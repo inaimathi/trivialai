@@ -1,11 +1,11 @@
 import unittest
 
-from src.trivialapi.toda import core
+from src.trivialai import ollama
 
 
 class TestBasics(unittest.TestCase):
     def test_basics(self):
-        core.Twin
+        ollama.Ollama
         self.assertTrue(True)
         self.assertIsNone(None)
         self.assertEqual("a", "a")
