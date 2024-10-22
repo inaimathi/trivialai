@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trivialai"
+version = "0.0.1"
+authors = [
+  { name="inaimathi", email="leo.zovic@gmail.com" },
+]
+description = "A trivial set of API bindings for AI models, because I'd like them to be easy to use."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = ["requests", "vertexai"]
+
+[project.urls]
+Homepage = "https://github.com/inaimathi/trivialai"
+Issues = "https://github.com/inaimathi/trivialai/issues"
