@@ -5,10 +5,10 @@ import google.auth
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-from .util import AiResult
+from .llm import LLMMixin, LLMResult
 
 
-class GCP:
+class GCP(LLMMixin):
     def __init__(self, model, vertex_api_creds, region):
         self.region = region
         self.api_creds = vertex_api_creds
@@ -42,6 +42,6 @@ class GCP:
         model = GenerativeModel(system_instruction=system, model_name=self.model)
         try:
             resp = model.generate_content(prompt)
-            return AiResult(resp, 200, resp.text.strip())
+            return LLMResult(resp, 200, resp.text.strip())
         except Exception as e:
-            return AiResult(e, 500, None)
+            return LLMResult(e, 500, None)

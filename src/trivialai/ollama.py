@@ -1,9 +1,9 @@
 import requests
 
-from .util import AiResult
+from .llm import LLMMixin, LLMResult
 
 
-class Ollama:
+class Ollama(LLMMixin):
     def __init__(self, model, ollama_server):
         self.model = model
         self.server = ollama_server.rstrip("/")
@@ -18,5 +18,5 @@ class Ollama:
             },
         )
         if res.status_code == 200:
-            return AiResult(res, 200, res.json()["response"].strip())
-        return AiResult(res, res.status_code, None)
+            return LLMResult(res, 200, res.json()["response"].strip())
+        return LLMResult(res, res.status_code, None)
