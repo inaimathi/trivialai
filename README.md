@@ -1,6 +1,15 @@
 # TrivialAI
 _(A set of `requests`-based, trivial bindings for AI models)_
 
+## Basics
+
+```
+$ pip install pytrivialai
+$ python
+>>> from trivialai import claude, gcp, ollama, chatgpt
+>>>
+```
+
 ## Basic models
 
 ### Claude
@@ -30,3 +39,11 @@ _(A set of `requests`-based, trivial bindings for AI models)_
 >>> 
 ```
 
+### ChatGPT
+
+```
+>>> client = chatgpt.ChatGPT("gpt-3.5-turbo", os.environ["OPENAI_API_KEY"])
+>>> client.generate("This is a test message. Use the word 'platypus' in your response.", "Hello there! :D").content
+'Hello! How are you today? By the way, did you know the platypus is one of the few mammals that lays eggs?'
+>>> 
+```
