@@ -1,7 +1,7 @@
 import json
 from collections import namedtuple
 
-LLMResult = namedtuple("LLMResult", ["raw", "status_code", "content"])
+LLMResult = namedtuple("LLMResult", ["raw", "content"])
 
 
 def loadch(resp):
@@ -23,8 +23,8 @@ class LLMMixin:
             res = self.generate(system, prompt)
             transformed, success = transformFn(res.content)
             if success:
-                return LLMResult(res.raw, res.status_code, transformed)
-        return LLMResult(res.raw, 500, res.content)
+                return LLMResult(res.raw, transformed)
+        return LLMResult(res.raw, None)
 
     def generate_json(self, system, prompt, retries=5):
         return self.generate_checked(loadch, system, prompt, retries=retries)

@@ -18,5 +18,5 @@ class Ollama(LLMMixin):
             },
         )
         if res.status_code == 200:
-            return LLMResult(res, 200, res.json()["response"].strip())
-        return LLMResult(res, res.status_code, None)
+            return LLMResult(res, res.json()["response"].strip())
+        return LLMResult(res, None)

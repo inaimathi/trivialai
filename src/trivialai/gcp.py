@@ -42,6 +42,6 @@ class GCP(LLMMixin):
         model = GenerativeModel(system_instruction=system, model_name=self.model)
         try:
             resp = model.generate_content(prompt)
-            return LLMResult(resp, 200, resp.text.strip())
+            return LLMResult(resp, resp.text.strip())
         except Exception as e:
-            return LLMResult(e, 500, None)
+            return LLMResult(e, None)
