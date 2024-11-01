@@ -10,7 +10,16 @@ $ python
 >>>
 ```
 
-## Basic models
+## Basic model usage
+
+### Ollama
+
+```
+>>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
+>>> client.generate("This is a test message. Use the word 'platypus' in your response.", "Hello there! :D").content
+'Hey!  Did you know platypuses lay eggs and have webbed feet? Pretty cool, huh? 😁'
+>>>
+```
 
 ### Claude
 
@@ -30,15 +39,6 @@ $ python
 >>> 
 ```
 
-### Ollama
-
-```
->>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
->>> client.generate("This is a test message. Use the word 'platypus' in your response.", "Hello there! :D").content
-'Hey!  Did you know platypuses lay eggs and have webbed feet? Pretty cool, huh? 😁'
->>> 
-```
-
 ### ChatGPT
 
 ```
@@ -47,3 +47,26 @@ $ python
 'Hello! How are you today? By the way, did you know the platypus is one of the few mammals that lays eggs?'
 >>> 
 ```
+
+## Basic Tool Use
+
+```
+>>> from src.trivialai import tools
+>>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
+>>> tls = tools.Tools()
+>>> from typing import Optional, List
+>>> def _screenshot(url: str, selectors: Optional[List[str]] = None) -> None:
+    "Takes a url and an optional list of selectors. Takes a screenshot"
+    print(f"GOT {url}, {selectors}!")
+... ... ... 
+>>> tls.define(_screenshot)
+True
+>>> tls.list()
+[{'name': '_screenshot', 'type': {'url': <class 'str'>, 'selectors': typing.Optional[typing.List[str]]}, 'description': 'Takes a url and an optional list of selectors. Takes a screenshot'}]
+>>> res = client.generate_tool_call(tls, "Take a screenshot of the Google website and highlight the search box")
+>>> res.content
+{'functionName': '_screenshot', 'args': {'url': 'https://www.google.com', 'selectors': ['#search']}}
+>>> tls.call(res.content)
+GOT https://www.google.com, ['#search']!
+>>> 
+``
