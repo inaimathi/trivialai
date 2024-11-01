@@ -1,11 +1,6 @@
 from .util import loadch
 
 
-def _screenshot(url: str, selectors: Optional[List[str]] = None) -> None:
-    "Takes a url and an optional list of selectors. Takes a screenshot"
-    print(f"GOT {url}, {selectors}!")
-
-
 class Tools:
     def __init__(self):
         self._env = {}
