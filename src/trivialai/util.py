@@ -1,11 +1,12 @@
 import json
+import re
 
 
 def loadch(resp):
     try:
         return (
             json.loads(
-                (resp.strip().removeprefix("```json").removesuffix("```").strip())
+                re.sub("^```\\w+\n", "", resp.strip()).removesuffix("```").strip()
             ),
             True,
         )
