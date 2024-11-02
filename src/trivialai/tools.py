@@ -59,7 +59,10 @@ class Tools:
             return parsed, True
         return None, False
 
+    def raw_call(self, tool_call):
+        return self._env[tool_call["functionName"]]["function"](**tool_call["args"])
+
     def call(self, tool_call):
         if self.validate(tool_call):
-            return self._env[tool_call["functionName"]]["function"](**tool_call["args"])
+            return self.raw_call(tool_call)
         return None
