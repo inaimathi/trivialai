@@ -3,6 +3,8 @@ import re
 
 
 def loadch(resp):
+    if resp is None:
+        return None, False
     try:
         return (
             json.loads(
