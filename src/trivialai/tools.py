@@ -59,6 +59,14 @@ class Tools:
             return parsed, True
         return None, False
 
+    def transform_multi(self, resp):
+        parsed, success = loadch(resp)
+        if not success or type(parsed) is not list:
+            return None, False
+        if all(self.validate(call) for call in parsed):
+            return parsed, True
+        return None, False
+
     def raw_call(self, tool_call):
         return self._env[tool_call["functionName"]]["function"](**tool_call["args"])
 
