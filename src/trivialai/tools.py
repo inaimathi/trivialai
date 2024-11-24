@@ -47,7 +47,7 @@ class Tools:
             and tool_call["functionName"] in self._env
         ):
             f = self._env[tool_call["functionName"]]
-            if not set(tool_call["args"].keys()).difference(f["type"].keys()):
+            if set(tool_call["args"].keys()) == set(f["type"].keys()):
                 return True
         return False
 
