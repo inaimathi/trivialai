@@ -63,6 +63,11 @@ $ python
 ... ... ... 
 >>> tls.define(_screenshot)
 True
+## You could also equivalently use
+## >>> @tls.define()
+## >>> def _screenshot(url: str, selectors: Optional[List[str]] = None) -> None:
+##    "Takes a url and an optional list of selectors. Takes a screenshot"
+##    print(f"GOT {url}, {selectors}!")
 >>> tls.list()
 [{'name': '_screenshot', 'type': {'url': <class 'str'>, 'selectors': typing.Optional[typing.List[str]]}, 'description': 'Takes a url and an optional list of selectors. Takes a screenshot'}]
 >>> res = client.generate_tool_call(tls, "Take a screenshot of the Google website and highlight the search box")
