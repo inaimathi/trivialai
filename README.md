@@ -18,6 +18,8 @@ $ python
 >>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
 >>> client.generate("This is a test message. Use the word 'platypus' in your response.", "Hello there! :D").content
 'Hey!  Did you know platypuses lay eggs and have webbed feet? Pretty cool, huh? 😁'
+>>> client.generate_json("This is a test message. Use the word 'platypus' in your response.", "Generate a list of animal names in JSON format. Return [Name] and no other commentary").content
+[{'name': 'Platypus'}, {'name': 'Eagle'}, {'name': 'Elephant'}, {'name': 'Giraffe'}, {'name': 'Lion'}, {'name': 'Tiger'}, {'name': 'Zebra'}, {'name': 'Dolphin'}, {'name': 'Whale'}, {'name': 'Bear'}, {'name': 'Wolf'}, {'name': 'Dog'}, {'name': 'Cat'}, {'name': 'Monkey'}]
 >>>
 ```
 
@@ -69,4 +71,4 @@ True
 >>> tls.call(res.content)
 GOT https://www.google.com, ['#search']!
 >>> 
-``
+```

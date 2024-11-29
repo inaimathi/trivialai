@@ -1,4 +1,4 @@
-from .util import loadch
+from . import util
 
 
 class Tools:
@@ -52,20 +52,19 @@ class Tools:
         return False
 
     def transform(self, resp):
-        parsed, success = loadch(resp)
-        if not success:
-            return None, False
+        parsed = util.loadch(resp)
         if self.validate(parsed):
-            return parsed, True
-        return None, False
+            return parsed
+        raise util.TransformError("invalid-tool-call", raw=resp)
 
     def transform_multi(self, resp):
-        parsed, success = loadch(resp)
-        if not success or type(parsed) is not list:
-            return None, False
-        if all(self.validate(call) for call in parsed):
-            return parsed, True
-        return None, False
+        parsed = util.loadch(resp)
+        if type(parsed) is not list:
+            raise util.TransformError("result-not-list", raw=parsed)
+        for call in parsed:
+            if not self.validate(call):
+                raise util.TransformError("invalid-tool-subcall", raw=call)
+        return parsed
 
     def lookup(self, tool_call):
         return self._env[tool_call["functionName"]]["function"]
