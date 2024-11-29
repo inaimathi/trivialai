@@ -16,7 +16,19 @@ class Tools:
         }
         return True
 
-    def define(self, fn, name=None, type=None, description=None):
+    def define(self, fn=None, *, name=None, type=None, description=None):
+        if fn is None:
+            # If no function is passed, return a decorator
+            def decorator(f):
+                self._define_function(f, name, type, description)
+                return f
+
+            return decorator
+
+        # If function is passed directly, define it
+        return self._define_function(fn, name, type, description)
+
+    def _define_function(self, fn, name=None, type=None, description=None):
         assert (
             fn.__annotations__ or type
         ), "either annotate the function or pass in a type dictionary for its inputs"

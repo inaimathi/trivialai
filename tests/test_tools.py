@@ -32,8 +32,28 @@ class TestTools(unittest.TestCase):
 
     def test_define_duplicate(self):
         """Test defining a duplicate function."""
-        result = self.tools.define(self._screenshot)
-        self.assertFalse(result)  # Duplicates are not added
+
+        def new_tool(a: int) -> int:
+            """Example tool."""
+            return a + 1
+
+        # Define the function once
+        result = self.tools.define(new_tool)
+        self.assertTrue(result)  # First definition should succeed
+
+        # Attempt to define the same function again
+        result = self.tools.define(new_tool)
+        self.assertFalse(result)  # Duplicate definitions should return False
+
+        # Use decorator-style definition
+        @self.tools.define()
+        def _duplicate_tool(arg: int) -> int:
+            """A tool that already exists."""
+            return arg + 1
+
+        # Attempt to define the same function again using the decorator
+        result = self.tools.define(_duplicate_tool)
+        self.assertFalse(result)  # Duplicate definitions should still return False
 
     def test_list(self):
         """Test listing defined tools."""
