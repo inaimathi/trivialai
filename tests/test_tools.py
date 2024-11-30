@@ -124,7 +124,7 @@ class TestTools(unittest.TestCase):
         result = self.tools.raw_call(tool_call)
         self.assertEqual(
             result,
-            f"Screenshot taken for https://example.com with selectors None",
+            "Screenshot taken for https://example.com with selectors None",
         )
 
     def test_call_valid(self):
@@ -136,7 +136,7 @@ class TestTools(unittest.TestCase):
         result = self.tools.call(tool_call)
         self.assertEqual(
             result,
-            f"Screenshot taken for https://example.com with selectors None",
+            "Screenshot taken for https://example.com with selectors None",
         )
 
     def test_call_invalid(self):
