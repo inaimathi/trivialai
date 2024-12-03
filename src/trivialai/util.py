@@ -9,13 +9,15 @@ class TransformError(Exception):
         super().__init__(self.message)
 
 
+def strip_md_code_marker(block):
+    return re.sub("^```\\w+\n", "", block).removesuffix("```").strip()
+
+
 def loadch(resp):
     if resp is None:
         raise TransformError("no-message-given")
     try:
-        return json.loads(
-            re.sub("^```\\w+\n", "", resp.strip()).removesuffix("```").strip()
-        )
+        return json.loads(strip_md_code_marker(resp.strip()))
     except (TypeError, json.decoder.JSONDecodeError):
         pass
     raise TransformError("parse-failed")
