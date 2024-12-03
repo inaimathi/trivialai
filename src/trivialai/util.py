@@ -9,6 +9,13 @@ class TransformError(Exception):
         super().__init__(self.message)
 
 
+class GenerationError(Exception):
+    def __init__(self, message="Generation Error", raw=None):
+        self.message = message
+        self.raw = raw
+        super().__init__(self.message)
+
+
 def strip_md_code_marker(block):
     return re.sub("^```\\w+\n", "", block).removesuffix("```").strip()
 
