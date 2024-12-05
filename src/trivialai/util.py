@@ -65,12 +65,7 @@ def spit(file_path, content, mode=None):
         dest.write(content)
 
 
-def tree(target_dir, ignore=None, focus=None):
-    assert os.path.exists(target_dir) and os.path.isdir(target_dir)
-
-    if ignore is None:
-        ignore = r"(^__|^env|^\.|~$|pyc$)"  # by default, ignore a bunch of python/emacs development intermediate files
-
+def _tree(target_dir, ignore=None, focus=None):
     def is_excluded(name):
         ignore_match = re.search(ignore, name) if ignore else False
         focus_match = re.search(focus, name) if focus else True
@@ -80,20 +75,23 @@ def tree(target_dir, ignore=None, focus=None):
         entries = sorted(
             [entry for entry in os.listdir(dir_path) if not is_excluded(entry)]
         )
-        lines = []
 
         for i, entry in enumerate(entries):
             entry_path = os.path.join(dir_path, entry)
             is_last = i == len(entries) - 1
             connector = "└── " if is_last else "├── "
-            lines.append(f"{prefix}{connector}{entry}")
+            yield f"{prefix}{connector}{entry}"
 
             if os.path.isdir(entry_path):
                 child_prefix = f"{prefix}    " if is_last else f"{prefix}│   "
-                lines.extend(build_tree(entry_path, child_prefix))
+                for ln in build_tree(entry_path, child_prefix):
+                    yield ln
 
-        return lines
+    yield target_dir
+    for ln in build_tree(target_dir):
+        yield ln
 
-    tree_lines = [target_dir]
-    tree_lines.extend(build_tree(target_dir))
-    return "\n".join(tree_lines)
+
+def tree(target_dir, ignore=None, focus=None):
+    assert os.path.exists(target_dir) and os.path.isdir(target_dir)
+    return "\n".join(_tree(target_dir, ignore, focus))
