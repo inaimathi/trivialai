@@ -2,7 +2,9 @@ from . import util
 
 
 class Tools:
-    def __init__(self):
+    def __init__(self, extras=None):
+        assert (extras is None) or (type(extras) is dict)
+        self.extras = None
         self._env = {}
 
     def _intern(self, name, type, description, fn):
@@ -84,7 +86,14 @@ class Tools:
     def raw_call(self, tool_call):
         return self.lookup(tool_call)(**tool_call["args"])
 
+    def call_with_extras(self, extras, tool_call):
+        if self.validate(tool_call):
+            with_extras = {**tool_call, "args": {**tool_call["args"], **extras}}
+            return self.raw_call(with_extras)
+
     def call(self, tool_call):
         if self.validate(tool_call):
+            if self.extras is not None:
+                return self.call_with_extras(self.extras, tool_call)
             return self.raw_call(tool_call)
         return None

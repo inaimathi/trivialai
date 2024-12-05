@@ -13,7 +13,7 @@ class LLMMixin:
                 return LLMResult(res.raw, transformFn(res.content))
             except TransformError:
                 pass
-        raise GenerationError(f"failed-on-{retries}-retries")
+        raise GenerationError(f"failed-on-{retries}-retries", raw=res)
 
     def generate_json(self, system, prompt, retries=5):
         return self.generate_checked(loadch, system, prompt, retries=retries)
