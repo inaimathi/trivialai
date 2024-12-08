@@ -37,9 +37,9 @@ def invert_md_code(md_block, comment_start=None, comment_end=None):
     return "\n".join(result)
 
 
-def relative_path(base, path):
+def relative_path(base, path, must_exist=True):
     stripped = path.strip("\\/")
-    if not os.path.isfile(os.path.join(base, stripped)):
+    if (not os.path.isfile(os.path.join(base, stripped))) and must_exist:
         raise TransformError("relative-file-doesnt-exist", raw=stripped)
     return stripped
 
@@ -95,3 +95,17 @@ def _tree(target_dir, ignore=None, focus=None):
 def tree(target_dir, ignore=None, focus=None):
     assert os.path.exists(target_dir) and os.path.isdir(target_dir)
     return "\n".join(_tree(target_dir, ignore, focus))
+
+
+def mk_local_files(in_dir, must_exist=True):
+    def _local_files(resp):
+        try:
+            loaded = loadch(resp)
+            if type(loaded) is not list:
+                raise TransformError("relative-file-response-not-list", raw=resp)
+            return [relative_path(in_dir, f, must_exist=must_exist) for f in loaded]
+        except Exception:
+            pass
+        raise TransformError("relative-file-translation-failed", raw=resp)
+
+    return _local_files
