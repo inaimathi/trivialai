@@ -1,9 +1,10 @@
 import requests
 
+from .filesystem import FilesystemMixin
 from .llm import LLMMixin, LLMResult
 
 
-class ChatGPT(LLMMixin):
+class ChatGPT(LLMMixin, FilesystemMixin):
     def __init__(self, model, api_key, anthropic_version=None, max_tokens=None):
         self.max_tokens = max_tokens or 4096
         self.version = anthropic_version or "2023-06-01"

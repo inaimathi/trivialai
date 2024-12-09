@@ -5,6 +5,7 @@ import google.auth
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
+from .filesystem import FilesystemMixin
 from .llm import LLMMixin, LLMResult
 
 _SAFETY_MAP = {
@@ -44,7 +45,7 @@ def _dict_to_safety(safety_settings):
     ]
 
 
-class GCP(LLMMixin):
+class GCP(LLMMixin, FilesystemMixin):
     def __init__(self, model, vertex_api_creds, region, safety_settings=None):
         safety = safety_settings
         if safety is None:

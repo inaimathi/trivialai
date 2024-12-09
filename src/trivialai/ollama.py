@@ -1,9 +1,10 @@
 import requests
 
+from .filesystem import FilesystemMixin
 from .llm import LLMMixin, LLMResult
 
 
-class Ollama(LLMMixin):
+class Ollama(LLMMixin, FilesystemMixin):
     def __init__(self, model, ollama_server):
         self.model = model
         self.server = ollama_server.rstrip("/")
