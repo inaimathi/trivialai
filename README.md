@@ -70,7 +70,7 @@ True
 ##    print(f"GOT {url}, {selectors}!")
 >>> tls.list()
 [{'name': '_screenshot', 'type': {'url': <class 'str'>, 'selectors': typing.Optional[typing.List[str]]}, 'description': 'Takes a url and an optional list of selectors. Takes a screenshot'}]
->>> res = client.generate_tool_call(tls, "Take a screenshot of the Google website and highlight the search box")
+>>> res = client.generate_tool_call(tls, "This space intentionally left blank.",  "Take a screenshot of the Google website and highlight the search box")
 >>> res.content
 {'functionName': '_screenshot', 'args': {'url': 'https://www.google.com', 'selectors': ['#search']}}
 >>> tls.call(res.content)

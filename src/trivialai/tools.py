@@ -26,7 +26,6 @@ class Tools:
                 return f
 
             return decorator
-
         # If function is passed directly, define it
         return self._define_function(fn, name, type, description)
 
