@@ -45,7 +45,7 @@ class FilesystemMixin:
         print(in_dir)
         project_tree = util.tree(in_dir, ignore_regex)
         files_list = self.generate_checked(
-            util.mk_local_files(in_dir),
+            util.mk_local_files(in_dir, must_exist=False),
             "\n".join(
                 [
                     base,
@@ -55,7 +55,11 @@ class FilesystemMixin:
             prompt,
         ).content
         print(f"   Considering {files_list}")
-        files = {fl: util.slurp(os.path.join(in_dir, fl)) for fl in files_list}
+        files = {
+            fl: util.slurp(os.path.join(in_dir, fl))
+            for fl in files_list
+            if os.path.isfile(os.path.join(in_dir, fl))
+        }
 
         change_files_list = self.generate_checked(
             util.mk_local_files(in_dir, must_exist=False),
@@ -64,7 +68,7 @@ class FilesystemMixin:
                     base,
                     f"The project tree of the project you've been asked to work on is {project_tree}.",
                     f"You've decided that these are the files you needed to consider: {files}",
-                    "What files does the users' query require you to make changes to? Return a JSON-formatted list of relative pathnames and no other content",
+                    "What files does the users' query require you to make changes to? Return a JSON-formatted list of relative pathnames and no other commentary",
                 ]
             ),
             prompt,
