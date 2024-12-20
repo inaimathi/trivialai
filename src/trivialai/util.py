@@ -21,6 +21,12 @@ def strip_md_code(block):
     return re.sub("^```\\w+\n", "", block).removesuffix("```").strip()
 
 
+def strip_to_first_md_code(block):
+    pattern = r"^.*?```\w+\n(.*?)\n```.*$"
+    match = re.search(pattern, block, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
 def invert_md_code(md_block, comment_start=None, comment_end=None):
     lines = md_block.splitlines()
     in_code_block = False
@@ -100,7 +106,7 @@ def tree(target_dir, ignore=None, focus=None):
 def mk_local_files(in_dir, must_exist=True):
     def _local_files(resp):
         try:
-            loaded = loadch(resp)
+            loaded = loadch(strip_to_first_md_code(resp))
             if type(loaded) is not list:
                 raise TransformError("relative-file-response-not-list", raw=resp)
             return [relative_path(in_dir, f, must_exist=must_exist) for f in loaded]

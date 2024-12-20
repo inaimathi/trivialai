@@ -68,7 +68,7 @@ class FilesystemMixin:
                     base,
                     f"The project tree of the project you've been asked to work on is {project_tree}.",
                     f"You've decided that these are the files you needed to consider: {files}",
-                    "What files does the users' query require you to make changes to? Return a JSON-formatted list of relative pathnames and no other commentary",
+                    "What files does the users' query require you to make changes to? Return a JSON-formatted list of relative pathnames of type [RelativePath] and no other commentary or content",
                 ]
             ),
             prompt,
