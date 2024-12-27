@@ -1,19 +1,11 @@
-from collections import namedtuple
-
-from .util import GenerationError, TransformError, loadch
-
-LLMResult = namedtuple("LLMResult", ["raw", "content"])
+from .util import generate_checked, loadch
 
 
 class LLMMixin:
     def generate_checked(self, transformFn, system, prompt, retries=5):
-        for i in range(retries):
-            res = self.generate(system, prompt)
-            try:
-                return LLMResult(res.raw, transformFn(res.content))
-            except TransformError:
-                pass
-        raise GenerationError(f"failed-on-{retries}-retries", raw=res)
+        return generate_checked(
+            lambda: self.generate(system, prompt), transformFn, retries=retries
+        )
 
     def generate_json(self, system, prompt, retries=5):
         return self.generate_checked(loadch, system, prompt, retries=retries)

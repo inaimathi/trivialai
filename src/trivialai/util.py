@@ -1,6 +1,9 @@
 import json
 import os
 import re
+from collections import namedtuple
+
+LLMResult = namedtuple("LLMResult", ["raw", "content"])
 
 
 class TransformError(Exception):
@@ -15,6 +18,16 @@ class GenerationError(Exception):
         self.message = message
         self.raw = raw
         super().__init__(self.message)
+
+
+def generate_checked(gen, transformFn, retries=5):
+    for i in range(retries):
+        res = gen()
+        try:
+            return LLMResult(res.raw, transformFn(res.content))
+        except TransformError:
+            pass
+    raise GenerationError(f"failed-on-{retries}-retries", raw=res)
 
 
 def strip_md_code(block):
@@ -54,7 +67,10 @@ def loadch(resp):
     if resp is None:
         raise TransformError("no-message-given")
     try:
-        return json.loads(strip_md_code(resp.strip()))
+        if type(resp) is str:
+            return json.loads(strip_md_code(resp.strip()))
+        elif type(resp) in {list, dict, tuple}:
+            return resp
     except (TypeError, json.decoder.JSONDecodeError):
         pass
     raise TransformError("parse-failed")
@@ -106,7 +122,8 @@ def tree(target_dir, ignore=None, focus=None):
 def mk_local_files(in_dir, must_exist=True):
     def _local_files(resp):
         try:
-            loaded = loadch(strip_to_first_md_code(resp))
+            rsp = resp if type(resp) is str else strip_to_first_md_code(resp)
+            loaded = loadch(rsp)
             if type(loaded) is not list:
                 raise TransformError("relative-file-response-not-list", raw=resp)
             return [relative_path(in_dir, f, must_exist=must_exist) for f in loaded]
