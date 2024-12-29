@@ -1,4 +1,4 @@
-from .util import TransformError, generate_checked, loadch
+from .util import LLMResult, TransformError, generate_checked, loadch
 
 
 class LLMMixin:
