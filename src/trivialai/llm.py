@@ -1,4 +1,4 @@
-from .util import generate_checked, loadch
+from .util import TransformError, generate_checked, loadch
 
 
 class LLMMixin:
