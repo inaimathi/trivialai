@@ -119,6 +119,33 @@ def tree(target_dir, ignore=None, focus=None):
     return "\n".join(_tree(target_dir, ignore, focus))
 
 
+def deep_ls(directory, ignore=None, focus=None):
+    ignore_pattern = re.compile(ignore) if ignore else None
+    focus_pattern = re.compile(focus) if focus else None
+
+    for root, dirs, files in os.walk(directory):
+        # Filter directories in place to control which ones get scanned
+        if ignore_pattern:
+            dirs[:] = [
+                d for d in dirs if not ignore_pattern.search(os.path.join(root, d))
+            ]
+        if focus_pattern:
+            dirs[:] = [d for d in dirs if focus_pattern.search(os.path.join(root, d))]
+
+        for file in files:
+            full_path = os.path.join(root, file)
+
+            # Skip if path matches ignore pattern
+            if ignore_pattern and ignore_pattern.search(full_path):
+                continue
+
+            # Skip if focus pattern exists and path doesn't match it
+            if focus_pattern and not focus_pattern.search(full_path):
+                continue
+
+            yield full_path
+
+
 def mk_local_files(in_dir, must_exist=True):
     def _local_files(resp):
         try:

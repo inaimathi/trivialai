@@ -2,6 +2,27 @@ import os
 
 from . import util
 
+_BASE_PROMPT = "You are an extremely experienced and knowledgeable programmer. A genie in human form, able to bend source code to your will in ways your peers can only marvel at."
+
+_DEFAULT_IGNORE = r"(^__pycache__|^node_modules|^env|^venv|^\..*|~$|\.pyc$|Thumbs\.db$|^build[\\/]|^dist[\\/]|^coverage[\\/]|\.log$|\.lock$|\.bak$|\.swp$|\.swo$|\.tmp$|\.temp$|\.class$|^target$|^Cargo\.lock$)"
+
+
+def relevant_files(m, in_dir, prompt, ignore=None, focus=None, must_exist=False):
+    if ignore is None:
+        ignore = _DEFAULT_IGNORE
+    project_tree = util.tree(in_dir, ignore=ignore, focus=focus)
+    files_list = m.generate_checked(
+        util.mk_local_files(in_dir, must_exist=must_exist),
+        "\n".join(
+            [
+                _BASE_PROMPT,
+                f"The directory tree of the directory you've been asked to work on is {project_tree}. What files does the users' query require you to consider or change? Return a JSON-formatted list of relative pathname strings and no other content.",
+            ]
+        ),
+        prompt,
+    ).content
+    return files_list
+
 
 class FilesystemMixin:
     def edit_file(
@@ -21,67 +42,48 @@ class FilesystemMixin:
         if after_save is not None:
             after_save(file_path)
 
+    def relevant_files(self, in_dir, prompt, ignore=None, focus=None, must_exist=None):
+        return relevant_files(
+            self, in_dir, prompt, ignore=ignore, focus=focus, must_exist=must_exist
+        )
+
     def edit_directory(
         self,
         in_dir,
         prompt,
         after_save=None,
         out_dir=None,
-        ignore_regex=None,
+        ignore=None,
         retries=5,
     ):
-        base = "You are an extremely experienced and knowledgeable programmer. A genie in human form, able to bend source code to your will in ways your peers can only marvel at."
         in_dir = os.path.expanduser(in_dir)
         if out_dir is None:
             out_dir = in_dir
         else:
             out_dir = os.path.expanduser(out_dir)
 
-        if ignore_regex is None:
-            ignore_regex = r"(^__pycache__|^node_modules|^env|^venv|^\..*|~$|\.pyc$|Thumbs\.db$|^build[\\/]|^dist[\\/]|^coverage[\\/]|\.log$|\.lock$|\.bak$|\.swp$|\.swo$|\.tmp$|\.temp$|\.class$|^target$|^Cargo\.lock$)"
-        elif not ignore_regex:
-            ignore_regex is None
+        if ignore is None:
+            ignore = _DEFAULT_IGNORE
+        elif not ignore:
+            ignore = None
 
         print(in_dir)
-        project_tree = util.tree(in_dir, ignore_regex)
-        files_list = self.generate_checked(
-            util.mk_local_files(in_dir, must_exist=False),
-            "\n".join(
-                [
-                    base,
-                    f"The directory tree of the directory you've been asked to work on is {project_tree}. What files does the users' query require you to consider? Return a JSON-formatted list of relative pathname strings and no other content.",
-                ]
-            ),
-            prompt,
-        ).content
-        print(f"   Considering {files_list}")
+        files_list = self.relevant_files(in_dir, prompt, ignore=ignore)
         files = {
             fl: util.slurp(os.path.join(in_dir, fl))
             for fl in files_list
             if os.path.isfile(os.path.join(in_dir, fl))
         }
 
-        change_files_list = self.generate_checked(
-            util.mk_local_files(in_dir, must_exist=False),
-            "\n".join(
-                [
-                    base,
-                    f"The project tree of the project you've been asked to work on is {project_tree}.",
-                    f"You've decided that these are the files you needed to consider: {files}",
-                    "What files does the users' query require you to make changes to? Return a JSON-formatted list of relative pathnames of type [RelativePath] and no other commentary or content",
-                ]
-            ),
-            prompt,
-        ).content
-
-        print(f"   Changing {change_files_list}")
-        for pth in change_files_list:
+        joined = "\n    - ".join(files_list)
+        print(f"   Changing \n{joined}")
+        for pth in files_list:
+            print(f"    x {pth}")
             self.edit_file(
                 os.path.join(out_dir, pth),
                 "\n".join(
                     [
-                        base,
-                        f"The project tree of the project you've been asked to work on is {project_tree}.",
+                        _BASE_PROMPT,
                         f"You've decided that these are the files you needed to consider: {files}",
                     ]
                 ),
