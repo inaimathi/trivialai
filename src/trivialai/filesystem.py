@@ -142,10 +142,10 @@ def _edit_files_considering(
             after_save=after_save,
         )
         logger.info(f"EDITED {pth}")
-        return {
-            "considered": relevant_files_list,
-            "changed": target_files_list,
-        }
+    return {
+        "considered": relevant_files_list,
+        "changed": target_files_list,
+    }
 
 
 def _relevant_files(
