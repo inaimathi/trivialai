@@ -16,6 +16,8 @@ $ python
 
 ```
 >>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
+# or ollama.Ollama("deepseek-coder-v2:latest", "http://localhost:11434/")
+# or ollama.Ollama("mannix/llama3.1-8b-abliterated:latest", "http://localhost:11434/")
 >>> client.generate("This is a test message. Use the word 'platypus' in your response.", "Hello there! :D").content
 'Hey!  Did you know platypuses lay eggs and have webbed feet? Pretty cool, huh? 😁'
 >>> client.generate_json("This is a test message. Use the word 'platypus' in your response.", "Generate a list of animal names in JSON format. Return [Name] and no other commentary").content
@@ -54,7 +56,7 @@ $ python
 
 ```
 >>> from src.trivialai import tools
->>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
+>>> client = ollama.Ollama("deepseek-v2:16b", "http://localhost:11434/")
 >>> tls = tools.Tools()
 >>> from typing import Optional, List
 >>> def _screenshot(url: str, selectors: Optional[List[str]] = None) -> None:
