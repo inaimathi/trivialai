@@ -22,11 +22,13 @@ class Ollama(LLMMixin, FilesystemMixin):
         )
         if res.status_code == 200:
             resp = res.json()["response"].strip()
-            think_match = re.search(r"<think>(.*?)</think>", resp, re.DOTALL)
+            pattern = r"<think>.*?</think>"
+            think_match = re.search(pattern, resp, re.DOTALL)
             if not think_match:
                 return LLMResult(res, resp, None)
 
-            scratchpad = think_match.group(1).strip()
-            content = re.sub(r"<think>.*?</think>", "", resp, re.DOTALL).strip()
+            matched = think_match.group(0)
+            scratchpad = matched[7:-8].strip()
+            content = resp.content.replace(matched, "").strip()
             return LLMResult(res, content, scratchpad)
         return LLMResult(res, None, None)
