@@ -29,6 +29,6 @@ class Ollama(LLMMixin, FilesystemMixin):
 
             matched = think_match.group(0)
             scratchpad = matched[7:-8].strip()
-            content = resp.content.replace(matched, "").strip()
+            content = resp.replace(matched, "").strip()
             return LLMResult(res, content, scratchpad)
         return LLMResult(res, None, None)
