@@ -86,6 +86,6 @@ class GCP(LLMMixin, FilesystemMixin):
                 prompt,
                 safety_settings=self.safety_settings,
             )
-            return LLMResult(resp, resp.text.strip())
+            return LLMResult(resp, resp.text.strip(), None)
         except Exception as e:
-            return LLMResult(e, None)
+            return LLMResult(e, None, None)

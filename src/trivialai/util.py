@@ -4,7 +4,7 @@ import os
 import re
 from collections import namedtuple
 
-LLMResult = namedtuple("LLMResult", ["raw", "content"])
+LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
 
 def getLogger(name, level=logging.DEBUG):
@@ -37,7 +37,7 @@ def generate_checked(gen, transformFn, retries=5):
     for i in range(retries):
         res = gen()
         try:
-            return LLMResult(res.raw, transformFn(res.content))
+            return LLMResult(res.raw, transformFn(res.content), res.scratchpad)
         except TransformError:
             pass
     raise GenerationError(f"failed-on-{retries}-retries", raw=res)

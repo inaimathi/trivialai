@@ -27,5 +27,5 @@ class Claude(LLMMixin, FilesystemMixin):
             },
         )
         if res.status_code == 200:
-            return LLMResult(res, res.json()["content"][0]["text"])
-        return LLMResult(res, None)
+            return LLMResult(res, res.json()["content"][0]["text"], None)
+        return LLMResult(res, None, None)

@@ -27,5 +27,5 @@ class ChatGPT(LLMMixin, FilesystemMixin):
             },
         )
         if res.status_code == 200:
-            return LLMResult(res, res.json()["choices"][0]["message"]["content"])
-        return LLMResult(res, None)
+            return LLMResult(res, res.json()["choices"][0]["message"]["content"], None)
+        return LLMResult(res, None, None)

@@ -1,3 +1,5 @@
+import re
+
 import requests
 
 from .filesystem import FilesystemMixin
@@ -19,5 +21,12 @@ class Ollama(LLMMixin, FilesystemMixin):
             },
         )
         if res.status_code == 200:
-            return LLMResult(res, res.json()["response"].strip())
-        return LLMResult(res, None)
+            resp = res.json()["response"].strip()
+            think_match = re.search(r"<think>(.*?)</think>", resp, re.DOTALL)
+            if not think_match:
+                return LLMResult(res, resp, None)
+
+            scratchpad = think_match.group(1).strip()
+            content = re.sub(r"<think>.*?</think>", "", resp, re.DOTALL).strip()
+            return LLMResult(res, content, scratchpad)
+        return LLMResult(res, None, None)
