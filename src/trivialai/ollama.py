@@ -11,15 +11,16 @@ class Ollama(LLMMixin, FilesystemMixin):
         self.model = model
         self.server = ollama_server.rstrip("/")
 
-    def generate(self, system, prompt):
-        res = requests.post(
-            f"{self.server}/api/generate",
-            json={
-                "model": self.model,
-                "stream": False,
-                "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
-            },
-        )
+    def generate(self, system, prompt, images=None):
+        data = {
+            "model": self.model,
+            "stream": False,
+            "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
+        }
+        if images is not None:
+            data["images"] = images
+        res = requests.post(f"{self.server}/api/generate", json=data)
+
         if res.status_code == 200:
             resp = res.json()["response"].strip()
             pattern = r"<think>.*?</think>"
