@@ -1,8 +1,11 @@
+import base64
 import json
 import logging
 import os
 import re
 from collections import namedtuple
+
+import requests
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
@@ -172,3 +175,15 @@ def mk_local_files(in_dir, must_exist=True):
         raise TransformError("relative-file-translation-failed", raw=resp)
 
     return _local_files
+
+
+def b64file(pathname):
+    with open(pathname, "rb") as f:
+        raw = f.read()
+        return base64.b64encode(raw).decode("utf-8")
+
+
+def b64url(url):
+    response = requests.get(url)
+    response.raise_for_status()  # Raises an exception for bad status codes
+    return base64.b64encode(response.content).decode("utf-8")
