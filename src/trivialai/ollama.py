@@ -7,7 +7,10 @@ from .llm import LLMMixin, LLMResult
 
 
 class Ollama(LLMMixin, FilesystemMixin):
-    def __init__(self, model, ollama_server):
+    def __init__(self, model, ollama_server=None):
+        if ollama_server is None:
+            ollama_server = "http://localhost:11434"
+
         self.model = model
         self.server = ollama_server.rstrip("/")
 
