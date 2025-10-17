@@ -1,4 +1,4 @@
-requests
+httpx[http2]~=0.27
 tenacity==9.1.2
 google-auth==2.31.0
 vertexai==1.49.0
