@@ -64,12 +64,23 @@ class TestTools(unittest.TestCase):
             tools_list[0]["description"],
             "Takes a url and an optional list of selectors. Takes a screenshot.",
         )
+        # sanity check: new 'args' schema exists
+        self.assertIn("args", tools_list[0])
+        self.assertIn("type", tools_list[0])
 
     def test_validate(self):
         """Test validation of a tool call."""
         tool_call = {
             "functionName": "_screenshot",
             "args": {"url": "https://www.google.com", "selectors": ["#search"]},
+        }
+        self.assertTrue(self.tools.validate(tool_call))
+
+    def test_validate_missing_optional_ok(self):
+        """Optional/defaulted params should be optional during validation."""
+        tool_call = {
+            "functionName": "_screenshot",
+            "args": {"url": "https://www.google.com"},
         }
         self.assertTrue(self.tools.validate(tool_call))
 
@@ -139,8 +150,9 @@ class TestTools(unittest.TestCase):
             "Screenshot taken for https://example.com with selectors None",
         )
 
-    def test_call_invalid(self):
-        """Test call on an invalid tool call."""
+    def test_call_invalid_raises(self):
+        """Invalid calls should raise TransformError instead of returning None."""
         tool_call = {"functionName": "nonexistent_tool", "args": {"param": "value"}}
-        result = self.tools.call(tool_call)
-        self.assertIsNone(result)
+        with self.assertRaises(TransformError) as ctx:
+            _ = self.tools.call(tool_call)
+        self.assertEqual(str(ctx.exception), "invalid-tool-call")
