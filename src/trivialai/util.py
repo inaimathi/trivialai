@@ -4,8 +4,9 @@ import logging
 import os
 import re
 from collections import namedtuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
 
-import requests
+import httpx
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
@@ -140,7 +141,6 @@ def deep_ls(directory, ignore=None, focus=None):
     focus_pattern = re.compile(focus) if focus else None
 
     for root, dirs, files in os.walk(directory):
-        # Filter directories in place to control which ones get scanned
         if ignore_pattern:
             dirs[:] = [
                 d for d in dirs if not ignore_pattern.search(os.path.join(root, d))
@@ -151,11 +151,9 @@ def deep_ls(directory, ignore=None, focus=None):
         for file in files:
             full_path = os.path.join(root, file)
 
-            # Skip if path matches ignore pattern
             if ignore_pattern and ignore_pattern.search(full_path):
                 continue
 
-            # Skip if focus pattern exists and path doesn't match it
             if focus_pattern and not focus_pattern.search(full_path):
                 continue
 
@@ -184,6 +182,62 @@ def b64file(pathname):
 
 
 def b64url(url):
-    response = requests.get(url)
-    response.raise_for_status()  # Raises an exception for bad status codes
-    return base64.b64encode(response.content).decode("utf-8")
+    with httpx.Client() as c:
+        r = c.get(url)
+        r.raise_for_status()
+        return base64.b64encode(r.content).decode("utf-8")
+
+
+# --- NEW: streaming “check at the end” wrappers ---
+
+
+def stream_checked(
+    stream_iter: Iterator[Dict[str, Any]], transformFn: Callable[[str], Any]
+) -> Iterator[Dict[str, Any]]:
+    """
+    Pass-through NDJSON events *and* emit a final parsed event once complete.
+    Yields events. The last event includes {"type":"final","ok":true|false,"parsed":..., "error":...}
+    """
+    buf: list[str] = []
+    last_end: Optional[Dict[str, Any]] = None
+
+    for ev in stream_iter:
+        t = ev.get("type")
+        if t == "delta":
+            # accumulate visible text only
+            buf.append(ev.get("text", ""))
+        elif t == "end":
+            last_end = ev
+        yield ev
+
+    full = "".join(buf) if buf else ((last_end or {}).get("content") or "")
+    try:
+        parsed = transformFn(full)
+        yield {"type": "final", "ok": True, "parsed": parsed}
+    except TransformError as e:
+        yield {"type": "final", "ok": False, "error": e.message, "raw": e.raw}
+
+
+async def astream_checked(
+    stream_agen: AsyncIterator[Dict[str, Any]], transformFn: Callable[[str], Any]
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Async variant of stream_checked for async generators.
+    """
+    buf: list[str] = []
+    last_end: Optional[Dict[str, Any]] = None
+
+    async for ev in stream_agen:
+        t = ev.get("type")
+        if t == "delta":
+            buf.append(ev.get("text", ""))
+        elif t == "end":
+            last_end = ev
+        yield ev
+
+    full = "".join(buf) if buf else ((last_end or {}).get("content") or "")
+    try:
+        parsed = transformFn(full)
+        yield {"type": "final", "ok": True, "parsed": parsed}
+    except TransformError as e:
+        yield {"type": "final", "ok": False, "error": e.message, "raw": e.raw}
