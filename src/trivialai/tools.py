@@ -1,11 +1,45 @@
+# tools.py
 from __future__ import annotations
 
+import asyncio
 import inspect
+from threading import Thread
 from typing import (Any, Callable, Dict, List, Optional, Tuple, Union,
                     get_args, get_origin)
 
 from . import util
 from .util import TransformError
+
+
+def _run_coro_sync(coro):
+    """
+    Run a coroutine from synchronous code.
+    - If no loop is running: use asyncio.run(coro).
+    - If a loop IS running in this thread: spin up a worker thread with its own loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # no loop: safe to run directly
+        return asyncio.run(coro)
+
+    # We are inside a running loop -> run in a separate thread
+    result_box: Dict[str, Any] = {}
+    error_box: Dict[str, BaseException] = {}
+
+    def _runner():
+        try:
+            result_box["value"] = asyncio.run(coro)
+        except BaseException as e:  # propagate any exception to caller
+            error_box["error"] = e
+
+    t = Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
 
 
 class Tools:
@@ -30,6 +64,7 @@ class Tools:
             "type": schema,  # raw annotations (original behavior preserved)
             "description": description,
             "function": fn,
+            "is_async": inspect.iscoroutinefunction(fn),
         }
         return True
 
@@ -37,9 +72,7 @@ class Tools:
         self,
         fn: Callable[..., Any],
         name: Optional[str] = None,
-        type: Optional[
-            Dict[str, Any]
-        ] = None,  # noqa: A002  (keep param name for back-compat)
+        type: Optional[Dict[str, Any]] = None,  # noqa: A002
         description: Optional[str] = None,
     ) -> bool:
         assert (
@@ -69,8 +102,7 @@ class Tools:
           - tools.define(func)
           - tools.define(func, name="...", description="...")
           - @tools.define(name="...", description="...")
-        Returns True/False when called directly with a function.
-        Returns the function itself when used as a decorator.
+        Works for BOTH sync and async functions.
         """
         if fn is None:
 
@@ -90,7 +122,8 @@ class Tools:
           "name": "...",
           "description": "...",
           "type": {...original python annotations...},   # for back-compat
-          "args": { "param": {"type":"string"|...,"items":...,"nullable":...}, ... }
+          "args": { "param": {"type":"string"|...,"items":...,"nullable":...}, ... },
+          "async": true|false
         }
         """
         out: List[Dict[str, Any]] = []
@@ -102,9 +135,10 @@ class Tools:
             out.append(
                 {
                     "name": k,
-                    "type": raw_schema,  # original, not super LLM-friendly, kept for compatibility
-                    "args": norm_schema,  # nicer normalized schema
+                    "type": raw_schema,
+                    "args": norm_schema,
                     "description": v["description"],
+                    "async": bool(v.get("is_async", False)),
                 }
             )
         return out
@@ -115,7 +149,7 @@ class Tools:
           - function exists
           - all required parameters present
           - no unknown parameters
-        Optional/defaulted params are, well, optional.
+        Optional/defaulted params are optional.
         """
         if not (
             isinstance(tool_call, dict)
@@ -131,10 +165,8 @@ class Tools:
         required, optional = _param_specs(fn)
         args = tool_call["args"] if isinstance(tool_call["args"], dict) else {}
 
-        # required present
         if not set(required).issubset(args.keys()):
             return False
-        # no unknowns
         if not set(args.keys()).issubset(set(required) | set(optional)):
             return False
         return True
@@ -160,14 +192,19 @@ class Tools:
             raise TransformError("tool-not-found", raw=tool_call)
         return self._env[name]["function"]
 
+    # ---------- Sync execution (now supports async tools safely) ----------
+
     def raw_call(self, tool_call: Dict[str, Any]) -> Any:
         """
-        Execute without merging extras. Raises TransformError on invalid calls.
+        Execute without merging extras. Supports both sync and async tools.
         """
         if not self.validate(tool_call):
             raise TransformError("invalid-tool-call", raw=tool_call)
         fn = self.lookup(tool_call)
-        return fn(**tool_call["args"])
+        res = fn(**tool_call["args"])
+        if inspect.isawaitable(res):
+            return _run_coro_sync(res)
+        return res
 
     def call_with_extras(
         self,
@@ -180,6 +217,7 @@ class Tools:
         Execute with extras merged into args.
         If override=True (default), extras override user args.
         If override=False, user args override extras.
+        Supports both sync and async tools.
         """
         if not self.validate(tool_call):
             raise TransformError("invalid-tool-call", raw=tool_call)
@@ -188,14 +226,16 @@ class Tools:
             if override
             else {**extras, **tool_call["args"]}
         )
-        return self.raw_call(
-            {"functionName": tool_call["functionName"], "args": merged_args}
-        )
+        fn = self.lookup(tool_call)
+        res = fn(**merged_args)
+        if inspect.isawaitable(res):
+            return _run_coro_sync(res)
+        return res
 
     def call(self, tool_call: Dict[str, Any]) -> Any:
         """
         Execute a tool call, merging self.extras (if provided).
-        Raises TransformError on invalid calls.
+        Supports both sync and async tools.
         """
         if not self.validate(tool_call):
             raise TransformError("invalid-tool-call", raw=tool_call)
@@ -203,23 +243,67 @@ class Tools:
             return self.call_with_extras(self.extras, tool_call)
         return self.raw_call(tool_call)
 
+    # ---------- Async execution (native await) ----------
 
-# ---------- Schema/validation helpers ----------
+    async def araw_call(self, tool_call: Dict[str, Any]) -> Any:
+        """
+        Async variant of raw_call(). Awaits coroutine tools, returns sync results directly.
+        """
+        if not self.validate(tool_call):
+            raise TransformError("invalid-tool-call", raw=tool_call)
+        fn = self.lookup(tool_call)
+        res = fn(**tool_call["args"])
+        if inspect.isawaitable(res):
+            return await res
+        return res
+
+    async def acall_with_extras(
+        self,
+        extras: Dict[str, Any],
+        tool_call: Dict[str, Any],
+        *,
+        override: bool = True,
+    ) -> Any:
+        """
+        Async variant of call_with_extras(). Awaits coroutine tools, returns sync results directly.
+        """
+        if not self.validate(tool_call):
+            raise TransformError("invalid-tool-call", raw=tool_call)
+        merged_args = (
+            {**tool_call["args"], **extras}
+            if override
+            else {**extras, **tool_call["args"]}
+        )
+        fn = self.lookup(tool_call)
+        res = fn(**merged_args)
+        if inspect.isawaitable(res):
+            return await res
+        return res
+
+    async def acall(self, tool_call: Dict[str, Any]) -> Any:
+        """
+        Async variant of call(). Merges self.extras (if provided).
+        """
+        if not self.validate(tool_call):
+            raise TransformError("invalid-tool-call", raw=tool_call)
+        if self.extras is not None:
+            return await self.acall_with_extras(self.extras, tool_call)
+        return await self.araw_call(tool_call)
+
+
+# ---------- Schema/validation helpers (unchanged) ----------
 
 
 def _param_specs(fn: Callable[..., Any]) -> Tuple[List[str], List[str]]:
-    """
-    Return (required, optional) param names for a function.
-    Required = no default and in standard keyword position.
-    """
-    sig = inspect.signature(fn)
+    import inspect as _inspect
+
+    sig = _inspect.signature(fn)
     required: List[str] = []
     optional: List[str] = []
     for name, p in sig.parameters.items():
         if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            # tools are called via kwargs; ignore *args/**kwargs/pos-only
             continue
-        if p.default is inspect._empty:
+        if p.default is _inspect._empty:
             required.append(name)
         else:
             optional.append(name)
@@ -227,12 +311,8 @@ def _param_specs(fn: Callable[..., Any]) -> Tuple[List[str], List[str]]:
 
 
 def _to_schema(t: Any) -> Dict[str, Any]:
-    """
-    Convert Python/typing type hints to a lightweight JSON-ish schema fragment.
-    """
     origin = get_origin(t)
 
-    # Optional[T] or Union[T, None]
     if origin is Union:
         args = list(get_args(t))
         nullable = any(a is type(None) for a in args)
@@ -241,30 +321,29 @@ def _to_schema(t: Any) -> Dict[str, Any]:
             base = _to_schema(non_none[0])
             base["nullable"] = True if nullable else base.get("nullable", False)
             return base
-        return {
-            "anyOf": [_to_schema(a) for a in non_none],
-            "nullable": nullable,
-        }
+        return {"anyOf": [_to_schema(a) for a in non_none], "nullable": nullable}
 
-    # Collections
     if origin in (list, List):
         (item_t,) = get_args(t) or (str,)
         return {"type": "array", "items": _to_schema(item_t)}
     if origin in (dict, Dict):
-        args = get_args(t) or (str, Any)
-        key_t, val_t = args[0], args[1]
+        key_t, val_t = (get_args(t) or (str, Any))[:2]
         return {
             "type": "object",
             "additionalProperties": _to_schema(val_t),
             "keys": str(getattr(key_t, "__name__", key_t)),
         }
 
-    # Primitives / simple classes
     if t in (str, int, float, bool):
-        return {"type": t.__name__}
+        prim = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+        }[t]
+        return {"type": prim}
     if t is Any:
         return {"type": "any"}
 
-    # typing.Any or unknown types fallback
     name = getattr(t, "__name__", None) or str(t)
     return {"type": name}
