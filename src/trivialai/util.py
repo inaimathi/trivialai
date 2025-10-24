@@ -1,10 +1,12 @@
 import base64
+import inspect as _inspect
 import json
 import logging
 import os
 import re
 from collections import namedtuple
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
+from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, Iterator,
+                    Optional)
 
 import httpx
 
@@ -188,7 +190,7 @@ def b64url(url):
         return base64.b64encode(r.content).decode("utf-8")
 
 
-# --- NEW: streaming “check at the end” wrappers ---
+# --- Streaming “check at the end” wrappers ---
 
 
 def stream_checked(
@@ -241,3 +243,112 @@ async def astream_checked(
         yield {"type": "final", "ok": True, "parsed": parsed}
     except TransformError as e:
         yield {"type": "final", "ok": False, "error": e.message, "raw": e.raw}
+
+
+# --- NEW: Retry-capable streaming wrappers (attempt logic centralized here) ---
+
+
+def stream_checked_retries(
+    stream_factory: Callable[[], Iterator[Dict[str, Any]]],
+    transformFn: Callable[[str], Any],
+    *,
+    retries: int = 5,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Like stream_checked, but will retry up to `retries` times by re-invoking `stream_factory()`.
+    Emits passthrough events for each attempt; on parse failure emits:
+      {"type":"attempt-failed","attempt":N,"error": "...","raw": ...}
+    On success:
+      {"type":"final","ok":true,"parsed":...,"attempt":N}
+    After exhausting attempts:
+      {"type":"final","ok":false,"error":"failed-on-<retries>-retries","attempts":retries,"last_error": "..."}
+    """
+    last_error: Optional[TransformError] = None
+    for attempt in range(1, max(1, retries) + 1):
+        buf: list[str] = []
+        last_end: Optional[Dict[str, Any]] = None
+
+        for ev in stream_factory():
+            t = ev.get("type")
+            if t == "delta":
+                buf.append(ev.get("text", ""))
+            elif t == "end":
+                last_end = ev
+            yield ev
+
+        full = "".join(buf) if buf else ((last_end or {}).get("content") or "")
+        try:
+            parsed = transformFn(full)
+            yield {"type": "final", "ok": True, "parsed": parsed, "attempt": attempt}
+            return
+        except TransformError as e:
+            last_error = e
+            yield {
+                "type": "attempt-failed",
+                "attempt": attempt,
+                "error": e.message,
+                "raw": e.raw,
+            }
+
+    yield {
+        "type": "final",
+        "ok": False,
+        "error": f"failed-on-{retries}-retries",
+        "attempts": retries,
+        "last_error": getattr(last_error, "message", None),
+    }
+
+
+async def astream_checked_retries(
+    stream_factory: Callable[
+        [], AsyncIterator[Dict[str, Any]] | Awaitable[AsyncIterator[Dict[str, Any]]]
+    ],
+    transformFn: Callable[[str], Any],
+    *,
+    retries: int = 5,
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Async variant of stream_checked_retries.
+
+    Accepts a factory that returns either:
+      - an AsyncIterator[Dict[str, Any]], or
+      - an Awaitable that resolves to an AsyncIterator[Dict[str, Any]].
+    """
+    last_error: Optional[TransformError] = None
+    for attempt in range(1, max(1, retries) + 1):
+        buf: list[str] = []
+        last_end: Optional[Dict[str, Any]] = None
+
+        stream_obj = stream_factory()
+        if _inspect.isawaitable(stream_obj):
+            stream_obj = await stream_obj  # support async factories
+
+        async for ev in stream_obj:
+            t = ev.get("type")
+            if t == "delta":
+                buf.append(ev.get("text", ""))
+            elif t == "end":
+                last_end = ev
+            yield ev
+
+        full = "".join(buf) if buf else ((last_end or {}).get("content") or "")
+        try:
+            parsed = transformFn(full)
+            yield {"type": "final", "ok": True, "parsed": parsed, "attempt": attempt}
+            return
+        except TransformError as e:
+            last_error = e
+            yield {
+                "type": "attempt-failed",
+                "attempt": attempt,
+                "error": e.message,
+                "raw": e.raw,
+            }
+
+    yield {
+        "type": "final",
+        "ok": False,
+        "error": f"failed-on-{retries}-retries",
+        "attempts": retries,
+        "last_error": getattr(last_error, "message", None),
+    }

@@ -1,6 +1,9 @@
+# test_util.py
+import asyncio
 import unittest
 
-from src.trivialai.util import TransformError, loadch, stream_checked
+from src.trivialai.util import (TransformError, astream_checked_retries,
+                                loadch, stream_checked, stream_checked_retries)
 
 
 class TestUtil(unittest.TestCase):
@@ -36,7 +39,7 @@ class TestUtil(unittest.TestCase):
             loadch(invalid_resp)
         self.assertEqual(str(context.exception), "parse-failed")
 
-    # --- New streaming tests ---
+    # --- Existing streaming tests ---
 
     def _fake_stream(self, parts):
         yield {"type": "start", "provider": "test", "model": "dummy"}
@@ -69,3 +72,84 @@ class TestUtil(unittest.TestCase):
         self.assertEqual(final.get("type"), "final")
         self.assertFalse(final.get("ok"))
         self.assertEqual(final.get("error"), "parse-failed")
+
+    # --- New: retry-capable streaming tests (sync & async) ---
+
+    def test_stream_checked_retries_retry_then_success(self):
+        """First attempt fails to parse; second succeeds."""
+        attempts = [
+            ["{bad:", "json}"],  # invalid
+            ['[{"ok":', " true}]"],  # valid JSON list
+        ]
+        idx = {"i": 0}
+
+        def factory():
+            # pick attempt's parts, then advance
+            parts = attempts[min(idx["i"], len(attempts) - 1)]
+            idx["i"] += 1
+            return self._fake_stream(parts)
+
+        evs = list(stream_checked_retries(factory, loadch, retries=2))
+
+        # should have an attempt-failed message
+        self.assertTrue(any(e.get("type") == "attempt-failed" for e in evs))
+        final = evs[-1]
+        self.assertEqual(final.get("type"), "final")
+        self.assertTrue(final.get("ok"))
+        self.assertEqual(final.get("attempt"), 2)
+        self.assertEqual(final.get("parsed"), [{"ok": True}])
+
+    def test_stream_checked_retries_all_fail(self):
+        """All attempts fail; final should indicate failure with attempts count."""
+        attempts = [
+            ["{bad:", "json}"],
+            ["{still:", "bad}"],
+        ]
+        idx = {"i": 0}
+
+        def factory():
+            parts = attempts[min(idx["i"], len(attempts) - 1)]
+            idx["i"] += 1
+            return self._fake_stream(parts)
+
+        evs = list(stream_checked_retries(factory, loadch, retries=2))
+        finals = [e for e in evs if e.get("type") == "final"]
+        self.assertEqual(len(finals), 1)
+        final = finals[0]
+        self.assertFalse(final.get("ok"))
+        self.assertEqual(final.get("attempts"), 2)
+        self.assertEqual(final.get("error"), "failed-on-2-retries")
+
+    def test_astream_checked_retries_retry_then_success(self):
+        """Async variant: first attempt fails; second succeeds."""
+        attempts = [
+            ["{bad:", "json}"],
+            ['{"good":', " 1}"],
+        ]
+        idx = {"i": 0}
+
+        async def async_stream(parts):
+            yield {"type": "start", "provider": "test", "model": "dummy"}
+            for p in parts:
+                yield {"type": "delta", "text": p}
+                await asyncio.sleep(0)  # yield control
+            yield {"type": "end", "content": "".join(parts)}
+
+        async def factory():
+            parts = attempts[min(idx["i"], len(attempts) - 1)]
+            idx["i"] += 1
+            return async_stream(parts)
+
+        async def run():
+            out = []
+            async for ev in astream_checked_retries(factory, loadch, retries=2):
+                out.append(ev)
+            return out
+
+        evs = asyncio.run(run())
+        self.assertTrue(any(e.get("type") == "attempt-failed" for e in evs))
+        final = evs[-1]
+        self.assertEqual(final.get("type"), "final")
+        self.assertTrue(final.get("ok"))
+        self.assertEqual(final.get("attempt"), 2)
+        self.assertEqual(final.get("parsed"), {"good": 1})

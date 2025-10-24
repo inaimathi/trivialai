@@ -1,8 +1,9 @@
+# test_llm.py
 import asyncio
 import unittest
 
 from src.trivialai.llm import LLMMixin
-from src.trivialai.util import LLMResult, loadch
+from src.trivialai.util import LLMResult, TransformError, loadch
 
 
 class FakeLLM(LLMMixin):
@@ -21,6 +22,31 @@ class FakeLLM(LLMMixin):
         self.calls += 1
         content = self.contents[idx]
         return LLMResult(raw=None, content=content, scratchpad=None)
+
+
+class _StubTools:
+    """
+    Minimal Tools-like stub for tests.
+    Enforces list-of-dicts with {"functionName": str, "args": dict}.
+    """
+
+    def list(self):
+        return [
+            {"name": "foo", "description": "stub", "args": {"x": {"type": "integer"}}}
+        ]
+
+    def transform_multi(self, resp):
+        data = loadch(resp)
+        if not isinstance(data, list):
+            raise TransformError("result-not-list", raw=data)
+        for item in data:
+            if (
+                not isinstance(item, dict)
+                or "functionName" not in item
+                or "args" not in item
+            ):
+                raise TransformError("invalid-tool-subcall", raw=item)
+        return data
 
 
 class TestLLMMixin(unittest.TestCase):
@@ -76,3 +102,68 @@ class TestLLMMixin(unittest.TestCase):
 
         res = asyncio.run(run())
         self.assertEqual(res.content, "result text")
+
+    # --- New: tool-call streaming tests (sync & async) ---
+
+    def test_stream_tool_calls_success_no_retry(self):
+        tools = _StubTools()
+        # Already a valid list of tool calls
+        payload = '[{"functionName": "foo", "args": {"x": 1}}]'
+        llm = FakeLLM([payload])
+
+        evs = list(llm.stream_tool_calls(tools, prompt="ignored", retries=3))
+
+        # Ensure pass-through events happened
+        self.assertTrue(any(e.get("type") == "start" for e in evs))
+        self.assertTrue(any(e.get("type") == "end" for e in evs))
+
+        final = evs[-1]
+        self.assertEqual(final.get("type"), "final")
+        self.assertTrue(final.get("ok"))
+        self.assertEqual(final.get("attempt"), 1)
+        self.assertEqual(
+            final.get("parsed"), [{"functionName": "foo", "args": {"x": 1}}]
+        )
+
+    def test_stream_tool_calls_retry_then_success(self):
+        tools = _StubTools()
+        # First attempt is NOT a list (invalid), second attempt is valid
+        bad = '{"functionName": "foo", "args": {"x": 1}}'
+        good = '[{"functionName": "foo", "args": {"x": 2}}]'
+        llm = FakeLLM([bad, good])
+
+        evs = list(llm.stream_tool_calls(tools, prompt="ignored", retries=2))
+
+        # We should see at least one attempt-failed before the final
+        self.assertTrue(any(e.get("type") == "attempt-failed" for e in evs))
+        final = evs[-1]
+        self.assertEqual(final.get("type"), "final")
+        self.assertTrue(final.get("ok"))
+        self.assertEqual(final.get("attempt"), 2)
+        self.assertEqual(
+            final.get("parsed"), [{"functionName": "foo", "args": {"x": 2}}]
+        )
+
+    def test_astream_tool_calls_retry_then_success(self):
+        tools = _StubTools()
+        bad = '{"not": "a list"}'
+        good = '[{"functionName": "foo", "args": {"x": 42}}]'
+        llm = FakeLLM([bad, good])
+
+        async def run():
+            out = []
+            async for ev in llm.astream_tool_calls(tools, prompt="ignored", retries=2):
+                out.append(ev)
+            return out
+
+        evs = asyncio.run(run())
+
+        # Expect an attempt-failed and then a final success
+        self.assertTrue(any(e.get("type") == "attempt-failed" for e in evs))
+        final = evs[-1]
+        self.assertEqual(final.get("type"), "final")
+        self.assertTrue(final.get("ok"))
+        self.assertEqual(final.get("attempt"), 2)
+        self.assertEqual(
+            final.get("parsed"), [{"functionName": "foo", "args": {"x": 42}}]
+        )

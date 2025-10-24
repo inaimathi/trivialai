@@ -1,11 +1,15 @@
+# llm.py
 from __future__ import annotations
 
 from asyncio import to_thread
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
 
 from .async_utils import aiter_to_iter
-from .util import LLMResult, TransformError, generate_checked, loadch
+from .util import LLMResult, TransformError
+from .util import astream_checked_retries as _astream_checked_retries
+from .util import generate_checked, loadch
 from .util import stream_checked as _stream_checked_util
+from .util import stream_checked_retries as _stream_checked_retries
 
 
 class LLMMixin:
@@ -85,7 +89,7 @@ class LLMMixin:
     ) -> LLMResult:
         raise NotImplementedError
 
-    # ---- Async & streaming APIs (new) ----
+    # ---- Async & streaming APIs (existing) ----
 
     async def agenerate(
         self, system: str, prompt: str, images: Optional[list] = None
@@ -146,3 +150,57 @@ class LLMMixin:
         Streaming helper that parses the final accumulated text as JSON.
         """
         return self.stream_checked(loadch, system, prompt, images)
+
+    # ---- NEW: streaming tool-calls (retries live in util) ----
+
+    async def astream_tool_calls(
+        self,
+        tools: Any,
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Async streaming wrapper that defers attempt/retry logic to util.astream_checked_retries.
+        Emits passthrough events from each attempt; on parse failure emits {"type":"attempt-failed", ...};
+        on success emits {"type":"final","ok":true,...}; finally emits {"type":"final","ok":false,...} if all fail.
+        """
+        sysprompt = (
+            "You are a computer specialist. Your job is translating client requests into tool calls. "
+            "Your client has sent a request to use some number of tools; return a list of function calls "
+            "corresponding to the request and no other commentary. "
+            'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
+            f"You have access to the tools: {tools.list()}."
+        )
+
+        # IMPORTANT: yield from the async generator, don't return it.
+        agen = _astream_checked_retries(
+            lambda: self.astream(sysprompt, prompt, images),
+            tools.transform_multi,
+            retries=retries,
+        )
+        async for ev in agen:
+            yield ev
+
+    def stream_tool_calls(
+        self,
+        tools: Any,
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Sync wrapper around util.stream_checked_retries for tool-call lists.
+        """
+        sysprompt = (
+            "You are a computer specialist. Your job is translating client requests into tool calls. "
+            "Your client has sent a request to use some number of tools; return a list of function calls "
+            "corresponding to the request and no other commentary. "
+            'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
+            f"You have access to the tools: {tools.list()}."
+        )
+        return _stream_checked_retries(
+            lambda: self.stream(sysprompt, prompt, images),
+            tools.transform_multi,
+            retries=retries,
+        )
