@@ -5,11 +5,91 @@ from asyncio import to_thread
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
 
 from .async_utils import aiter_to_iter
-from .util import LLMResult, TransformError
-from .util import astream_checked_retries as _astream_checked_retries
-from .util import generate_checked, loadch
-from .util import stream_checked as _stream_checked_util
-from .util import stream_checked_retries as _stream_checked_retries
+from .util import GenerationError, LLMResult, TransformError
+from .util import astream_checked as _astream_checked_once
+from .util import generate_checked as _generate_checked_once
+from .util import loadch
+from .util import stream_checked as _stream_checked_once
+
+
+def _stream_with_retries(
+    stream_factory: Callable[[], Iterator[Dict[str, Any]]],
+    transformFn: Callable[[str], Any],
+    *,
+    retries: int,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Run util.stream_checked once per attempt; preserve passthrough events;
+    on failure, emit attempt-failed; on success, augment final with attempt.
+    """
+    last_error_msg = None
+    for attempt in range(1, max(1, retries) + 1):
+        final_ev: Optional[Dict[str, Any]] = None
+        for ev in _stream_checked_once(stream_factory(), transformFn):
+            if ev.get("type") == "final":
+                final_ev = ev
+            else:
+                yield ev
+
+        if final_ev and final_ev.get("ok"):
+            out = dict(final_ev)
+            out["attempt"] = attempt
+            yield out
+            return
+        else:
+            last_error_msg = (final_ev or {}).get("error")
+            yield {
+                "type": "attempt-failed",
+                "attempt": attempt,
+                "error": last_error_msg,
+                "raw": (final_ev or {}).get("raw"),
+            }
+
+    yield {
+        "type": "final",
+        "ok": False,
+        "error": f"failed-on-{retries}-retries",
+        "attempts": retries,
+        "last_error": last_error_msg,
+    }
+
+
+async def _astream_with_retries(
+    stream_factory: Callable[[], AsyncIterator[Dict[str, Any]]],
+    transformFn: Callable[[str], Any],
+    *,
+    retries: int,
+) -> AsyncIterator[Dict[str, Any]]:
+    last_error_msg = None
+    for attempt in range(1, max(1, retries) + 1):
+        final_ev: Optional[Dict[str, Any]] = None
+        async for ev in _astream_checked_once(stream_factory(), transformFn):
+            if ev.get("type") == "final":
+                final_ev = ev
+            else:
+                yield ev
+
+        if final_ev and final_ev.get("ok"):
+            out = dict(final_ev)
+            out["attempt"] = attempt
+            yield out
+            return
+        else:
+            last_error_msg = (final_ev or {}).get("error")
+            yield {
+                "type": "attempt-failed",
+                "attempt": attempt,
+                "error": last_error_msg,
+                "raw": (final_ev or {}).get("raw"),
+            }
+
+    yield {
+        "type": "final",
+        "ok": False,
+        "error": f"failed-on-{retries}-retries",
+        "attempts": retries,
+        "last_error": last_error_msg,
+    }
 
 
 class LLMMixin:
@@ -29,11 +109,23 @@ class LLMMixin:
         images: Optional[list] = None,
         retries: int = 5,
     ) -> LLMResult:
-        if images is not None:
-            fn = lambda: self.generate(system, prompt, images=images)
-        else:
-            fn = lambda: self.generate(system, prompt)
-        return generate_checked(fn, transformFn, retries=retries)
+        """
+        Retry at the caller level. Each attempt calls util.generate_checked once.
+        """
+        last_exc: Optional[TransformError] = None
+        for _ in range(max(1, retries)):
+
+            def _gen():
+                return self.generate(system, prompt, images=images)
+
+            try:
+                return _generate_checked_once(_gen, transformFn)
+            except TransformError as e:
+                last_exc = e
+                continue
+        raise GenerationError(
+            f"failed-on-{retries}-retries", raw=getattr(last_exc, "raw", None)
+        )
 
     def generate_json(
         self,
@@ -103,10 +195,6 @@ class LLMMixin:
     async def astream(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Default async streaming: not truly incremental.
-        Subclasses should override for token/fragment streaming.
-        """
         res = await self.agenerate(system, prompt, images)
         content = res.content or ""
         yield {
@@ -126,9 +214,6 @@ class LLMMixin:
     def stream(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Sync facade over `astream` so you can iterate in a plain REPL / sync server.
-        """
         return aiter_to_iter(self.astream(system, prompt, images))
 
     def stream_checked(
@@ -138,20 +223,14 @@ class LLMMixin:
         prompt: str,
         images: Optional[list] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Pass-through stream events, then emit a final parsed event using transformFn(full_text).
-        """
-        return _stream_checked_util(self.stream(system, prompt, images), transformFn)
+        return _stream_checked_once(self.stream(system, prompt, images), transformFn)
 
     def stream_json(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Streaming helper that parses the final accumulated text as JSON.
-        """
         return self.stream_checked(loadch, system, prompt, images)
 
-    # ---- NEW: streaming tool-calls (retries live in util) ----
+    # ---- Streaming tool-calls with caller-managed retries ----
 
     async def astream_tool_calls(
         self,
@@ -160,11 +239,6 @@ class LLMMixin:
         images: Optional[list] = None,
         retries: int = 5,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Async streaming wrapper that defers attempt/retry logic to util.astream_checked_retries.
-        Emits passthrough events from each attempt; on parse failure emits {"type":"attempt-failed", ...};
-        on success emits {"type":"final","ok":true,...}; finally emits {"type":"final","ok":false,...} if all fail.
-        """
         sysprompt = (
             "You are a computer specialist. Your job is translating client requests into tool calls. "
             "Your client has sent a request to use some number of tools; return a list of function calls "
@@ -172,14 +246,11 @@ class LLMMixin:
             'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
             f"You have access to the tools: {tools.list()}."
         )
-
-        # IMPORTANT: yield from the async generator, don't return it.
-        agen = _astream_checked_retries(
+        async for ev in _astream_with_retries(
             lambda: self.astream(sysprompt, prompt, images),
             tools.transform_multi,
             retries=retries,
-        )
-        async for ev in agen:
+        ):
             yield ev
 
     def stream_tool_calls(
@@ -189,9 +260,6 @@ class LLMMixin:
         images: Optional[list] = None,
         retries: int = 5,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Sync wrapper around util.stream_checked_retries for tool-call lists.
-        """
         sysprompt = (
             "You are a computer specialist. Your job is translating client requests into tool calls. "
             "Your client has sent a request to use some number of tools; return a list of function calls "
@@ -199,7 +267,7 @@ class LLMMixin:
             'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
             f"You have access to the tools: {tools.list()}."
         )
-        return _stream_checked_retries(
+        return _stream_with_retries(
             lambda: self.stream(sysprompt, prompt, images),
             tools.transform_multi,
             retries=retries,

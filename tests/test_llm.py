@@ -1,4 +1,4 @@
-# test_llm.py
+# tests/test_llm.py
 import asyncio
 import unittest
 
@@ -59,9 +59,12 @@ class TestLLMMixin(unittest.TestCase):
 
     def test_generate_checked_retries_then_success(self):
         # First attempt invalid JSON, second attempt valid
-        llm = FakeLLM(["{x: 1}", '{"x": 1}'])
+        # Note that loadch uses JSON5, so things like `{x: 1}` or `{x: [1, 2,]}` would succeed.
+        # This is for _really_ invalid JSON
+        llm = FakeLLM(['{"x": }', '{"x": 1}'])
         res = llm.generate_checked(loadch, "sys", "prompt", retries=2)
         self.assertEqual(res.content, {"x": 1})
+        # Ensure we actually retried
         self.assertEqual(llm.calls, 2)
 
     def test_generate_json_strips_code_fence(self):
@@ -103,11 +106,10 @@ class TestLLMMixin(unittest.TestCase):
         res = asyncio.run(run())
         self.assertEqual(res.content, "result text")
 
-    # --- New: tool-call streaming tests (sync & async) ---
+    # --- streaming tool-calls (caller-level retries) ---
 
     def test_stream_tool_calls_success_no_retry(self):
         tools = _StubTools()
-        # Already a valid list of tool calls
         payload = '[{"functionName": "foo", "args": {"x": 1}}]'
         llm = FakeLLM([payload])
 
@@ -127,8 +129,7 @@ class TestLLMMixin(unittest.TestCase):
 
     def test_stream_tool_calls_retry_then_success(self):
         tools = _StubTools()
-        # First attempt is NOT a list (invalid), second attempt is valid
-        bad = '{"functionName": "foo", "args": {"x": 1}}'
+        bad = '{"functionName": "foo", "args": {"x": 1}}'  # not a list
         good = '[{"functionName": "foo", "args": {"x": 2}}]'
         llm = FakeLLM([bad, good])
 
