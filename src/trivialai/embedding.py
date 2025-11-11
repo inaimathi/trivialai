@@ -79,6 +79,8 @@ class OllamaEmbedder(Embedder):
                 raise ValueError("Embedding response missing 'embedding' list")
             return embedding  # type: ignore[return-value]
         elif res.status_code >= 500:
+            if "exceeds the context length" in res.text:
+                raise ValueError("Embedding failed: chunk too large for context")
             # trigger tenacity retry for transient server errors
             raise RuntimeError(f"Ollama server error: {res.status_code}")
         else:
