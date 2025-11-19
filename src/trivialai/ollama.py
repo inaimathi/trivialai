@@ -95,12 +95,15 @@ class Ollama(LLMMixin, FilesystemMixin):
         model: str,
         ollama_server: Optional[str] = None,
         timeout: Optional[float] = 300.0,
+        skip_healthcheck=False,
     ):
         self.server = (ollama_server or "http://localhost:11434").rstrip("/")
         self.model = model
         self.timeout = timeout
+        if not skip_healthcheck:
+            self._startup_health_check()
 
-        # ---- Tight invariant checks: server up AND model present ----
+    def _startup_health_check(self):
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 # 1) Server reachable and responding

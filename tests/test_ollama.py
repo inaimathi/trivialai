@@ -27,7 +27,9 @@ class TestOllamaHelpers(unittest.TestCase):
 
 class FakeStreamOllama(Ollama):
     def __init__(self):
-        super().__init__(model="fake", ollama_server="http://example")
+        super().__init__(
+            model="fake", ollama_server="http://example", skip_healthcheck=True
+        )
 
     async def astream(self, system, prompt, images=None):
         yield {"type": "start", "provider": "ollama", "model": self.model}
@@ -62,7 +64,7 @@ class FakeStreamOllama(Ollama):
 
 class TestOllamaClass(unittest.TestCase):
     def test_constructor_normalizes_server(self):
-        o = Ollama("mistral", "http://host:11434/")
+        o = Ollama("mistral", "http://host:11434/", skip_healthcheck=True)
         self.assertEqual(o.server, "http://host:11434")
         self.assertEqual(o.model, "mistral")
 
