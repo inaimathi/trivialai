@@ -100,6 +100,37 @@ class Ollama(LLMMixin, FilesystemMixin):
         self.model = model
         self.timeout = timeout
 
+        # ---- Tight invariant checks: server up AND model present ----
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                # 1) Server reachable and responding
+                tags_resp = client.get(f"{self.server}/api/tags")
+        except httpx.RequestError as e:
+            raise ValueError(f"Cannot reach Ollama server at {self.server}: {e}") from e
+
+        if tags_resp.status_code != 200:
+            raise ValueError(
+                f"Ollama server at {self.server} responded with HTTP {tags_resp.status_code} for /api/tags"
+            )
+
+        # 2) Model exists exactly as specified (no shorthands, no fallback)
+        try:
+            show_resp = httpx.post(
+                f"{self.server}/api/show",
+                json={"name": self.model},
+                timeout=self.timeout,
+            )
+        except httpx.RequestError as e:
+            raise ValueError(
+                f"Failed to query model '{self.model}' on {self.server}: {e}"
+            ) from e
+
+        if show_resp.status_code != 200:
+            raise ValueError(
+                f"Model '{self.model}' is not available on Ollama server {self.server} "
+                f"(HTTP {show_resp.status_code} from /api/show)."
+            )
+
     # ---- Sync full-generate (compat) ----
     def generate(
         self, system: str, prompt: str, images: Optional[list] = None

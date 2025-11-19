@@ -222,13 +222,25 @@ class LLMMixin:
         system: str,
         prompt: str,
         images: Optional[list] = None,
+        retries: int = 5,
     ) -> Iterator[Dict[str, Any]]:
-        return _stream_checked_once(self.stream(system, prompt, images), transformFn)
+        return _stream_with_retries(
+            lambda: self.stream(system, prompt, images),
+            transformFn,
+            retries=retries,
+        )
 
     def stream_json(
-        self, system: str, prompt: str, images: Optional[list] = None
+        self,
+        system: str,
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
     ) -> Iterator[Dict[str, Any]]:
-        return self.stream_checked(loadch, system, prompt, images)
+        """
+        JSON convenience wrapper over stream_checked with retries.
+        """
+        return self.stream_checked(loadch, system, prompt, images, retries=retries)
 
     # ---- Streaming tool-calls with caller-managed retries ----
 
