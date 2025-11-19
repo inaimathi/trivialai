@@ -1,22 +1,24 @@
 # TrivialAI
 
-*(A set of **httpx**-based, trivial bindings for AI models — now with optional streaming)*
+*(A set of **httpx** / **boto3**-based, trivial bindings for AI models — now with optional streaming)*
 
 ## Install
 
 ```bash
-pip install pytrivialai
+pip install trivialai
 # Optional: HTTP/2 for OpenAI/Anthropic
-# pip install "pytrivialai[http2]"
+# pip install "trivialai[http2]"
+# Optional: AWS Bedrock support (via boto3)
+# pip install "trivialai[bedrock]"
 ```
 
 * Requires **Python ≥ 3.9**.
-* Uses **httpx** (no more `requests`).
+* Uses **httpx** for HTTP-based providers and **boto3** for Bedrock.
 
 ## Quick start
 
 ```py
->>> from trivialai import claude, gcp, ollama, chatgpt
+>>> from trivialai import claude, gcp, ollama, chatgpt, bedrock
 ```
 
 ## Synchronous usage (unchanged ergonomics)
@@ -33,7 +35,7 @@ pip install pytrivialai
 {'name': 'Platypus'}
 ```
 
-### Claude
+### Claude (Anthropic API)
 
 ```py
 >>> client = claude.Claude("claude-3-5-sonnet-20240620", os.environ["ANTHROPIC_API_KEY"])
@@ -49,13 +51,108 @@ pip install pytrivialai
 "Hello, platypus!"
 ```
 
-### ChatGPT
+### ChatGPT (OpenAI API)
 
 ```py
 >>> client = chatgpt.ChatGPT("gpt-4o-mini", os.environ["OPENAI_API_KEY"])
 >>> client.generate("sys msg", "Say hi with 'platypus'.").content
 "Hello, platypus!"
 ```
+
+### AWS Bedrock (Claude / Llama / Nova / etc)
+
+Bedrock support is provided via the `Bedrock` client, which implements the same `LLMMixin` interface as the others.
+
+#### 1) One-time AWS setup
+
+1. **Enable Bedrock and model access**
+
+   * In the AWS console, pick a Bedrock-supported region (e.g. `us-east-1`).
+   * Go to **Amazon Bedrock → Model access** and enable access for the models you want (e.g. Claude 3.5 Sonnet, Llama, Nova, etc).
+
+2. **IAM permissions**
+
+   Grant your user/role permission to call Bedrock runtime APIs, for example:
+
+   ```jsonc
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "bedrock:Converse",
+           "bedrock:ConverseStream",
+           "bedrock:InvokeModel",
+           "bedrock:InvokeModelWithResponseStream"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+
+   You can restrict `Resource` to specific model ARNs later.
+
+3. **Credentials**
+
+   TrivialAI can use either:
+
+   * the normal AWS credential chain (`aws configure`, env vars, instance role), or
+   * explicit credentials passed into the `Bedrock` constructor.
+
+#### 2) Choosing the right `model_id`
+
+Bedrock distinguishes between:
+
+* **Foundation model IDs**, like:
+  `anthropic.claude-3-5-sonnet-20241022-v2:0`
+* **Inference profile IDs**, which are region-prefixed, like:
+  `us.anthropic.claude-3-5-sonnet-20241022-v2:0`
+
+Some newer models (like Claude 3.5 Sonnet v2) must be called **via the inference profile ID** from certain regions. If you see a `ValidationException` complaining about “Invocation of model ID ... with on-demand throughput isn’t supported; retry with an inference profile”, swap to the `us.`-prefixed ID.
+
+#### 3) Minimal Bedrock demo
+
+```py
+from trivialai import bedrock
+
+# Using an inference profile ID for Claude 3.5 Sonnet v2 from us-east-1:
+client = bedrock.Bedrock(
+    model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    region="us-east-1",
+    # Either rely on normal AWS creds...
+    # aws_profile="my-dev-profile",
+    # ...or pass explicit keys (for testing):
+    aws_access_key_id="AKIA...",
+    aws_secret_access_key="SECRET...",
+)
+
+res = client.generate(
+    "This is a test message. Make sure your reply contains the word 'margarine'",
+    "Hello there! Can you hear me?"
+)
+print(res.content)
+# -> "Yes, I can hear you! ... margarine ..."
+
+# With JSON parsing:
+res_json = client.generate_json(
+    "You are a JSON-only assistant.",
+    "Return {'name':'Platypus'} as JSON."
+)
+print(res_json.content)
+# -> {'name': 'Platypus'}
+```
+
+The `Bedrock` client fully participates in the same higher-level helpers:
+
+* `generate_checked(...)`
+* `generate_json(...)`
+* `generate_tool_call(...)`
+* `generate_many_tool_calls(...)`
+* `stream_checked(...)` / `stream_json(...)`
+
+No special-casing required in downstream code.
 
 ---
 
@@ -65,11 +162,11 @@ All providers expose a common streaming shape via `stream(...)` (sync iterator) 
 
 **Event schema**
 
-* `{"type":"start", "provider": "<ollama|openai|anthropic|gcp>", "model": "..."}`
+* `{"type":"start", "provider": "<ollama|openai|anthropic|gcp|bedrock>", "model": "..."}`
 * `{"type":"delta", "text":"...", "scratchpad":"..."}`
 
   * For **Ollama**, `scratchpad` contains model “thinking” extracted from `<think>…</think>`.
-  * For **ChatGPT**/**Claude**, `scratchpad` is `""` (empty).
+  * For **ChatGPT**, **Claude API**, **GCP**, and **Bedrock**, `scratchpad` is `""` (empty) in deltas.
 * `{"type":"end", "content":"...", "scratchpad": <str|None>, "tokens": <int>}`
 * `{"type":"error", "message":"..."}`
 
@@ -84,6 +181,24 @@ All providers expose a common streaming shape via `stream(...)` (sync iterator) 
 ...     elif ev["type"] == "end":
 ...         print("\n-- scratchpad --")
 ...         print(ev["scratchpad"])
+```
+
+### Example: streaming Bedrock (sync)
+
+```py
+>>> from trivialai import bedrock
+>>> client = bedrock.Bedrock(
+...     model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+...     region="us-east-1",
+... )
+>>> events = list(client.stream(
+...     "This is a test message. Make sure your reply contains the word 'margarine'",
+...     "Hello there! Can you hear me?"
+... ))
+>>> events[0]
+{'type': 'start', 'provider': 'bedrock', 'model': 'us.anthropic.claude-3-5-sonnet-20241022-v2:0'}
+>>> events[-1]
+{'type': 'end', 'content': 'Yes, I can hear you! ... margarine ...', 'scratchpad': None, 'tokens': 36}
 ```
 
 ### Example: parse-at-end streaming
@@ -111,6 +226,8 @@ Shortcut: `stream_json(system, prompt)` yields the same stream and a final parse
 async for ev in client.astream("sys", "Stream something."):
     ...
 ```
+
+*(For Bedrock, `stream(...)` is the native streaming interface; `astream(...)` currently falls back to the default `LLMMixin` behavior unless you wrap it yourself.)*
 
 ---
 
@@ -168,7 +285,7 @@ tools.define(search)
 
 ### 3) Ask the model to choose a tool
 
-All LLM clients support a helper that prompts for a tool call and validates it:
+All LLM clients (Ollama, Claude API, ChatGPT, GCP, Bedrock) support a helper that prompts for a tool call and validates it:
 
 ```python
 from trivialai import ollama
@@ -256,20 +373,8 @@ vec = embed("hello world")
 
 ## Notes & compatibility
 
-* **Dependencies**: `httpx` replaces `requests`. Use `httpx[http2]` if you want HTTP/2 for OpenAI/Anthropic.
+* **Dependencies**: `httpx` replaces `requests`. Use `httpx[http2]` if you want HTTP/2 for OpenAI/Anthropic. Use `boto3` for AWS Bedrock.
 * **Python**: ≥ **3.9** (we use `asyncio.to_thread`).
 * **Scratchpad**: only **Ollama** surfaces `<think>` content; others emit `scratchpad` as `""` in deltas and `None` in the final event.
 * **GCP/Vertex AI**: primarily for setup/auth. No native provider streaming; `astream` falls back to a single final chunk unless you override.
-
----
-
-## Changelog (highlights)
-
-* **0.3.0**
-
-  * Switched to **httpx**; removed `requests`.
-  * Added **streaming** interface (`stream`, `astream`) with a unified event schema.
-  * Exposed **Ollama** `<think>` content live via `scratchpad` in deltas.
-  * Added `stream_checked` / `astream_checked` helpers to parse the final output while preserving deltas.
-  * Tightened typing across modules; added tests.
-
+* **Bedrock**: `stream(...)` uses `converse_stream()`; token counts (when available) are surfaced as `tokens` in the final `end` event.
