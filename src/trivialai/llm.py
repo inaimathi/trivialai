@@ -242,6 +242,40 @@ class LLMMixin:
         """
         return self.stream_checked(loadch, system, prompt, images, retries=retries)
 
+    async def astream_checked(
+        self,
+        transformFn: Callable[[str], Any],
+        system: str,
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Async counterpart to `stream_checked`, using util.astream_checked
+        under the hood via `_astream_with_retries`.
+        """
+        async for ev in _astream_with_retries(
+            lambda: self.astream(system, prompt, images),
+            transformFn,
+            retries=retries,
+        ):
+            yield ev
+
+    async def astream_json(
+        self,
+        system: str,
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Async JSON convenience wrapper over astream_checked with retries.
+        """
+        async for ev in self.astream_checked(
+            loadch, system, prompt, images=images, retries=retries
+        ):
+            yield ev
+
     # ---- Streaming tool-calls with caller-managed retries ----
 
     async def astream_tool_calls(
