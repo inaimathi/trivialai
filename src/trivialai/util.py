@@ -1,14 +1,18 @@
+# util.py
+from __future__ import annotations
+
 import base64
 import inspect as _inspect
 import logging
 import os
 import re
 from collections import namedtuple
-from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, Iterator,
-                    Optional)
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
 
 import httpx
 import json5
+
+from .async_utils import dual_stream
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
@@ -185,38 +189,27 @@ def b64url(url):
         return base64.b64encode(r.content).decode("utf-8")
 
 
-def stream_checked(
-    stream_iter: Iterator[Dict[str, Any]], transformFn: Callable[[str], Any]
-) -> Iterator[Dict[str, Any]]:
-    """
-    One-shot streaming: pass-through events and finally emit {"type":"final",...}.
-    No retries here.
-    """
-    buf: list[str] = []
-    last_end: Optional[Dict[str, Any]] = None
-
-    for ev in stream_iter:
-        t = ev.get("type")
-        if t == "delta":
-            buf.append(ev.get("text", ""))
-        elif t == "end":
-            last_end = ev
-        yield ev
-
-    full = "".join(buf) if buf else ((last_end or {}).get("content") or "")
-    try:
-        parsed = transformFn(full)
-        yield {"type": "final", "ok": True, "parsed": parsed}
-    except TransformError as e:
-        yield {"type": "final", "ok": False, "error": e.message, "raw": e.raw}
+async def _iter_to_aiter(it: Iterator[Dict[str, Any]]) -> AsyncIterator[Dict[str, Any]]:
+    for item in it:
+        yield item
 
 
 async def astream_checked(
-    stream_agen: AsyncIterator[Dict[str, Any]], transformFn: Callable[[str], Any]
+    stream_src: Any,
+    transformFn: Callable[[str], Any],
 ) -> AsyncIterator[Dict[str, Any]]:
     """
-    Async one-shot streaming.
+    Async one-shot streaming: pass-through events and finally emit {"type":"final",...}.
+    No retries here.
+
+    This is the canonical implementation. A sync-friendly wrapper exists as
+    `stream_checked` via async_utils.dual_stream.
     """
+    if hasattr(stream_src, "__aiter__"):
+        stream_agen = stream_src  # AsyncIterator or DualStream
+    else:
+        stream_agen = _iter_to_aiter(stream_src)
+
     buf: list[str] = []
     last_end: Optional[Dict[str, Any]] = None
 
@@ -234,3 +227,23 @@ async def astream_checked(
         yield {"type": "final", "ok": True, "parsed": parsed}
     except TransformError as e:
         yield {"type": "final", "ok": False, "error": e.message, "raw": e.raw}
+
+
+@dual_stream
+async def stream_checked(
+    stream_agen: AsyncIterator[Dict[str, Any]],
+    transformFn: Callable[[str], Any],
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Dual-mode wrapper around astream_checked.
+
+    - Async:
+        async for ev in stream_checked(stream, transformFn): ...
+
+    - Sync:
+        for ev in stream_checked(stream, transformFn): ...
+
+    where `stream` can itself be a DualStream (e.g. llm.stream(...)).
+    """
+    async for ev in astream_checked(stream_agen, transformFn):
+        yield ev
