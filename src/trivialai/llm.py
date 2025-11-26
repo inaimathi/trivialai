@@ -1,35 +1,150 @@
 # llm.py
 from __future__ import annotations
 
+import re
 from asyncio import to_thread
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 
-from .async_utils import DualStream, dual_stream
-from .util import GenerationError, LLMResult, TransformError
-from .util import astream_checked as _astream_checked_once
+from .bistream import BiStream
+from .util import GenerationError, LLMResult, TransformError, astream_checked
 from .util import generate_checked as _generate_checked_once
 from .util import loadch
 
+# --- Module-level helpers for <think> parsing (default tags) ---
+
+_DEFAULT_THINK_OPEN = "<think>"
+_DEFAULT_THINK_CLOSE = "</think>"
+
+
+def _split_think_full_with_tags(
+    resp: str, open_tag: str, close_tag: str
+) -> Tuple[str, Optional[str]]:
+    """
+    Given a full response string, remove a single open_tag...close_tag section (if present)
+    and return (public_text, scratchpad_text). If none present, scratchpad is None.
+    """
+    pattern = re.compile(
+        re.escape(open_tag) + r"(.*?)" + re.escape(close_tag), re.DOTALL
+    )
+    m = pattern.search(resp)
+    if not m:
+        return resp, None
+    scratch = m.group(1).strip()
+    content = (resp[: m.start()] + resp[m.end() :]).strip()
+    return content, (scratch or None)
+
+
+def _split_think_full(resp: str) -> Tuple[str, Optional[str]]:
+    """
+    Default helper using <think>...</think> tags.
+    (Kept for back-compat / tests that import it directly.)
+    """
+    return _split_think_full_with_tags(resp, _DEFAULT_THINK_OPEN, _DEFAULT_THINK_CLOSE)
+
+
+def _separate_think_delta_with_tags(
+    delta: str,
+    in_think: bool,
+    carry: str,
+    open_tag: str,
+    close_tag: str,
+) -> Tuple[str, str, bool, str]:
+    """
+    Streaming-safe splitter that handles open_tag...close_tag across chunk boundaries.
+
+    Args:
+      delta: current chunk
+      in_think: whether we're inside <think>…</think>-style region
+      carry: trailing fragment from previous chunk that *might* be a tag prefix
+
+    Returns:
+      (public_out, scratch_out, new_in_think, new_carry)
+    """
+    text = carry + delta
+    i = 0
+    out_pub: list[str] = []
+    out_scr: list[str] = []
+
+    max_tag_len = max(len(open_tag), len(close_tag))
+
+    def _maybe_partial_tag_at(idx: int) -> bool:
+        # If remaining text at idx is a prefix of an open/close tag, we need more bytes.
+        remaining = text[idx:]
+        if len(remaining) >= max_tag_len:
+            return False
+        return open_tag.startswith(remaining) or close_tag.startswith(remaining)
+
+    while i < len(text):
+        # Full tags
+        if text.startswith(open_tag, i):
+            in_think = True
+            i += len(open_tag)
+            continue
+        if text.startswith(close_tag, i):
+            in_think = False
+            i += len(close_tag)
+            continue
+
+        # Partial tag at buffer end? keep it in carry for the next call
+        if _maybe_partial_tag_at(i):
+            carry = text[i:]
+            break
+
+        # Normal emission
+        ch = text[i]
+        if in_think:
+            out_scr.append(ch)
+        else:
+            out_pub.append(ch)
+        i += 1
+        carry = ""  # we've consumed any previous carry
+
+    # If we consumed all text, ensure carry is empty
+    if i >= len(text):
+        carry = ""
+
+    return ("".join(out_pub), "".join(out_scr), in_think, carry)
+
+
+def _separate_think_delta(
+    delta: str, in_think: bool, carry: str
+) -> Tuple[str, str, bool, str]:
+    """
+    Default helper using <think>...</think> tags.
+    (Kept for back-compat / tests that import it directly.)
+    """
+    return _separate_think_delta_with_tags(
+        delta, in_think, carry, _DEFAULT_THINK_OPEN, _DEFAULT_THINK_CLOSE
+    )
+
 
 async def _astream_with_retries(
-    stream_factory: Callable[[], AsyncIterator[Dict[str, Any]]],
+    stream_factory: Callable[[], Any],
     transformFn: Callable[[str], Any],
     *,
     retries: int,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
-    Async retry helper for streaming.
+    Async core for streaming with retries.
 
-    - Calls util.astream_checked(stream_factory(), transformFn) once per attempt.
-    - Yields passthrough events.
-    - Emits a final event with retry metadata.
+    For each attempt:
+      - Run `astream_checked` on the stream
+      - Pass through non-final events
+      - Inspect the final event:
+          * if ok=True, emit final+attempt and stop
+          * else emit attempt-failed and retry
+
+    After exhausting retries, emit a final failure event.
     """
     last_error_msg: Optional[str] = None
 
     for attempt in range(1, max(1, retries) + 1):
         final_ev: Optional[Dict[str, Any]] = None
 
-        async for ev in _astream_checked_once(stream_factory(), transformFn):
+        # Normalize stream to BiStream so we can safely consume it async.
+        stream = BiStream.ensure(stream_factory())
+
+        async for ev in astream_checked(stream, transformFn):
             if ev.get("type") == "final":
                 final_ev = ev
             else:
@@ -40,15 +155,14 @@ async def _astream_with_retries(
             out["attempt"] = attempt
             yield out
             return
-
-        # failure on this attempt
-        last_error_msg = (final_ev or {}).get("error")
-        yield {
-            "type": "attempt-failed",
-            "attempt": attempt,
-            "error": last_error_msg,
-            "raw": (final_ev or {}).get("raw"),
-        }
+        else:
+            last_error_msg = (final_ev or {}).get("error")
+            yield {
+                "type": "attempt-failed",
+                "attempt": attempt,
+                "error": last_error_msg,
+                "raw": (final_ev or {}).get("raw"),
+            }
 
     # Exhausted retries
     yield {
@@ -60,182 +174,98 @@ async def _astream_with_retries(
     }
 
 
+def _stream_with_retries(
+    stream_factory: Callable[[], Any],
+    transformFn: Callable[[str], Any],
+    *,
+    retries: int,
+) -> BiStream[Dict[str, Any]]:
+    """
+    Sync/async-friendly wrapper around _astream_with_retries.
+
+    Returns a BiStream so callers can:
+      - `for ev in _stream_with_retries(...): ...`
+      - `async for ev in _stream_with_retries(...): ...`
+    """
+    return BiStream(_astream_with_retries(stream_factory, transformFn, retries=retries))
+
+
 class LLMMixin:
     """
-    LLM mixin with:
+    Mixin surface for LLMs.
 
-      - sync core:
-          generate, generate_checked, generate_json, generate_tool_call, ...
+    Subclasses MUST implement:
+      - generate(system, prompt, images=None) -> LLMResult
 
-      - async helpers:
-          agenerate (default: run generate() in a thread)
+    Subclasses MAY override:
+      - astream(...) for true incremental streaming
+      - agenerate(...) if they want a custom async aggregation strategy
 
-      - streaming surfaces:
-          stream, stream_checked, stream_json, stream_tool_calls
+    Scratchpad / think-block handling:
 
-        All streaming methods are implemented once as async generators,
-        and exposed as DualStream so they work in both sync and async code:
+      - Set THINK_OPEN / THINK_CLOSE at class definition time *or* per instance:
 
-          # async
-          async for ev in llm.stream(...): ...
-          async for ev in llm.stream_json(...): ...
+          class Ollama(LLMMixin, ...):
+              THINK_OPEN = "<think>"
+              THINK_CLOSE = "</think>"
 
-          # sync (REPL/tests)
-          for ev in llm.stream(...): ...
-          for ev in llm.stream_json(...): ...
+          # or
+          o = Ollama(..., open_think="<!--think-->", close_think="<!--/think-->")
 
-    Scratchpad support:
-
-      - Class-level tags THINK_OPEN / THINK_CLOSE define scratchpad boundaries.
-      - If these are set (e.g., "<think>" / "</think>"), helper methods
-        `_split_think_full` and `_separate_think_delta` can be used by
-        subclasses to separate public content from scratchpad, both in
-        full-response and streaming modes.
-
-      - If tags are left as None (default), no tag-based splitting is applied
-        by the helpers (they become no-ops).
+      - If THINK_* is configured (on the instance), streaming output from `.stream(...)` will:
+          * strip think blocks from user-visible 'text'
+          * accumulate them into 'scratchpad'
+      - If THINK_* is NOT configured, streaming output will:
+          * leave text untouched
+          * emit scratchpad="" on deltas and scratchpad=None on end.
     """
 
-    # ---- Scratchpad configuration (override per subclass if desired) --------
-
-    # Example for models with think blocks:
-    #   THINK_OPEN = "<think>"
-    #   THINK_CLOSE = "</think>"
     THINK_OPEN: Optional[str] = None
     THINK_CLOSE: Optional[str] = None
 
-    # ---- Scratchpad helpers -------------------------------------------------
+    # ---- Instance-level helpers for think/scratchpad parsing ----
 
-    @classmethod
-    def _has_scratchpad_tags(cls) -> bool:
-        return bool(cls.THINK_OPEN) and bool(cls.THINK_CLOSE)
-
-    @classmethod
-    def _split_think_full(cls, text: str) -> Tuple[str, Optional[str]]:
+    def _get_think_tags(self) -> Tuple[Optional[str], Optional[str]]:
         """
-        Given a full response string, remove a single THINK_OPEN...THINK_CLOSE
-        section (if configured and present) and return (public_text, scratchpad).
-
-        If tags are not configured or no complete pair is found, returns
-        (text, None).
+        Look up think tags on the instance first (allow per-instance overrides),
+        then fall back to class attributes.
         """
-        if not cls._has_scratchpad_tags() or not text:
-            return text, None
+        open_tag = getattr(self, "THINK_OPEN", None)
+        close_tag = getattr(self, "THINK_CLOSE", None)
+        return open_tag, close_tag
 
-        open_tag = cls.THINK_OPEN or ""
-        close_tag = cls.THINK_CLOSE or ""
+    def _think_enabled(self) -> bool:
+        open_tag, close_tag = self._get_think_tags()
+        return bool(open_tag and close_tag)
 
-        start = text.find(open_tag)
-        if start == -1:
-            return text, None
-        end = text.find(close_tag, start + len(open_tag))
-        if end == -1:
-            return text, None
+    def split_think_full(self, resp: str) -> Tuple[str, Optional[str]]:
+        """
+        Split a full response string into (public_text, scratchpad) based on
+        the instance THINK_* configuration.
+        """
+        open_tag, close_tag = self._get_think_tags()
+        if not (open_tag and close_tag):
+            return resp, None
+        return _split_think_full_with_tags(resp, open_tag, close_tag)
 
-        scratch = text[start + len(open_tag) : end].strip()
-        content = (text[:start] + text[end + len(close_tag) :]).strip()
-        return content, (scratch or None)
-
-    @classmethod
-    def _separate_think_delta(
-        cls,
-        delta: str,
-        in_think: bool,
-        carry: str,
+    def separate_think_delta(
+        self, delta: str, in_think: bool, carry: str
     ) -> Tuple[str, str, bool, str]:
         """
-        Streaming-safe splitter that handles THINK_OPEN...THINK_CLOSE across
-        chunk boundaries.
+        Split a delta chunk into (public, scratchpad) based on THINK_* config.
 
-        Args:
-          delta: current chunk
-          in_think: whether we're inside THINK_OPEN…THINK_CLOSE
-          carry: trailing fragment from previous chunk that *might* be a tag prefix
-
-        Returns:
-          (public_out, scratch_out, new_in_think, new_carry)
-
-        If tags are not configured, returns (delta+carry, "", False, "").
+        If THINK_* is not set, returns (delta_with_carry, "", in_think, "").
         """
-        if not cls._has_scratchpad_tags():
-            # No tag semantics: everything is public text.
-            full = (carry or "") + (delta or "")
-            return full, "", False, ""
+        open_tag, close_tag = self._get_think_tags()
+        if not (open_tag and close_tag):
+            # No scratchpad semantics: entire delta is public.
+            text = carry + delta
+            return text, "", in_think, ""
+        return _separate_think_delta_with_tags(
+            delta, in_think, carry, open_tag, close_tag
+        )
 
-        open_tag = cls.THINK_OPEN or ""
-        close_tag = cls.THINK_CLOSE or ""
-        max_len = max(len(open_tag), len(close_tag))
-
-        text = (carry or "") + (delta or "")
-        i = 0
-        out_pub: list[str] = []
-        out_scr: list[str] = []
-
-        def _maybe_partial_tag_at(idx: int) -> bool:
-            remaining = text[idx:]
-            if len(remaining) >= max_len:
-                return False
-            return open_tag.startswith(remaining) or close_tag.startswith(remaining)
-
-        while i < len(text):
-            # Full tags
-            if text.startswith(open_tag, i):
-                in_think = True
-                i += len(open_tag)
-                continue
-            if text.startswith(close_tag, i):
-                in_think = False
-                i += len(close_tag)
-                continue
-
-            # Partial tag at buffer end? keep it in carry for the next call
-            if _maybe_partial_tag_at(i):
-                carry = text[i:]
-                break
-
-            # Normal emission
-            ch = text[i]
-            if in_think:
-                out_scr.append(ch)
-            else:
-                out_pub.append(ch)
-            i += 1
-            carry = ""  # we've consumed any previous carry
-
-        # If we consumed all text, ensure carry is empty
-        if i >= len(text):
-            carry = ""
-
-        return ("".join(out_pub), "".join(out_scr), in_think, carry)
-
-    # ---- Core text generation -----------------------------------------------
-
-    def generate(
-        self, system: str, prompt: str, images: Optional[list] = None
-    ) -> LLMResult:
-        """
-        Subclasses MUST override this with a synchronous implementation.
-
-        Returns an LLMResult(raw, content, scratchpad).
-
-        Subclasses that want tag-based scratchpad splitting for full responses
-        can use `_split_think_full` here, e.g.:
-
-            raw = provider_call(...)
-            content, scratch = self._split_think_full(raw_text)
-            return LLMResult(raw, content, scratch)
-        """
-        raise NotImplementedError
-
-    async def agenerate(
-        self, system: str, prompt: str, images: Optional[list] = None
-    ) -> LLMResult:
-        """
-        Default async implementation: runs sync `generate` in a thread.
-
-        Subclasses with native async clients may override this to avoid thread hopping.
-        """
-        return await to_thread(self.generate, system, prompt, images)
+    # ---- Synchronous APIs ----
 
     def generate_checked(
         self,
@@ -246,13 +276,12 @@ class LLMMixin:
         retries: int = 5,
     ) -> LLMResult:
         """
-        Retry at the caller level. Each attempt calls util.generate_checked once,
-        which in turn calls self.generate(...) and applies transformFn.
+        Retry at the caller level. Each attempt calls util.generate_checked once.
         """
         last_exc: Optional[TransformError] = None
         for _ in range(max(1, retries)):
 
-            def _gen() -> LLMResult:
+            def _gen():
                 return self.generate(system, prompt, images=images)
 
             try:
@@ -260,7 +289,6 @@ class LLMMixin:
             except TransformError as e:
                 last_exc = e
                 continue
-
         raise GenerationError(
             f"failed-on-{retries}-retries", raw=getattr(last_exc, "raw", None)
         )
@@ -273,7 +301,7 @@ class LLMMixin:
         retries: int = 5,
     ) -> LLMResult:
         """
-        Convenience wrapper for JSON responses.
+        Convenience wrapper: decode the model output as JSON via loadch.
         """
         return self.generate_checked(
             loadch, system, prompt, images=images, retries=retries
@@ -287,6 +315,9 @@ class LLMMixin:
         images: Optional[list] = None,
         retries: int = 5,
     ) -> LLMResult:
+        """
+        Single tool-call generation: return a single validated tool invocation.
+        """
         sysprompt = (
             "You are a computer specialist. Your job is translating client requests "
             "into tool calls. Your client has sent a request to use a tool; return the "
@@ -305,6 +336,9 @@ class LLMMixin:
         images: Optional[list] = None,
         retries: int = 5,
     ) -> LLMResult:
+        """
+        Multiple tool-call generation: return a list of validated tool invocations.
+        """
         sysprompt = (
             "You are a computer specialist. Your job is translating client requests into tool calls. "
             "Your client has sent a request to use some number of tools; return a list of function calls "
@@ -316,121 +350,193 @@ class LLMMixin:
             tools.transform_multi, sysprompt, prompt, images=images, retries=retries
         )
 
-    # ---- Base async streaming primitive -------------------------------------
+    # Subclasses must provide this. Keeps sync compatibility.
+    def generate(
+        self, system: str, prompt: str, images: Optional[list] = None
+    ) -> LLMResult:
+        raise NotImplementedError
 
-    async def _astream_raw(
+    # ---- Async full-generate built on streaming ----
+
+    async def agenerate(
+        self, system: str, prompt: str, images: Optional[list] = None
+    ) -> LLMResult:
+        """
+        Default async implementation: aggregates over the streaming API.
+
+        Subclasses that override `astream` automatically benefit here; callers
+        can still `await llm.agenerate(...)` without caring about streaming details.
+        """
+        content_parts: list[str] = []
+        scratch_parts: list[str] = []
+
+        async for ev in self.stream(system, prompt, images):
+            t = ev.get("type")
+            if t == "delta":
+                text = ev.get("text", "") or ""
+                scratch = ev.get("scratchpad", "") or ""
+                if text:
+                    content_parts.append(text)
+                if scratch:
+                    scratch_parts.append(scratch)
+            elif t == "end":
+                if "content" in ev and ev["content"] is not None:
+                    content_parts = [ev["content"]]
+                if "scratchpad" in ev and ev["scratchpad"] is not None:
+                    scratch_parts = [ev["scratchpad"]]
+
+        content = "".join(content_parts)
+        scratch = "".join(scratch_parts) if scratch_parts else None
+        return LLMResult(raw=None, content=content, scratchpad=scratch)
+
+    # ---- Provider-level async streaming core ----
+
+    async def astream(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Default streaming implementation in terms of agenerate().
+        Default provider-level async streaming implementation: runs sync `generate`
+        in a thread and yields a single delta.
 
-        Subclasses that support true incremental streaming SHOULD override this
-        with a real async streaming implementation that can use
-        `_separate_think_delta` per chunk.
+        Subclasses with native async/streaming APIs should override *this* to yield
+        base events:
 
-        Default behavior (no incremental streaming):
+          - {"type":"start", ...}
+          - {"type":"delta", "text": "..."}  # may include THINK tags
+          - {"type":"end", "content": "..."} # optional content
 
-          - calls agenerate()
-          - emits a single delta with text=res.content and scratchpad=""
-          - emits an end event with content=res.content, scratchpad=res.scratchpad
+        THINK parsing is applied by `stream(...)`, not here.
         """
-        res = await self.agenerate(system, prompt, images)
+        res = await to_thread(self.generate, system, prompt, images)
         content = res.content or ""
+
         yield {
             "type": "start",
             "provider": self.__class__.__name__.lower(),
             "model": getattr(self, "model", None),
         }
         if content:
-            # For generic models (e.g., ChatGPT/Claude) that don't have
-            # a separate scratchpad stream, we standardize on scratchpad=""
-            # for deltas. Models with think tags will typically override
-            # _astream_raw and use _separate_think_delta instead.
-            yield {"type": "delta", "text": content, "scratchpad": ""}
-
+            yield {
+                "type": "delta",
+                "text": content,
+            }
         yield {
             "type": "end",
             "content": content,
-            "scratchpad": res.scratchpad,
-            "tokens": len(content.split()) if isinstance(content, str) else None,
         }
 
-    # ---- Dual-mode streaming surfaces ---------------------------------------
+    # ---- Unified streaming APIs (BiStream-based, with THINK parsing) ----
 
-    @dual_stream
-    async def stream(
+    def stream(
         self, system: str, prompt: str, images: Optional[list] = None
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> BiStream[Dict[str, Any]]:
         """
-        Dual-mode stream interface.
+        Unified streaming API, with scratchpad (<think>…) parsing handled here.
 
-        - Async:
-            async for ev in llm.stream(system, prompt): ...
-
-        - Sync:
-            for ev in llm.stream(system, prompt): ...
-
-        Default behavior is to call `_astream_raw`, which in turn uses `agenerate`.
-        Subclasses can override `_astream_raw` for true incremental streaming and
-        can use `_separate_think_delta` to manage scratchpad tokens.
+        Returns a BiStream so callers can:
+          - use it synchronously:   for ev in llm.stream(...):
+          - use it asynchronously:  async for ev in llm.stream(...):
         """
-        async for ev in self._astream_raw(system, prompt, images):
-            yield ev
 
-    @dual_stream
-    async def stream_checked(
+        async def _wrapped() -> AsyncIterator[Dict[str, Any]]:
+            in_think = False
+            carry = ""
+            content_buf: list[str] = []
+            scratch_buf: list[str] = []
+
+            async for ev in self.astream(system, prompt, images):
+                t = ev.get("type")
+
+                if t == "delta":
+                    raw_text = ev.get("text", "") or ""
+                    out, scr, in_think, carry = self.separate_think_delta(
+                        raw_text, in_think, carry
+                    )
+                    out = out or ""
+                    scr = scr or ""
+
+                    new_ev = dict(ev)
+                    new_ev["text"] = out
+                    new_ev["scratchpad"] = scr
+
+                    if out:
+                        content_buf.append(out)
+                    if scr:
+                        scratch_buf.append(scr)
+
+                    # For THINK-enabled models we might drop purely tag-only deltas;
+                    # for non-THINK we still pass through whatever we got.
+                    if out or scr or not self._think_enabled():
+                        yield new_ev
+
+                elif t == "end":
+                    # Flush any leftover carry as final text/scratch
+                    if carry:
+                        extra_pub, extra_scr, in_think, carry = (
+                            self.separate_think_delta(carry, in_think, "")
+                        )
+                        if extra_pub:
+                            content_buf.append(extra_pub)
+                        if extra_scr:
+                            scratch_buf.append(extra_scr)
+
+                    final_content = "".join(content_buf) or ev.get("content") or ""
+                    final_scratch = "".join(scratch_buf) or None
+
+                    new_ev = dict(ev)
+                    new_ev["content"] = final_content
+                    new_ev["scratchpad"] = final_scratch
+
+                    yield new_ev
+
+                else:
+                    # passthrough for "start" / "error" / etc
+                    yield ev
+
+        return BiStream(_wrapped())
+
+    def stream_checked(
         self,
         transformFn: Callable[[str], Any],
         system: str,
         prompt: str,
         images: Optional[list] = None,
         retries: int = 5,
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> BiStream[Dict[str, Any]]:
         """
-        Retry-aware streaming wrapper that uses util.astream_checked under the hood.
-
-        Exposed as dual-mode:
-
-          - async for ev in llm.stream_checked(...): ...
-          - for ev in llm.stream_checked(...): ...
+        Streaming with transform + retries, returned as a BiStream.
         """
-        async for ev in _astream_with_retries(
+        return _stream_with_retries(
             lambda: self.stream(system, prompt, images),
             transformFn,
             retries=retries,
-        ):
-            yield ev
+        )
 
-    @dual_stream
-    async def stream_json(
+    def stream_json(
         self,
         system: str,
         prompt: str,
         images: Optional[list] = None,
         retries: int = 5,
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> BiStream[Dict[str, Any]]:
         """
-        JSON convenience wrapper over stream_checked with retries.
+        Streaming JSON convenience wrapper over stream_checked with retries.
         """
-        async for ev in self.stream_checked(
+        return self.stream_checked(
             loadch, system, prompt, images=images, retries=retries
-        ):
-            yield ev
+        )
 
-    @dual_stream
-    async def stream_tool_calls(
+    # ---- Streaming tool-calls (BiStream-based) ----
+
+    def stream_tool_calls(
         self,
         tools: Any,
         prompt: str,
         images: Optional[list] = None,
         retries: int = 5,
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> BiStream[Dict[str, Any]]:
         """
-        Streaming tool-call interface.
-
-        Yields:
-          - passthrough events from the underlying LLM stream
-          - attempt-failed / final events from the checked parser
+        Stream a list of tool calls with retries, as a BiStream of events.
         """
         sysprompt = (
             "You are a computer specialist. Your job is translating client requests into tool calls. "
@@ -439,12 +545,8 @@ class LLMMixin:
             'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
             f"You have access to the tools: {tools.list()}."
         )
-
-        async for ev in self.stream_checked(
+        return _stream_with_retries(
+            lambda: self.stream(sysprompt, prompt, images),
             tools.transform_multi,
-            sysprompt,
-            prompt,
-            images=images,
             retries=retries,
-        ):
-            yield ev
+        )
