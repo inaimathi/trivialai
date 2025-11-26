@@ -22,6 +22,9 @@ def _split_think_full_with_tags(
     """
     Given a full response string, remove a single open_tag...close_tag section (if present)
     and return (public_text, scratchpad_text). If none present, scratchpad is None.
+
+    When tags are present, the public content is stripped at the ends to remove
+    dangling whitespace where the think block was removed.
     """
     pattern = re.compile(
         re.escape(open_tag) + r"(.*?)" + re.escape(close_tag), re.DOTALL
@@ -32,14 +35,6 @@ def _split_think_full_with_tags(
     scratch = m.group(1).strip()
     content = (resp[: m.start()] + resp[m.end() :]).strip()
     return content, (scratch or None)
-
-
-def _split_think_full(resp: str) -> Tuple[str, Optional[str]]:
-    """
-    Default helper using <think>...</think> tags.
-    (Kept for back-compat / tests that import it directly.)
-    """
-    return _split_think_full_with_tags(resp, _DEFAULT_THINK_OPEN, _DEFAULT_THINK_CLOSE)
 
 
 def _separate_think_delta_with_tags(
@@ -111,7 +106,7 @@ def _separate_think_delta(
 ) -> Tuple[str, str, bool, str]:
     """
     Default helper using <think>...</think> tags.
-    (Kept for back-compat / tests that import it directly.)
+    (Kept for back-compat / external callers that imported it directly.)
     """
     return _separate_think_delta_with_tags(
         delta, in_think, carry, _DEFAULT_THINK_OPEN, _DEFAULT_THINK_CLOSE
@@ -443,6 +438,7 @@ class LLMMixin:
             carry = ""
             content_buf: list[str] = []
             scratch_buf: list[str] = []
+            saw_think = False
 
             async for ev in self.astream(system, prompt, images):
                 t = ev.get("type")
@@ -463,6 +459,7 @@ class LLMMixin:
                         content_buf.append(out)
                     if scr:
                         scratch_buf.append(scr)
+                        saw_think = True
 
                     # For THINK-enabled models we might drop purely tag-only deltas;
                     # for non-THINK we still pass through whatever we got.
@@ -479,9 +476,15 @@ class LLMMixin:
                             content_buf.append(extra_pub)
                         if extra_scr:
                             scratch_buf.append(extra_scr)
+                            saw_think = True
 
                     final_content = "".join(content_buf) or ev.get("content") or ""
                     final_scratch = "".join(scratch_buf) or None
+
+                    # Match split_think_full semantics:
+                    # only trim when we actually saw a think block.
+                    if saw_think and final_content:
+                        final_content = final_content.strip()
 
                     new_ev = dict(ev)
                     new_ev["content"] = final_content

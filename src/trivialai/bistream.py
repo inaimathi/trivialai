@@ -12,7 +12,7 @@ from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
 from typing import Generic, TypeVar
 
-from . import util
+from .log import getLogger
 
 T = TypeVar("T")
 
@@ -29,7 +29,7 @@ _QUEUE_MAXSIZE = 64
 # longer than this, we log a warning once per iterator.
 _SYNC_ASYNC_WARN_THRESHOLD = 1  # seconds
 
-logger = util.getLogger("trivialai.bistream")
+logger = getLogger("trivialai.bistream")
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
