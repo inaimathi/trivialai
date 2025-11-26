@@ -1,4 +1,3 @@
-# tests/test_llm.py
 import asyncio
 import unittest
 
@@ -34,65 +33,46 @@ class ThinkLLM(LLMMixin):
         self._full_text = full_text
 
     def generate(self, system, prompt, images=None) -> LLMResult:
-        content, scratch = self._split_think_full(self._full_text)
+        # Use the instance-level helper (new API)
+        content, scratch = self.split_think_full(self._full_text)
         return LLMResult(raw=None, content=content, scratchpad=scratch)
 
 
 class StreamingThinkLLM(LLMMixin):
     """
-    LLM that uses the tag-based helpers in a custom _astream_raw to exercise
-    streaming scratchpad splitting via .stream(), not by testing helpers directly.
+    LLM that exercises streaming scratchpad splitting via LLMMixin.stream().
+
+    THINK_OPEN/THINK_CLOSE are configured so that:
+      - .astream() yields raw chunks (with tags possibly split across chunks)
+      - .stream() applies the tag-based splitting to produce text/scratchpad deltas
     """
 
     THINK_OPEN = "<think>"
     THINK_CLOSE = "</think>"
 
     def __init__(self, chunks):
+        # e.g. ["<thi", "nk>abc", "123</t", "hink>HEL", "LO"]
         self._chunks = chunks
 
     def generate(self, system, prompt, images=None) -> LLMResult:
-        # Fallback non-streaming behavior: reuse the helpers on the full text.
+        # Non-streaming fallback: reuse the same helper on the full text.
         full = "".join(self._chunks)
-        content, scratch = self._split_think_full(full)
+        content, scratch = self.split_think_full(full)
         return LLMResult(raw=None, content=content, scratchpad=scratch)
 
-    async def _astream_raw(self, system, prompt, images=None):
-        # Simulate a streaming provider that returns the chunks in self._chunks
+    async def astream(self, system, prompt, images=None):
+        """
+        Simulate a streaming provider that yields the raw chunks verbatim.
+
+        LLMMixin.stream() will wrap this, calling self.separate_think_delta()
+        to split out THINK_OPEN/THINK_CLOSE regions into scratchpad.
+        """
         yield {"type": "start", "provider": "streamingthinkllm", "model": None}
-
-        in_think = False
-        carry = ""
-        content_buf = []
-        scratch_buf = []
-
         for part in self._chunks:
-            out, scr, in_think, carry = self._separate_think_delta(
-                part, in_think, carry
-            )
-            if scr:
-                scratch_buf.append(scr)
-            if out:
-                content_buf.append(out)
-            if out or scr:
-                yield {"type": "delta", "text": out or "", "scratchpad": scr or ""}
-
-        # Flush any carry that turned out not to be a tag
-        if carry:
-            if in_think:
-                scratch_buf.append(carry)
-                yield {"type": "delta", "text": "", "scratchpad": carry}
-            else:
-                content_buf.append(carry)
-                yield {"type": "delta", "text": carry, "scratchpad": ""}
-
-        final_content = "".join(content_buf)
-        final_scratch = "".join(scratch_buf) or None
-        yield {
-            "type": "end",
-            "content": final_content,
-            "scratchpad": final_scratch,
-            "tokens": len(final_content.split()) if final_content else 0,
-        }
+            # Raw text, including <think>...</think> fragments across chunks
+            yield {"type": "delta", "text": part}
+        # Base end event; LLMMixin.stream will rewrite content/scratchpad.
+        yield {"type": "end", "content": "".join(self._chunks)}
 
 
 class TestLLMMixinBasics(unittest.TestCase):
@@ -129,7 +109,7 @@ class TestLLMMixinBasics(unittest.TestCase):
     def test_stream_default_emits_start_delta_end_with_empty_scratchpad(self):
         llm = DummyLLM("hello stream")
 
-        # DualStream: sync iteration is allowed
+        # BiStream: sync iteration is allowed
         events = list(llm.stream("sys", "prompt"))
         kinds = [e.get("type") for e in events]
 
@@ -177,7 +157,7 @@ class TestLLMMixinScratchpadHelpers(unittest.TestCase):
         llm = ThinkLLM(text)
 
         res = llm.generate("sys", "prompt")
-        # _split_think_full should strip the think block from public content
+        # split_think_full should strip the think block from public content
         self.assertEqual(res.content, "Visible before  visible after".strip())
         self.assertEqual(res.scratchpad, "hidden reasoning")
 
