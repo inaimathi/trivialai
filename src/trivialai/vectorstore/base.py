@@ -1,3 +1,4 @@
+# base.py
 import hashlib
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -5,7 +6,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from ..embedding.core import Embedder
 
 Vector = List[float]
-Metadata = Dict[str, str]
+Metadata = Dict[str, Any]
 SearchResult = Dict[str, Any]
 
 
@@ -41,7 +42,24 @@ class Collection(ABC):
         pass
 
     @abstractmethod
-    def lookup(self, vector: Vector) -> Optional[SearchResult]:
+    def lookup(
+        self,
+        *,
+        id: Optional[str] = None,
+        vector: Optional[Vector] = None,
+    ) -> SearchResult:
+        """
+        Index-like lookup.
+
+        Exactly one of `id` or `vector` must be provided:
+        - id:    direct lookup by document ID
+        - vector:nearest neighbor to the provided vector
+
+        Raises:
+            ValueError: if both or neither of id/vector are provided
+            KeyError:   if no matching document exists (e.g. empty collection
+                        or missing id)
+        """
         pass
 
     @abstractmethod
@@ -64,7 +82,17 @@ class Collection(ABC):
         self,
         content: Optional[Any] = None,
         vector: Optional[Vector] = None,
+        id: Optional[str] = None,
     ) -> bool:
+        """
+        Delete by:
+        - id:      document ID
+        - content: hash of str(content)
+        - vector:  nearest neighbor to the given vector
+
+        Returns True if a delete was attempted; False if nothing matched
+        (e.g. empty collection on vector-delete).
+        """
         pass
 
     @abstractmethod
