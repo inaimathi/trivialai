@@ -1,3 +1,5 @@
+# trivialai/agent/core.py
+
 import asyncio
 import json
 import logging
@@ -7,7 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 from uuid import uuid4
 
-from ..tools import to_llm_snippet  # your helper
+from ..bistream import BiStream
+from ..tools import to_llm_snippet
+from .prompting import DEFAULT_CONTEXT_SIZE_CHARS, build_prompt
 
 Message = Dict[str, Any]
 
@@ -30,12 +34,31 @@ class Agent:
         name: Optional[str] = None,
         log_path: Optional[Union[str, Path]] = None,
         logger: Optional[logging.Logger] = None,
+        *,
+        base_system_prompt: str = "",
+        context_size: int = DEFAULT_CONTEXT_SIZE_CHARS,
+        memory: Optional[Any] = None,  # VectorStore | Collection | None (duck-typed)
+        context_summary: Optional[str] = None,
     ):
+        """
+        Agent that uses an LLMMixin-compatible LLM with a streaming API.
+
+        Config:
+        - base_system_prompt: high-level behaviour / goals for build_prompt
+        - context_size: max char length for system prompt built by build_prompt
+        - memory: optional VectorStore/Collection for retrieved context
+        - context_summary: optional short summary of what has happened so far
+        """
         self.llm = llm
         self.name = name or f"agent-{uuid4().hex[:8]}"
         self.log_path = (
             Path(log_path) if log_path else Path(f"./agent_log_{self.name}.jsonl")
         )
+
+        self.base_system_prompt = base_system_prompt
+        self.context_size = context_size
+        self.memory = memory
+        self.context_summary = context_summary
 
         self.logger = logger or logging.getLogger(f"trivialai.agent.{self.name}")
         if not self.logger.handlers:
@@ -58,7 +81,9 @@ class Agent:
 
         self.log("agent.created", {"name": self.name, "log_path": str(self.log_path)})
 
-    # --- logging -------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
 
     def log(self, event_type: str, payload: Dict[str, Any]) -> None:
         event = {
@@ -72,18 +97,36 @@ class Agent:
         self._log_file.flush()
         self.logger.info("%s: %s", event_type, payload)
 
-    # --- constructors --------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Constructors
+    # -------------------------------------------------------------------------
 
     @classmethod
-    def from_llm(cls, llm, log_path: Optional[Union[str, Path]] = None) -> "Agent":
-        return cls(llm=llm, name=None, log_path=log_path)
+    def from_llm(
+        cls,
+        llm,
+        log_path: Optional[Union[str, Path]] = None,
+        **kwargs: Any,
+    ) -> "Agent":
+        """
+        Convenience constructor; forwards extra kwargs to Agent.__init__.
+
+        Example:
+            Agent.from_llm(
+                llm,
+                base_system_prompt="You are a codebase maintenance agent.",
+                context_size=8000,
+                memory=my_collection,
+            )
+        """
+        return cls(llm=llm, name=None, log_path=log_path, **kwargs)
 
     @classmethod
     def from_logs(cls, log_path: Union[str, Path]) -> "Agent":
         """
         Rebuild basic Agent state from an NDJSON log file.
-        You can't reconstruct function objects; you'll need to re-equip tools
-        after creating the Agent.
+        You can't reconstruct function objects or memory; you'll need to
+        re-equip tools and reattach memory after creating the Agent.
         """
         log_path = Path(log_path)
         events = [json.loads(line) for line in log_path.open("r", encoding="utf-8")]
@@ -94,7 +137,6 @@ class Agent:
         agent = cls(llm=None, name=name, log_path=log_path)
         agent._logs = events
 
-        # Tasks can be reconstructed; tools must be re-equipped by the caller.
         for ev in events:
             if ev["event_type"] == "task.enqueued":
                 p = ev["payload"]
@@ -111,7 +153,9 @@ class Agent:
 
         return agent
 
-    # --- tools: functions-as-tools ------------------------------------------
+    # -------------------------------------------------------------------------
+    # Tools: functions-as-tools (for prompt description now, tool-calls later)
+    # -------------------------------------------------------------------------
 
     def equip(
         self,
@@ -153,7 +197,6 @@ class Agent:
 
     def unequip(self, tool: Union[str, Callable[..., Any]]) -> None:
         if callable(tool):
-            # find by identity
             to_remove = [name for name, fn in self._tools.items() if fn is tool]
         else:
             to_remove = [tool]
@@ -164,40 +207,12 @@ class Agent:
                 self._tool_snippets.pop(name, None)
                 self.log("tool.unequipped", {"name": name})
 
-    def _tool_specs_for_llm(self) -> List[Dict[str, Any]]:
-        """
-        Convert tool snippets into the tool schema expected by the LLM.
-
-        Here I assume an OpenAI-like JSON schema. If your trivialai LLM
-        wrapper expects a different shape, adapt this one function.
-        """
-        specs: List[Dict[str, Any]] = []
-        for name, snip in self._tool_snippets.items():
-            args_schema = snip["args"]  # already JSON-schema-like
-
-            specs.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": snip["description"],
-                        "parameters": {
-                            "type": "object",
-                            "properties": args_schema,
-                            # You can get fancier: required from annotations / defaults
-                            "required": list(args_schema.keys()),
-                        },
-                    },
-                }
-            )
-        return specs
-
-    def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Any:
+    async def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Any:
         """
         Execute a tool function with the given args.
 
-        Handles sync vs async, and logs results. Any path/permission checks
-        should be enforced inside the tool function itself.
+        Handles sync vs async, and logs results. This isn't wired into the
+        streaming loop yet, but is ready for future auto tool-calls.
         """
         fn = self._tools[name]
         snip = self._tool_snippets[name]
@@ -207,10 +222,10 @@ class Agent:
 
         try:
             if is_async:
-                # naive: if there's already a running loop you'll want a helper
-                result = asyncio.run(fn(**args))
+                result = await fn(**args)  # type: ignore[misc]
             else:
-                result = fn(**args)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, lambda: fn(**args))
         except Exception as e:
             self.log("tool.error", {"name": name, "args": args, "error": repr(e)})
             raise
@@ -218,7 +233,9 @@ class Agent:
         self.log("tool.result", {"name": name, "args": args, "result": result})
         return result
 
-    # --- tasks ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Tasks
+    # -------------------------------------------------------------------------
 
     def do(self, prompt: str) -> str:
         task = Task(id=uuid4().hex, kind="do", prompt=prompt)
@@ -250,169 +267,371 @@ class Agent:
         )
         return task.id
 
-    def run(self) -> None:
-        for task in self._tasks:
-            if task.status == "done":
-                continue
-            task.status = "running"
-            self.log("task.started", {"id": task.id, "kind": task.kind})
-            try:
-                if task.kind == "do":
-                    result = self._run_single(task)
-                elif task.kind == "loop":
-                    result = self._run_loop(task)
-                else:
-                    raise ValueError(f"Unknown task kind {task.kind}")
-                task.status = "done"
-                task.result = result
-                self.log("task.done", {"id": task.id, "result": result})
-            except Exception as e:
-                task.status = "failed"
-                self.log("task.failed", {"id": task.id, "error": repr(e)})
+    # -------------------------------------------------------------------------
+    # Run: single BiStream interface (sync OR async)
+    # -------------------------------------------------------------------------
 
-    # --- agent loops ---------------------------------------------------------
+    def run(self) -> BiStream[Dict[str, Any]]:
+        """
+        Run all planned tasks and return a BiStream of agent events.
 
-    def _run_single(self, task: Task) -> Any:
-        messages: List[Message] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a tool-using agent. Use tools when needed; "
-                    "when you have enough information, answer the user."
-                ),
-            },
-            {"role": "user", "content": task.prompt},
-        ]
+        Usage:
 
-        tools_for_llm = self._tool_specs_for_llm()
+            # sync
+            for ev in agent.run():
+                ...
 
-        for step in range(1, 32):
-            self.log(
-                "llm.call",
-                {
+            # async
+            async for ev in agent.run():
+                ...
+        """
+
+        async def _agen():
+            for task in self._tasks:
+                if task.status == "done":
+                    continue
+
+                task.status = "running"
+                self.log("task.started", {"id": task.id, "kind": task.kind})
+                yield {
+                    "type": "task.started",
                     "task_id": task.id,
-                    "step": step,
-                    "messages_len": len(messages),
-                    "tools": list(self._tools.keys()),
-                },
-            )
-            result = self.llm.generate(messages=messages, tools=tools_for_llm)
+                    "kind": task.kind,
+                }
 
-            tool_calls = getattr(result, "tool_calls", None)
-            if tool_calls:
-                for call in tool_calls:
-                    tool_name = call["name"]
-                    args = call["arguments"]
-                    tool_result = self._dispatch_tool(tool_name, args)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "content": json.dumps(tool_result),
-                        }
-                    )
-                # loop; let LLM react to tool results
-                continue
-            else:
-                content = result.content
-                messages.append({"role": "assistant", "content": content})
-                self.log("llm.final", {"task_id": task.id, "content": content})
-                return content
-
-        # exceeded steps
-        return {"messages": messages, "truncated": True}
-
-    def _run_loop(self, task: Task) -> Any:
-        history: List[Message] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an iterative agent. At each iteration, use tools to "
-                    "make progress on the task. Avoid repeating work."
-                ),
-            },
-            {"role": "user", "content": task.prompt},
-        ]
-        tools_for_llm = self._tool_specs_for_llm()
-
-        for iteration in range(1, task.max_iter + 1):
-            self.log(
-                "loop.iteration.start", {"task_id": task.id, "iteration": iteration}
-            )
-            messages = list(history)
-
-            # inner tool-using loop
-            for step in range(1, 32):
-                self.log(
-                    "llm.call",
-                    {
+                if task.kind == "do":
+                    async for ev in self._run_single_stream(task):
+                        yield ev
+                elif task.kind == "loop":
+                    async for ev in self._run_loop_stream(task):
+                        yield ev
+                else:
+                    err = ValueError(f"Unknown task kind {task.kind}")
+                    self.log("task.failed", {"id": task.id, "error": repr(err)})
+                    yield {
+                        "type": "task.failed",
                         "task_id": task.id,
+                        "error": repr(err),
+                    }
+                    task.status = "failed"
+                    continue
+
+                task.status = "done"
+                self.log(
+                    "task.done",
+                    {"id": task.id, "kind": task.kind, "result": task.result},
+                )
+                yield {
+                    "type": "task.done",
+                    "task_id": task.id,
+                    "kind": task.kind,
+                    "result": task.result,
+                }
+
+        return BiStream.ensure(_agen())
+
+    # -------------------------------------------------------------------------
+    # Internal: LLM streaming helpers
+    # -------------------------------------------------------------------------
+
+    async def _llm_stream_once(
+        self,
+        *,
+        task_id: str,
+        phase: str,
+        user_prompt: str,
+        iteration: Optional[int] = None,
+    ):
+        """
+        Single LLM call (streaming) as an async generator of events.
+
+        Yields:
+          - {"type": "llm.start", ...}
+          - {"type": "llm.delta", ...}
+          - {"type": "llm.end", ...}
+        """
+        system = build_prompt(
+            base_system_prompt=self.base_system_prompt,
+            user_prompt=user_prompt,
+            tools=list(self._tool_snippets.values()),
+            context_size=self.context_size,
+            memory=self.memory,
+            context_summary=self.context_summary,
+        )
+
+        log_payload: Dict[str, Any] = {
+            "task_id": task_id,
+            "phase": phase,
+            "system_len": len(system),
+            "prompt": user_prompt,
+        }
+        if iteration is not None:
+            log_payload["iteration"] = iteration
+
+        self.log("llm.call", log_payload)
+
+        stream = self.llm.stream(system, user_prompt, images=None)  # BiStream
+
+        content_parts: List[str] = []
+        scratch_parts: List[str] = []
+        final_content: Optional[str] = None
+        final_scratch: Optional[str] = None
+
+        async for ev in stream:
+            ev_type = ev.get("type")
+            if ev_type == "start":
+                out = {
+                    "type": "llm.start",
+                    "task_id": task_id,
+                    "phase": phase,
+                    "iteration": iteration,
+                    "provider": ev.get("provider"),
+                    "model": ev.get("model"),
+                }
+                self.log(
+                    "llm.stream.start",
+                    {
+                        "task_id": task_id,
+                        "phase": phase,
                         "iteration": iteration,
-                        "step": step,
-                        "messages_len": len(messages),
-                        "tools": list(self._tools.keys()),
+                        "provider": out["provider"],
+                        "model": out["model"],
                     },
                 )
-                result = self.llm.generate(messages=messages, tools=tools_for_llm)
+                yield out
 
-                tool_calls = getattr(result, "tool_calls", None)
-                if tool_calls:
-                    for call in tool_calls:
-                        tool_name = call["name"]
-                        args = call["arguments"]
-                        tool_result = self._dispatch_tool(tool_name, args)
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "name": tool_name,
-                                "content": json.dumps(tool_result),
-                            }
-                        )
-                    continue
-                else:
-                    content = result.content
-                    messages.append({"role": "assistant", "content": content})
-                    history.extend(messages[len(history) :])
+            elif ev_type == "delta":
+                text = (ev.get("text") or "") if isinstance(ev.get("text"), str) else ""
+                scratch = (
+                    (ev.get("scratchpad") or "")
+                    if isinstance(ev.get("scratchpad"), str)
+                    else ""
+                )
+                if text:
+                    content_parts.append(text)
+                if scratch:
+                    scratch_parts.append(scratch)
+
+                yield {
+                    "type": "llm.delta",
+                    "task_id": task_id,
+                    "phase": phase,
+                    "iteration": iteration,
+                    "text": text,
+                    "scratchpad": scratch,
+                }
+
+            elif ev_type == "end":
+                if "content" in ev and ev["content"] is not None:
+                    final_content = ev["content"]
+                if "scratchpad" in ev and ev["scratchpad"] is not None:
+                    final_scratch = ev["scratchpad"]
+
+        if final_content is not None:
+            content = final_content
+        else:
+            content = "".join(content_parts)
+
+        if final_scratch is not None:
+            scratch = final_scratch
+        else:
+            scratch = "".join(scratch_parts) if scratch_parts else None
+
+        self.log(
+            "llm.final",
+            {
+                "task_id": task_id,
+                "phase": phase,
+                "iteration": iteration,
+                "content": content,
+                "scratchpad": scratch,
+            },
+        )
+        yield {
+            "type": "llm.end",
+            "task_id": task_id,
+            "phase": phase,
+            "iteration": iteration,
+            "content": content,
+            "scratchpad": scratch,
+        }
+
+    # -------------------------------------------------------------------------
+    # Agent loops: "do" and "loop" in streaming form
+    # -------------------------------------------------------------------------
+
+    async def _run_single_stream(self, task: Task):
+        """
+        Single-step task:
+        - One streaming LLM call
+        - Task.result set to final content
+        """
+        last_content: Optional[str] = None
+
+        async for ev in self._llm_stream_once(
+            task_id=task.id, phase="do", user_prompt=task.prompt
+        ):
+            if ev["type"] == "llm.end":
+                last_content = ev.get("content") or ""
+            yield ev
+
+        # Ensure result is captured
+        task.result = last_content or ""
+        yield {
+            "type": "task.result",
+            "task_id": task.id,
+            "result": task.result,
+        }
+
+    async def _run_loop_stream(self, task: Task):
+        """
+        Iterative task:
+        - For each iteration:
+            * stream a "progress" LLM call
+            * stream a "until-check" LLM call
+        - At the end, stream a "final summary" call
+        - Task.result is the final summary content
+        """
+        iteration_summaries: List[str] = []
+
+        for iteration in range(1, task.max_iter + 1):
+            # Progress phase
+            self.log(
+                "loop.iteration.start",
+                {"task_id": task.id, "iteration": iteration},
+            )
+            yield {
+                "type": "loop.iteration.start",
+                "task_id": task.id,
+                "iteration": iteration,
+            }
+
+            progress_prompt = (
+                "You are working on the following task:\n\n"
+                f"{task.prompt}\n\n"
+                f"This is iteration {iteration} of at most {task.max_iter}. "
+                "Describe the concrete actions you would take or have taken, "
+                "and what you achieved in this iteration."
+            )
+
+            if iteration_summaries:
+                prev = "\n\n".join(
+                    f"Iteration {i+1}: {s}" for i, s in enumerate(iteration_summaries)
+                )
+                progress_prompt += (
+                    "\n\nHere is a summary of previous iterations:\n\n" f"{prev}"
+                )
+
+            iter_content: Optional[str] = None
+            async for ev in self._llm_stream_once(
+                task_id=task.id,
+                phase="loop-iteration",
+                user_prompt=progress_prompt,
+                iteration=iteration,
+            ):
+                if ev["type"] == "llm.end":
+                    iter_content = ev.get("content") or ""
+                yield ev
+
+            iter_summary = iter_content or ""
+            iteration_summaries.append(iter_summary)
+            self.log(
+                "loop.iteration.summary",
+                {
+                    "task_id": task.id,
+                    "iteration": iteration,
+                    "content": iter_summary,
+                },
+            )
+            yield {
+                "type": "loop.iteration.summary",
+                "task_id": task.id,
+                "iteration": iteration,
+                "content": iter_summary,
+            }
+
+            # Until-check phase
+            if task.until:
+                summaries_text = "\n\n".join(
+                    f"Iteration {i+1}: {s}" for i, s in enumerate(iteration_summaries)
+                )
+                check_prompt = (
+                    "You are evaluating whether the task is complete.\n\n"
+                    f"Task description:\n{task.prompt}\n\n"
+                    f"Work done so far:\n{summaries_text}\n\n"
+                    "Now, answer STRICTLY 'yes' or 'no':\n"
+                    f"{task.until!r}"
+                )
+
+                answer_raw: Optional[str] = None
+                async for ev in self._llm_stream_once(
+                    task_id=task.id,
+                    phase="loop-until-check",
+                    user_prompt=check_prompt,
+                    iteration=iteration,
+                ):
+                    if ev["type"] == "llm.end":
+                        answer_raw = ev.get("content") or ""
+                    yield ev
+
+                answer_norm = (answer_raw or "").strip().lower()
+                self.log(
+                    "loop.until.check",
+                    {"task_id": task.id, "iteration": iteration, "answer": answer_norm},
+                )
+                yield {
+                    "type": "loop.until.check",
+                    "task_id": task.id,
+                    "iteration": iteration,
+                    "answer": answer_norm,
+                }
+
+                if answer_norm.startswith("yes"):
                     self.log(
-                        "loop.iteration.summary",
-                        {
-                            "task_id": task.id,
-                            "iteration": iteration,
-                            "content": content,
-                        },
+                        "loop.stopped",
+                        {"task_id": task.id, "iteration": iteration},
                     )
+                    yield {
+                        "type": "loop.stopped",
+                        "task_id": task.id,
+                        "iteration": iteration,
+                    }
                     break
 
-            # stopping condition check
-            stop_messages = history + [
-                {
-                    "role": "user",
-                    "content": (
-                        "Considering all the work so far, answer STRICTLY 'yes' or 'no':\n"
-                        f"Is the following condition now satisfied?\n\n{task.until!r}"
-                    ),
-                }
-            ]
-            stop_result = self.llm.generate(messages=stop_messages, tools=None)
-            stop_text = stop_result.content.strip().lower()
-            self.log(
-                "loop.until.check",
-                {"task_id": task.id, "iteration": iteration, "answer": stop_text},
-            )
-            if stop_text.startswith("yes"):
-                self.log(
-                    "loop.stopped",
-                    {"task_id": task.id, "iteration": iteration},
-                )
-                break
+        # Final summary phase
+        summaries_text = "\n\n".join(
+            f"Iteration {i+1}:\n{s}" for i, s in enumerate(iteration_summaries)
+        )
+        summary_prompt = (
+            "Summarize the work done across all iterations into a concise report "
+            "for the user, focusing on what was attempted, what worked, and what "
+            "remains to be done (if anything).\n\n"
+            f"{summaries_text}"
+        )
 
-        # final summary
-        final_prompt = (
-            "Summarize the work done across all iterations into a concise report."
-        )
-        summary_messages = history + [{"role": "user", "content": final_prompt}]
-        final_result = self.llm.generate(messages=summary_messages, tools=None)
+        final_summary: Optional[str] = None
+        async for ev in self._llm_stream_once(
+            task_id=task.id,
+            phase="loop-final-summary",
+            user_prompt=summary_prompt,
+            iteration=None,
+        ):
+            if ev["type"] == "llm.end":
+                final_summary = ev.get("content") or ""
+            yield ev
+
+        task.result = final_summary or ""
         self.log(
-            "loop.final.summary", {"task_id": task.id, "content": final_result.content}
+            "loop.final.summary",
+            {"task_id": task.id, "content": task.result},
         )
-        return final_result.content
+        yield {
+            "type": "loop.final.summary",
+            "task_id": task.id,
+            "content": task.result,
+        }
+        yield {
+            "type": "task.result",
+            "task_id": task.id,
+            "result": task.result,
+        }
