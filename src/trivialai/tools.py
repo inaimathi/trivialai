@@ -11,6 +11,42 @@ from . import util
 from .util import TransformError
 
 
+def to_llm_snippet(
+    fn: Callable[..., Any],
+    *,
+    name: Optional[str] = None,
+    types: Optional[Dict[str, Any]] = None,
+    description: Optional[str] = None,
+    is_async: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Build the LLM-facing tool descriptor for a function.
+
+    - name: override tool name (defaults to fn.__name__)
+    - types: override parameter annotations dict (defaults to fn.__annotations__ without 'return')
+    - description: override description (defaults to fn.__doc__ or "")
+    - is_async: override async flag (defaults to inspect.iscoroutinefunction(fn))
+    """
+    # Either use the provided schema, or derive it from annotations
+    if types is not None:
+        raw_schema: Dict[str, Any] = types
+    else:
+        ann = getattr(fn, "__annotations__", {}) or {}
+        raw_schema = {k: v for k, v in ann.items() if k != "return"}
+
+    norm_schema: Dict[str, Any] = {arg: _to_schema(t) for arg, t in raw_schema.items()}
+
+    return {
+        "name": name or fn.__name__,
+        "type": raw_schema,
+        "args": norm_schema,
+        "description": description or (fn.__doc__ or ""),
+        "async": bool(
+            is_async if is_async is not None else inspect.iscoroutinefunction(fn)
+        ),
+    }
+
+
 def _run_coro_sync(coro):
     """
     Run a coroutine from synchronous code.
@@ -128,18 +164,14 @@ class Tools:
         """
         out: List[Dict[str, Any]] = []
         for k, v in self._env.items():
-            raw_schema: Dict[str, Any] = v["type"]
-            norm_schema: Dict[str, Any] = {
-                arg: _to_schema(t) for arg, t in raw_schema.items()
-            }
             out.append(
-                {
-                    "name": k,
-                    "type": raw_schema,
-                    "args": norm_schema,
-                    "description": v["description"],
-                    "async": bool(v.get("is_async", False)),
-                }
+                to_llm_snippet(
+                    v["function"],
+                    name=k,
+                    types=v["type"],
+                    description=v["description"],
+                    is_async=v.get("is_async", False),
+                )
             )
         return out
 
