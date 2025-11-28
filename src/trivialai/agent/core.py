@@ -15,6 +15,13 @@ from .prompting import DEFAULT_CONTEXT_SIZE_CHARS, build_prompt
 
 Message = Dict[str, Any]
 
+_EVENT_PREFIX = "trivialai.agent."
+
+
+def _etype(local: str) -> str:
+    """Prefix event type names for streamed events."""
+    return _EVENT_PREFIX + local
+
 
 @dataclass
 class Task:
@@ -110,14 +117,6 @@ class Agent:
     ) -> "Agent":
         """
         Convenience constructor; forwards extra kwargs to Agent.__init__.
-
-        Example:
-            Agent.from_llm(
-                llm,
-                base_system_prompt="You are a codebase maintenance agent.",
-                context_size=8000,
-                memory=my_collection,
-            )
         """
         return cls(llm=llm, name=None, log_path=log_path, **kwargs)
 
@@ -294,7 +293,7 @@ class Agent:
                 task.status = "running"
                 self.log("task.started", {"id": task.id, "kind": task.kind})
                 yield {
-                    "type": "task.started",
+                    "type": _etype("task.started"),
                     "task_id": task.id,
                     "kind": task.kind,
                 }
@@ -309,7 +308,7 @@ class Agent:
                     err = ValueError(f"Unknown task kind {task.kind}")
                     self.log("task.failed", {"id": task.id, "error": repr(err)})
                     yield {
-                        "type": "task.failed",
+                        "type": _etype("task.failed"),
                         "task_id": task.id,
                         "error": repr(err),
                     }
@@ -322,7 +321,7 @@ class Agent:
                     {"id": task.id, "kind": task.kind, "result": task.result},
                 )
                 yield {
-                    "type": "task.done",
+                    "type": _etype("task.done"),
                     "task_id": task.id,
                     "kind": task.kind,
                     "result": task.result,
@@ -346,9 +345,9 @@ class Agent:
         Single LLM call (streaming) as an async generator of events.
 
         Yields:
-          - {"type": "llm.start", ...}
-          - {"type": "llm.delta", ...}
-          - {"type": "llm.end", ...}
+          - {"type": "trivialai.agent.llm.start", ...}
+          - {"type": "trivialai.agent.llm.delta", ...}
+          - {"type": "trivialai.agent.llm.end", ...}
         """
         system = build_prompt(
             base_system_prompt=self.base_system_prompt,
@@ -381,7 +380,7 @@ class Agent:
             ev_type = ev.get("type")
             if ev_type == "start":
                 out = {
-                    "type": "llm.start",
+                    "type": _etype("llm.start"),
                     "task_id": task_id,
                     "phase": phase,
                     "iteration": iteration,
@@ -413,7 +412,7 @@ class Agent:
                     scratch_parts.append(scratch)
 
                 yield {
-                    "type": "llm.delta",
+                    "type": _etype("llm.delta"),
                     "task_id": task_id,
                     "phase": phase,
                     "iteration": iteration,
@@ -448,7 +447,7 @@ class Agent:
             },
         )
         yield {
-            "type": "llm.end",
+            "type": _etype("llm.end"),
             "task_id": task_id,
             "phase": phase,
             "iteration": iteration,
@@ -471,14 +470,13 @@ class Agent:
         async for ev in self._llm_stream_once(
             task_id=task.id, phase="do", user_prompt=task.prompt
         ):
-            if ev["type"] == "llm.end":
+            if ev["type"] == _etype("llm.end"):
                 last_content = ev.get("content") or ""
             yield ev
 
-        # Ensure result is captured
         task.result = last_content or ""
         yield {
-            "type": "task.result",
+            "type": _etype("task.result"),
             "task_id": task.id,
             "result": task.result,
         }
@@ -488,7 +486,7 @@ class Agent:
         Iterative task:
         - For each iteration:
             * stream a "progress" LLM call
-            * stream a "until-check" LLM call
+            * stream an "until-check" LLM call
         - At the end, stream a "final summary" call
         - Task.result is the final summary content
         """
@@ -501,7 +499,7 @@ class Agent:
                 {"task_id": task.id, "iteration": iteration},
             )
             yield {
-                "type": "loop.iteration.start",
+                "type": _etype("loop.iteration.start"),
                 "task_id": task.id,
                 "iteration": iteration,
             }
@@ -529,7 +527,7 @@ class Agent:
                 user_prompt=progress_prompt,
                 iteration=iteration,
             ):
-                if ev["type"] == "llm.end":
+                if ev["type"] == _etype("llm.end"):
                     iter_content = ev.get("content") or ""
                 yield ev
 
@@ -544,7 +542,7 @@ class Agent:
                 },
             )
             yield {
-                "type": "loop.iteration.summary",
+                "type": _etype("loop.iteration.summary"),
                 "task_id": task.id,
                 "iteration": iteration,
                 "content": iter_summary,
@@ -570,7 +568,7 @@ class Agent:
                     user_prompt=check_prompt,
                     iteration=iteration,
                 ):
-                    if ev["type"] == "llm.end":
+                    if ev["type"] == _etype("llm.end"):
                         answer_raw = ev.get("content") or ""
                     yield ev
 
@@ -580,7 +578,7 @@ class Agent:
                     {"task_id": task.id, "iteration": iteration, "answer": answer_norm},
                 )
                 yield {
-                    "type": "loop.until.check",
+                    "type": _etype("loop.until.check"),
                     "task_id": task.id,
                     "iteration": iteration,
                     "answer": answer_norm,
@@ -592,7 +590,7 @@ class Agent:
                         {"task_id": task.id, "iteration": iteration},
                     )
                     yield {
-                        "type": "loop.stopped",
+                        "type": _etype("loop.stopped"),
                         "task_id": task.id,
                         "iteration": iteration,
                     }
@@ -616,7 +614,7 @@ class Agent:
             user_prompt=summary_prompt,
             iteration=None,
         ):
-            if ev["type"] == "llm.end":
+            if ev["type"] == _etype("llm.end"):
                 final_summary = ev.get("content") or ""
             yield ev
 
@@ -626,12 +624,12 @@ class Agent:
             {"task_id": task.id, "content": task.result},
         )
         yield {
-            "type": "loop.final.summary",
+            "type": _etype("loop.final.summary"),
             "task_id": task.id,
             "content": task.result,
         }
         yield {
-            "type": "task.result",
+            "type": _etype("task.result"),
             "task_id": task.id,
             "result": task.result,
         }
