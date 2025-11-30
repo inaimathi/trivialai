@@ -2,11 +2,6 @@ import textwrap
 from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
                     Tuple, Union)
 
-# If you want, you can later wire in your actual base classes:
-# from trivialai.vector.base import VectorStore, Collection
-# For now, we duck-type them.
-
-
 DEFAULT_CONTEXT_SIZE_CHARS = 3000
 
 
@@ -58,15 +53,9 @@ def build_prompt(
     return prompt
 
 
-# ---------------------------------------------------------------------------
-# Section builders
-# ---------------------------------------------------------------------------
-
-
 def _build_base_section(base_system_prompt: str) -> str:
     text = (base_system_prompt or "").strip()
     if not text:
-        # Very lightweight default; you can tweak this for your library.
         text = textwrap.dedent(
             """
             You are an AI agent that can use tools to reason about complex tasks.

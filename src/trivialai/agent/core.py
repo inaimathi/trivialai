@@ -2,30 +2,190 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
+from .. import util
+from ..bistream import BiStream, sequentially
 from ..llm import LLMMixin
+from ..ollama import Ollama
 from ..tools import Tools
+from ..vectorstore.core import Whim
+from . import prompting
+
+TODO = "TODO"
+
+_DEFAULT_IGNORE = r"(^__pycache__|^node_modules|\.git/|/env-.*|\.egg-info/.*|^venv|^\..*|~$|\.pyc$|Thumbs\.db$|^build[\\/]|^dist[\\/]|^coverage[\\/]|\.log$|\.lock$|\.bak$|\.swp$|\.swo$|\.tmp$|\.temp$|\.class$|^target$|^Cargo\.lock$)"
+
+# core.run_pdb_test("/home/inaimathi/projects/pycronado/")
+# res = core.force(_)
+
+
+def _pr(text):
+    print(text, end="", flush=True)
+
+
+def find_tool(tools, name):
+    try:
+        return [t for t in tools if getattr(t, "__name__") == name][0]
+    except IndexError:
+        return None
+
+
+def tool_call(tools, call):
+    tool = find_tool(tools, call["tool"])
+    return tool(**call["args"])
+
+
+def run_pdb_test(path: str):
+    agent_name = "pdb_agent_001"
+    qwq = Ollama("qwq:latest", "http://localhost:11435/")
+    tools = [util.slurp, util.spit]
+    tool_names = {t.__name__ for t in tools}
+    files = list(util.deep_ls(path, ignore=_DEFAULT_IGNORE))
+    src_files = [f for f in files if f.endswith(".py")]
+
+    system = (
+        "You are an autonomous agent that follows instructions carefully and"
+        " respects file write permissions enforced by the host."
+        " You MUST NOT write outside the directories explicitly "
+        "granted write access, except for the agent's own scratchpad."
+        f" Your scratchpad file is ./{agent_name}.md; write to it freely using the `spit` tool."
+        " Your current task is to look over a git repository and find potential bugs."
+        " The way you should go about doing this is by using the Hypothesis testing module "
+        "to write properties in new test files and then run them. You should propose tests "
+        "that point to real, exploitable bugs, rather than tests that might be a result of "
+        "style issues. Use any tools you've been handed, and feel free to write to disk where "
+        "you've been given permissions. Your target is a git repository, and you don't have "
+        "general shell or commit permissions so at worst any mistakes can be easily rolled "
+        "back once they're reviewed."
+    )
+
+    def _check_resp(resp: str) -> dict[str, Any]:
+        parsed = util.loadch(resp)
+        if parsed.get("type") not in {"summary", "tool-call"}:
+            raise util.TransformError("invalid-object-structure")
+        if parsed["type"] == "tool-call":
+            if parsed["tool"] not in tool_names:
+                raise util.TransformError("no-such-tool")
+        return parsed
+
+    def _per_file_stream(f: str):
+        prompt = (
+            f"Find bugs in the repository {path}. The relevant file tree in the repo is {files}. "
+            f"You are currently working on file {f}. Your response should be either\n"
+            "1. a tool call (in which case the tool will be called, and once it completes, you "
+            "   will be given its result to evaluate). In this case it is IMPORTANT that your "
+            "   response be ONLY the tool call structure (a JSON object of type "
+            "   {type: 'tool-call', tool: ToolName, args: {ParamName: ParamValue}}) and no other commentary.\n"
+            "2. a summary of what you've done so far and an approval to move on to the next phase. "
+            "   In this case, it is IMPORTANT that your response be ONLY a summary structure "
+            "   {type: 'summary', summary: MarkdownString}. The markdown string should be a concise "
+            "   summary of your findings so far sufficient for a reviewer to understand and double "
+            "   check further on in the process.\n"
+        )
+
+        base = qwq.stream_checked(
+            _check_resp,
+            prompting.build_prompt(system, prompt, tools=tools),
+            prompt,
+        )
+
+        def _proceed(final_ev: dict[str, Any]):
+            parsed = final_ev["parsed"]
+
+            if parsed.get("type") == "tool-call":
+                res = tool_call(tools, parsed)
+                yield (
+                    {"type": "trivialai.agent.log", "message": "Running a tool call..."}
+                )
+                pr = (
+                    f"You previously asked me to run the tool call {parsed}. "
+                    f"The result of that call is {res}."
+                    f"{prompt}\n"
+                )
+
+                yield from qwq.stream_checked(
+                    _check_resp,
+                    prompting.build_prompt(system, pr, tools=tools),
+                    pr,
+                )
+
+            if parsed.get("type") == "summary":
+                yield {"type": "summary", "summary": parsed["summary"]}
+
+        return sequentially(base, [_proceed])
+
+    for f in src_files[0:1]:
+        yield from _per_file_stream(f)
+
+
+def force(event_generator):
+    """
+    Process a generator of streaming events and print them with aggregation.
+
+    Args:
+        event_generator: A generator yielding events with structure:
+            - {'type': 'start', ...}
+            - {'type': 'delta', 'text': str, 'scratchpad': str}
+            - {'type': 'end', ...}
+            - Other event types
+
+    Behavior:
+        - Contiguous scratchpad content is aggregated into "Thinking: " blocks
+        - Contiguous text content is aggregated into "Saying: " blocks
+        - Other events are printed as standalone dictionaries
+        - Prints to stdout as events stream in
+
+    Returns:
+        list: Array of any 'end' events encountered
+    """
+    end_events = []
+    current_mode = None  # 'thinking', 'saying', or None
+
+    for event in event_generator:
+        if event["type"] == "delta":
+            scratchpad = event.get("scratchpad", "")
+            text = event.get("text", "")
+
+            # Handle scratchpad content
+            if scratchpad:
+                if current_mode != "thinking":
+                    if current_mode is not None:
+                        print()  # Add newline when switching modes
+                    print("Thinking: ", end="")
+                    current_mode = "thinking"
+                print(scratchpad, end="")
+
+            # Handle text content
+            if text:
+                if current_mode != "saying":
+                    if current_mode is not None:
+                        print()  # Add newline when switching modes
+                    print("Saying: ", end="")
+                    current_mode = "saying"
+                print(text, end="")
+
+        elif event["type"] == "end":
+            end_events.append(event)
+
+        else:
+            # Non-delta, non-end events (like 'start')
+            if current_mode is not None:
+                print()  # Add newline when switching from content to standalone
+                current_mode = None
+            print(event)
+
+    # Add final newline if we were in a content mode
+    if current_mode is not None:
+        print()
+
+    return end_events
 
 
 class Agent:
-    """
-    A lightweight planning/execution wrapper around an LLMMixin instance.
-
-    - Memory: pointers to files/dirs, URLs, and text snippets.
-    - Context: built *per step* from memory + event history.
-    - Plan: ordered list of AgentStep.
-    - Execution:
-        * .run()  -> generator of events for all remaining steps
-        * .do(s) -> sugar: .plan(s).run(); returns self
-
-    Events yielded by .run() include both:
-      - agent meta-events: "agent-step-start", "agent-step-end", etc.
-      - raw LLM stream events, augmented with `agent_step` index.
-    """
-
     def __init__(
         self,
         llm: LLMMixin,
@@ -43,119 +203,27 @@ class Agent:
 
         self.log_path: Path = root_path / f"{self.name}.agent"
 
-    # --------- Construction / builder API ---------
-
     @classmethod
-    def from_llm(
-        cls,
-        llm: LLMMixin,
-        *,
-        name: Optional[str] = None,
-        root: Optional[Union[str, Path]] = None,
-    ) -> Agent:
-        return cls(llm, name=name, root=root)
-
-    # --- Memory (pointers) ---
+    def from_logs(cls, log_path: Path) -> Agent:
+        return TODO
 
     def consider(self, item: Union[str, Path]) -> Agent:
-        """
-        Register a read-only memory pointer:
-          - str starting with http(s) -> URL
-          - other str / Path         -> file or directory path
-        """
-        if isinstance(item, Path):
-            p = item.expanduser().resolve()
-            self.memory_items.append(MemoryFile(path=p, writable=False))
-        elif isinstance(item, str):
-            if item.startswith("http://") or item.startswith("https://"):
-                self.memory_items.append(MemoryURL(url=item))
-            else:
-                p = Path(item).expanduser().resolve()
-                self.memory_items.append(MemoryFile(path=p, writable=False))
-        else:
-            raise TypeError(f"Unsupported memory item type: {type(item)}")
-        return self
+        return TODO
 
     def consider_with_write_access(self, path: Union[str, Path]) -> Agent:
-        """
-        Register a memory pointer and explicitly grant write access
-        to that path (file or directory).
-        """
-        p = Path(path).expanduser().resolve()
-        self.memory_items.append(MemoryFile(path=p, writable=True))
-        self.scope.allowed_writes.append(p)
-        return self
+        return TODO
 
     def remember_text(self, label: str, text: str) -> Agent:
-        """
-        Register a raw text snippet as a memory item.
-        """
-        self.memory_items.append(MemoryText(label=label, text=text))
-        return self
-
-    # --- Tooling ("equip" instead of "use") ---
+        return TODO
 
     def equip(self, tools: Any) -> Agent:
-        """
-        Attach tools to this agent.
-
-        Accepts:
-          - a Tools instance (merged into self.tools),
-          - a single callable (registered via self.tools.define),
-          - an iterable of the above.
-        """
-        # Tools instance
-        if isinstance(tools, Tools):
-            # Merge into self.tools, respecting existing entries.
-            for name, spec in tools._env.items():  # type: ignore[attr-defined]
-                if name not in self.tools._env:  # type: ignore[attr-defined]
-                    self.tools._env[name] = spec  # type: ignore[attr-defined]
-            return self
-
-        # Iterable of things?
-        if isinstance(tools, Iterable) and not isinstance(tools, (str, bytes)):
-            for t in tools:
-                self.equip(t)
-            return self
-
-        # Assume single callable
-        if callable(tools):
-            self.tools.define(tools)
-            return self
-
-        raise TypeError(f"Unsupported tools/equipment type: {type(tools)}")
-
-    # --- Planning API ---
+        return TODO
 
     def plan(self, description: str, *, kind: str = "do") -> Agent:
-        """
-        Add a step to the internal plan. Does not execute it.
-        """
-        self.steps.append(AgentStep(kind=kind, description=description))
-        return self
-
-    def loop(self, description: str) -> Agent:
-        """
-        Convenience for planning a 'loop' step.
-        Semantics are up to _run_loop_step; currently v0 is simple.
-        """
-        return self.plan(description, kind="loop")
+        return TODO
 
     def do(self, description: str) -> Agent:
-        """
-        Sugar: plan a 'do' step and immediately execute all pending steps.
-
-        Equivalent to:
-          agent.plan(description)
-          for _ in agent.run():
-              pass
-          return agent
-        """
-        self.plan(description, kind="do")
-        for _ in self.run():
-            # side-effects: history & log update
-            pass
-        return self
+        return TODO
 
     # --------- Execution API ---------
 
@@ -243,7 +311,7 @@ class Agent:
         lines: List[str] = []
 
         lines.append(
-            "You are an autonomous coding and text-editing agent that follows "
+            "You are an autonomous agent that follows "
             "instructions carefully and respects file write permissions enforced "
             "by the host. You MUST NOT write outside the directories explicitly "
             "granted write access, except for the agent's own scratchpad."

@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
-from chromadb import ChromaCollection
+from ..embedding.core import Embedder
+from . import base
+from .chromadb import ChromaCollection
 
 Vector = List[float]
 Metadata = Dict[str, Any]
@@ -54,7 +56,7 @@ class Whim(ChromaCollection):
 
     def consume(
         self,
-        other: vectorbase.Collection,
+        other: base.Collection,
         batch_size: int = 256,
         meta_filter: Optional[Callable[[Metadata], bool]] = None,
         extra_meta: Optional[Metadata] = None,

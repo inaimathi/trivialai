@@ -10,11 +10,13 @@ from collections.abc import AsyncIterable as ABCAsyncIterable
 from collections.abc import AsyncIterator as ABCAsyncIterator
 from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
-from typing import Generic, TypeVar
+from functools import reduce
+from typing import Any, Callable, Generic, Iterable, Optional, TypeVar
 
 from .log import getLogger
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 __loop: asyncio.AbstractEventLoop | None = None
 __thread: threading.Thread | None = None
@@ -160,28 +162,69 @@ def aiter_to_iter(agen: ABCAsyncIterator[T]) -> ABCIterator[T]:
     return SyncFromAsync()
 
 
+def _chain_on(
+    src: BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any],
+    then: Callable[
+        [Any],
+        BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any] | None,
+    ],
+    pred: Optional[Callable[[Any], bool]] = None,
+) -> BiStream[Any]:
+    stream = BiStream.ensure(src)
+
+    if pred is None:
+
+        def pred(ev: Any) -> bool:  # default
+            return isinstance(ev, dict) and ev.get("type") == "final"
+
+    def _gen():
+        final_ev: Any | None = None
+
+        # Drain src synchronously
+        for ev in stream:
+            if pred(ev):
+                final_ev = ev
+            yield ev
+
+        # Chain follow-up if any
+        if final_ev is not None:
+            follow = then(final_ev)
+            if follow is None:
+                return
+            follow_stream = BiStream.ensure(follow)
+            for ev2 in follow_stream:
+                yield ev2
+
+    return BiStream(_gen())
+
+
+def sequentially(
+    src: BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any],
+    thens: Iterable[
+        Callable[
+            [Any],
+            BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any] | None,
+        ]
+    ],
+    pred: Optional[Callable[[Any], bool]] = None,
+) -> BiStream[Any]:
+    """
+    Apply a sequence of `then`-steps to a stream, in order.
+
+    Roughly:
+
+        sequentially(src, [f1, f2, f3]) ==
+            _chain_on(_chain_on(_chain_on(src, f1), f2), f3)
+    """
+    return reduce(lambda acc, f: _chain_on(acc, f, pred=pred), thens, src)
+
+
 class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
     """
     Bidirectional stream wrapper.
 
-    Wraps:
-      - a synchronous Iterable[T]
-      - an AsyncIterable[T]
-      - another BiStream[T]
-
-    and acts as BOTH:
-      - Iterator[T]        -> usable with `for`, `next()`, list(), itertools, etc.
-      - AsyncIterator[T]   -> usable with `async for`.
-
-    Semantics:
-      - Single-shot: once consumed, it's exhausted.
-      - A BiStream instance must be consumed EITHER synchronously OR
-        asynchronously, not both. Attempting to mix modes raises at runtime.
-      - Exactly ONE canonical underlying iterator, chosen by source type:
-          * async source   -> one AsyncIterator; sync side adapts via aiter_to_iter
-          * sync source    -> one Iterator; async side is an async wrapper
-      - If constructed from another BiStream, we reuse its underlying
-        iterators (sharing partial-consumption progress).
+    Exactly one underlying iterator, but we only adapt async->sync
+    lazily when someone actually uses the sync interface.
     """
 
     def __init__(
@@ -194,8 +237,8 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         if isinstance(src, BiStream):
             # Reuse underlying iterators (sharing consumption state).
             self._src: ABCIterable[T] | ABCAsyncIterable[T] = src._src
-            self._sync_iter: ABCIterator[T] = src._sync_iter
-            self._async_iter: ABCAsyncIterator[T] = src._async_iter
+            self._sync_iter: ABCIterator[T] | None = src._sync_iter
+            self._async_iter: ABCAsyncIterator[T] | None = src._async_iter
             self._mode = src._mode
             return
 
@@ -210,9 +253,6 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
             NOTE:
               - This runs `next(sync_iter)` directly in the event loop
                 thread, so if it blocks, your event loop is blocked.
-              - That is treated as a *bug*: we log a warning the first
-                time an iteration takes "too long", to make the culprit
-                obvious in logs / metrics.
             """
             last = time.monotonic()
             warned = False
@@ -232,16 +272,14 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
                         sync_iter,
                         delta,
                     )
-                    # If you ever want "fail fast" behaviour instead of just
-                    # logging, you could raise here in a debug/strict mode:
-                    # raise RuntimeError("Blocking sync iterator used in async BiStream")
 
                 yield item
 
         if isinstance(src, ABCAsyncIterable):
             base_async = src.__aiter__()  # type: ignore[assignment]
-            self._async_iter = base_async
-            self._sync_iter = aiter_to_iter(base_async)
+            self._async_iter: ABCAsyncIterator[T] | None = base_async
+            # LAZY: don't build the sync adapter yet
+            self._sync_iter: ABCIterator[T] | None = None
         elif isinstance(src, ABCIterable):
             base_sync = iter(src)
             self._sync_iter = base_sync
@@ -268,13 +306,6 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         cls,
         src: BiStream[T] | ABCIterable[T] | ABCAsyncIterable[T],
     ) -> BiStream[T]:
-        """
-        Idempotent constructor: if src is already a BiStream, return it;
-        otherwise wrap it.
-
-        Prefer this to calling BiStream(...) directly in most code, so that
-        you don't accidentally double-wrap a BiStream.
-        """
         if isinstance(src, BiStream):
             return src
         return cls(src)
@@ -283,12 +314,18 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
 
     def __iter__(self) -> BiStream[T]:
         self._set_mode("sync")
+        if self._sync_iter is None:
+            # We were built from an async source; make the bridge *now*.
+            assert self._async_iter is not None
+            self._sync_iter = aiter_to_iter(self._async_iter)
         return self
 
     def __next__(self) -> T:
-        # Ensure the mode is set and consistent even if someone calls next()
-        # directly without going through iter().
         self._set_mode("sync")
+        if self._sync_iter is None:
+            # Allow next() without an explicit iter() first.
+            assert self._async_iter is not None
+            self._sync_iter = aiter_to_iter(self._async_iter)
         return next(self._sync_iter)
 
     # ---- async side ----
@@ -298,7 +335,13 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         return self
 
     async def __anext__(self) -> T:
-        # Ensure the mode is set and consistent even if someone calls __anext__()
-        # directly without going through __aiter__().
         self._set_mode("async")
+        assert self._async_iter is not None
         return await self._async_iter.__anext__()
+
+    def then(
+        self: BiStream[T],
+        fn: Callable[[T], BiStream[U] | ABCIterable[U] | ABCAsyncIterable[U] | None],
+        pred: Optional[Callable[[T], bool]] = None,
+    ) -> BiStream[T | U]:
+        return _chain_on(self, fn, pred=pred)
