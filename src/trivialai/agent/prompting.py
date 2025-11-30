@@ -2,13 +2,15 @@ import textwrap
 from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
                     Tuple, Union)
 
+from ..tools import ToolKit
+
 DEFAULT_CONTEXT_SIZE_CHARS = 3000
 
 
 def build_prompt(
     base_system_prompt: str,
     user_prompt: str,
-    tools: Optional[Sequence[Any]] = None,
+    tools: Optional[ToolKit] = None,
     *,
     context_size: int = DEFAULT_CONTEXT_SIZE_CHARS,
     memory: Optional[Any] = None,  # VectorStore | Collection | None (duck-typed)
@@ -27,13 +29,11 @@ def build_prompt(
     Returns:
         A single string intended as the `system` message for the LLM.
     """
-    tools = tools or []
-
     # 1) Base system instructions (or a default if blank)
     base_section = _build_base_section(base_system_prompt)
 
     # 2) Tools / capabilities section (optional)
-    tools_section = _build_tools_section(tools)
+    tools_section = "" if tools is None else tools.to_tool_prompt()
 
     # 3) High-priority context summary (if given)
     summary_section = _build_summary_section(context_summary)

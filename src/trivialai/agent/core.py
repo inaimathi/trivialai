@@ -23,22 +23,6 @@ _DEFAULT_IGNORE = r"(^__pycache__|^node_modules|\.git/|/env-.*|\.egg-info/.*|^ve
 # res = core.force(_)
 
 
-def _pr(text):
-    print(text, end="", flush=True)
-
-
-def find_tool(tools, name):
-    try:
-        return [t for t in tools if getattr(t, "__name__") == name][0]
-    except IndexError:
-        return None
-
-
-def tool_call(tools, call):
-    tool = find_tool(tools, call["tool"])
-    return tool(**call["args"])
-
-
 def run_pdb_test(path: str):
     agent_name = "pdb_agent_001"
 
@@ -47,8 +31,7 @@ def run_pdb_test(path: str):
         util.spit("agent_log.ndjson", line + "\n", mode="a")
 
     qwq = Ollama("qwq:latest", "http://localhost:11435/")
-    tools = [util.slurp, util.spit]
-    tool_names = {t.__name__ for t in tools}
+    tools = ToolKit(util.slurp, util.spit)
     files = list(util.deep_ls(path, ignore=_DEFAULT_IGNORE))
     src_files = [f for f in files if f.endswith(".py")]
 
@@ -73,8 +56,7 @@ def run_pdb_test(path: str):
         if parsed.get("type") not in {"summary", "tool-call"}:
             raise util.TransformError("invalid-object-structure")
         if parsed["type"] == "tool-call":
-            if parsed["tool"] not in tool_names:
-                raise util.TransformError("no-such-tool")
+            return tk.check_tool(parsed)
         return parsed
 
     def _per_file_stream(f: str):
@@ -114,7 +96,7 @@ def run_pdb_test(path: str):
             parsed = final_ev.get("parsed", {})
 
             if parsed.get("type") == "tool-call":
-                res = tool_call(tools, parsed)
+                res = tools.call_tool(parsed)
 
                 # stitched log event
                 yield {
@@ -157,25 +139,6 @@ def run_pdb_test(path: str):
 
 
 def force(event_generator):
-    """
-    Process a generator of streaming events and print them with aggregation.
-
-    Args:
-        event_generator: A generator yielding events with structure:
-            - {'type': 'start', ...}
-            - {'type': 'delta', 'text': str, 'scratchpad': str}
-            - {'type': 'end', ...}
-            - Other event types
-
-    Behavior:
-        - Contiguous scratchpad content is aggregated into "Thinking: " blocks
-        - Contiguous text content is aggregated into "Saying: " blocks
-        - Other events are printed as standalone dictionaries
-        - Prints to stdout as events stream in
-
-    Returns:
-        list: Array of any 'end' events encountered
-    """
     end_events = []
     current_mode = None  # 'thinking', 'saying', or None
 

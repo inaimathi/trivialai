@@ -1,329 +1,262 @@
-import asyncio
-import inspect
+# tests/test_tools.py
+from __future__ import annotations
+
 import unittest
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from src.trivialai.tools import Tools
-from src.trivialai.util import TransformError
+from src.trivialai.tools import ToolKit, TransformError, to_summary
+
+# ---------- helper functions used as tools ----------
 
 
-class TestTools(unittest.TestCase):
-    def setUp(self):
-        """Set up a Tools instance for each test."""
-        self.tools = Tools()
+def add(x: int, y: int) -> int:
+    """Add two integers."""
+    return x + y
 
-        # Example function to define (SYNC)
-        def _screenshot(url: str, selectors: Optional[List[str]] = None) -> str:
-            """Takes a url and an optional list of selectors. Takes a screenshot."""
-            return f"Screenshot taken for {url} with selectors {selectors}"
 
-        self._screenshot = _screenshot
-        self.tools.define(self._screenshot)
+def spit(file_path: str, content: str, mode: Optional[str] = None) -> None:
+    """Write content to a file path (dummy impl)."""
+    # no-op in tests; just exercise signature / summary
+    return None
 
-    def test_define(self):
-        """Test defining a function in Tools."""
 
-        def new_tool(a: int) -> int:
-            """Example tool."""
-            return a + 1
+def kwtool(a: int, *, b: str = "default") -> str:
+    """Keyword-only parameter example."""
+    return f"{a}:{b}"
 
-        result = self.tools.define(new_tool)
-        self.assertTrue(result)
-        tool_list = self.tools.list()
-        self.assertIn("new_tool", [t["name"] for t in tool_list])
 
-    def test_define_duplicate(self):
-        """Test defining a duplicate function."""
+def varkw_tool(level: str, **kwargs: Any) -> Dict[str, Any]:
+    """Tool that accepts arbitrary keyword arguments."""
+    out = {"level": level}
+    out.update(kwargs)
+    return out
 
-        def new_tool(a: int) -> int:
-            """Example tool."""
-            return a + 1
 
-        # Define the function once
-        result = self.tools.define(new_tool)
-        self.assertTrue(result)  # First definition should succeed
+def bad_type_tool(x: int) -> None:
+    """Raises TypeError inside the tool."""
+    raise TypeError("boom")
 
-        # Attempt to define the same function again
-        result = self.tools.define(new_tool)
-        self.assertFalse(result)  # Duplicate definitions should return False
 
-        # Use decorator-style definition
-        @self.tools.define()
-        def _duplicate_tool(arg: int) -> int:
-            """A tool that already exists."""
-            return arg + 1
+class TestToSummary(unittest.TestCase):
+    def test_to_summary_basic_signature_and_args(self) -> None:
+        summary = to_summary(spit)
 
-        # Attempt to define the same function again using the decorator
-        result = self.tools.define(_duplicate_tool)
-        self.assertFalse(result)  # Duplicate definitions should still return False
+        self.assertEqual(summary["name"], "spit")
+        self.assertIn("signature", summary)
+        sig = summary["signature"]
+        # Ensure the compact signature reflects parameters and default
+        self.assertIn("spit(", sig)
+        self.assertIn("file_path: str", sig)
+        self.assertIn("content: str", sig)
+        self.assertIn("mode: Optional[str] = None", sig)
+        self.assertIn("->", sig)
 
-    def test_list(self):
-        """Test listing defined tools."""
-        tools_list = self.tools.list()
-        self.assertEqual(len(tools_list), 1)
-        item = tools_list[0]
-        self.assertEqual(item["name"], "_screenshot")
-        self.assertEqual(
-            item["description"],
-            "Takes a url and an optional list of selectors. Takes a screenshot.",
-        )
-        # sanity check: new 'args' schema exists
-        self.assertIn("args", item)
-        self.assertIn("type", item)  # raw annotations kept for back-compat
-        self.assertIn("async", item)
-        self.assertFalse(item["async"])  # _screenshot is sync
+        # Description comes from docstring
+        self.assertTrue(summary["description"].startswith("Write content"))
 
-        # Check normalized schema for Optional[List[str]]
-        sel = item["args"]["selectors"]
-        self.assertEqual(sel["type"], "array")
-        self.assertIn("items", sel)
-        self.assertEqual(sel["items"]["type"], "string")
-        # Optional[...] should mark nullable
-        self.assertTrue(sel.get("nullable", False))
+        args_schema = summary["args"]
+        self.assertIsInstance(args_schema, dict)
+        self.assertIn("file_path", args_schema)
+        self.assertIn("content", args_schema)
+        self.assertIn("mode", args_schema)
 
-    def test_validate(self):
-        """Test validation of a tool call."""
-        tool_call = {
-            "functionName": "_screenshot",
-            "args": {"url": "https://www.google.com", "selectors": ["#search"]},
+    def test_to_summary_unannotated_function(self) -> None:
+        def no_ann(x, y=5):
+            return x + y
+
+        summary = to_summary(no_ann)
+
+        self.assertEqual(summary["name"], "no_ann")
+        sig = summary["signature"]
+        # We expect Any for unannotated params
+        self.assertIn("x: Any", sig)
+        self.assertIn("y: Any = 5", sig)
+        self.assertIn("-> Any", sig)
+
+        # args schema should have both parameters
+        self.assertIn("x", summary["args"])
+        self.assertIn("y", summary["args"])
+
+
+class TestToolKitShapeAndPrompt(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tk = ToolKit(add, spit, kwtool)
+
+    def test_to_tool_shape_contains_all_tool_names(self) -> None:
+        shape = self.tk.to_tool_shape()
+        self.assertEqual(shape["type"], "tool-call")
+        self.assertIn("<param>", shape["args"])
+        self.assertIn("...", shape["args"])
+
+        # The placeholder for "tool" should mention all tool names
+        tool_placeholder = shape["tool"]
+        self.assertIn("add", tool_placeholder)
+        self.assertIn("spit", tool_placeholder)
+        self.assertIn("kwtool", tool_placeholder)
+
+    def test_to_tool_prompt_contains_signatures_and_shape(self) -> None:
+        prompt = self.tk.to_tool_prompt()
+        # Basic header text
+        self.assertIn("You have access to the following tools.", prompt)
+        self.assertIn('"type": "tool-call"', prompt)
+
+        # Compact signatures for each tool
+        self.assertIn("add(", prompt)
+        self.assertIn("spit(", prompt)
+        self.assertIn("kwtool(", prompt)
+
+        # Simple check that description line is present
+        self.assertIn("Add two integers.", prompt)
+        self.assertIn("Write content to a file path", prompt.splitlines()[0] or prompt)
+
+
+class TestToolKitCheckTool(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tk = ToolKit(add, spit, kwtool, varkw_tool, bad_type_tool)
+
+    # ---- happy path ----
+
+    def test_check_tool_valid_call(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "add",
+            "args": {"x": 1, "y": 2},
         }
-        self.assertTrue(self.tools.validate(tool_call))
+        checked = self.tk.check_tool(call)
+        self.assertEqual(checked, call)
 
-    def test_validate_missing_optional_ok(self):
-        """Optional/defaulted params should be optional during validation."""
-        tool_call = {
-            "functionName": "_screenshot",
-            "args": {"url": "https://www.google.com"},
+    def test_call_tool_executes_function(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "add",
+            "args": {"x": 2, "y": 3},
         }
-        self.assertTrue(self.tools.validate(tool_call))
+        result = self.tk.call_tool(call)
+        self.assertEqual(result, 5)
 
-    def test_validate_invalid(self):
-        """Test validation of an invalid tool call."""
-        tool_call = {"functionName": "nonexistent_tool", "args": {"param": "value"}}
-        self.assertFalse(self.tools.validate(tool_call))
-
-    def test_transform_valid(self):
-        """Test transforming a valid response."""
-        response = '{"functionName": "_screenshot", "args": {"url": "https://www.google.com", "selectors": ["#search"]}}'
-        result = self.tools.transform(response)
-        self.assertEqual(result["functionName"], "_screenshot")
-        self.assertEqual(result["args"]["url"], "https://www.google.com")
-
-    def test_transform_invalid(self):
-        """Test transforming an invalid response."""
-        response = '{"invalid": "data"}'
-        with self.assertRaises(TransformError) as context:
-            self.tools.transform(response)
-        self.assertEqual(str(context.exception), "invalid-tool-call")
-
-    def test_transform_multi_valid(self):
-        """Test transforming a valid multi-tool response."""
-        response = '[{"functionName": "_screenshot", "args": {"url": "https://example.com", "selectors": ["#header"]}}]'
-        result = self.tools.transform_multi(response)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["functionName"], "_screenshot")
-
-    def test_transform_multi_invalid(self):
-        """Test transforming an invalid multi-tool response."""
-        response = '[{"invalid": "data"}]'
-        with self.assertRaises(TransformError) as context:
-            self.tools.transform_multi(response)
-        self.assertEqual(str(context.exception), "invalid-tool-subcall")
-
-    def test_lookup(self):
-        """Test looking up a function."""
-        tool_call = {
-            "functionName": "_screenshot",
-            "args": {"url": "https://www.google.com", "selectors": None},
+    def test_check_tool_allows_varkw_extra_args(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "varkw_tool",
+            "args": {"level": "info", "message": "hello", "code": 200},
         }
-        function = self.tools.lookup(tool_call)
-        self.assertEqual(function, self._screenshot)
+        checked = self.tk.check_tool(call)
+        self.assertEqual(checked, call)
 
-    def test_raw_call(self):
-        """Test raw_call on a valid tool call (sync tool)."""
-        tool_call = {
-            "functionName": "_screenshot",
-            "args": {"url": "https://example.com", "selectors": None},
+        result = self.tk.call_tool(call)
+        self.assertEqual(result["level"], "info")
+        self.assertEqual(result["message"], "hello")
+        self.assertEqual(result["code"], 200)
+
+    # ---- structural error cases ----
+
+    def test_check_tool_rejects_non_dict(self) -> None:
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool("not-a-dict")  # type: ignore[arg-type]
+        self.assertIn("invalid-object-structure", str(cm.exception))
+
+    def test_check_tool_missing_type(self) -> None:
+        call = {"tool": "add", "args": {"x": 1, "y": 2}}
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("invalid-tool-call-type", str(cm.exception))
+
+    def test_check_tool_wrong_type_value(self) -> None:
+        call = {"type": "not-tool-call", "tool": "add", "args": {"x": 1, "y": 2}}
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("invalid-tool-call-type", str(cm.exception))
+
+    def test_check_tool_invalid_tool_name_type(self) -> None:
+        call = {"type": "tool-call", "tool": 123, "args": {}}  # type: ignore[dict-item]
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("invalid-tool-name", str(cm.exception))
+
+    def test_check_tool_unknown_tool(self) -> None:
+        call = {"type": "tool-call", "tool": "does_not_exist", "args": {}}
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("no-such-tool", str(cm.exception))
+
+    def test_check_tool_args_not_dict(self) -> None:
+        call = {"type": "tool-call", "tool": "add", "args": 42}
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("invalid-tool-args", str(cm.exception))
+
+    # ---- arg shape error cases ----
+
+    def test_check_tool_unexpected_arg(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "add",
+            "args": {"x": 1, "y": 2, "z": 3},
         }
-        result = self.tools.raw_call(tool_call)
-        self.assertEqual(
-            result,
-            "Screenshot taken for https://example.com with selectors None",
-        )
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("unexpected-tool-arg", str(cm.exception))
 
-    def test_call_valid(self):
-        """Test call on a valid tool call (sync tool)."""
-        tool_call = {
-            "functionName": "_screenshot",
-            "args": {"url": "https://example.com", "selectors": None},
+    def test_check_tool_missing_required_arg(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "add",
+            "args": {"x": 1},  # missing 'y'
         }
-        result = self.tools.call(tool_call)
-        self.assertEqual(
-            result,
-            "Screenshot taken for https://example.com with selectors None",
-        )
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("missing-tool-arg", str(cm.exception))
 
-    def test_call_invalid_raises(self):
-        """Invalid calls should raise TransformError instead of returning None."""
-        tool_call = {"functionName": "nonexistent_tool", "args": {"param": "value"}}
-        with self.assertRaises(TransformError) as ctx:
-            _ = self.tools.call(tool_call)
-        self.assertEqual(str(ctx.exception), "invalid-tool-call")
+    # ---- type error cases ----
 
+    def test_check_tool_type_mismatch(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "add",
+            "args": {"x": "not-an-int", "y": 2},
+        }
+        with self.assertRaises(TransformError) as cm:
+            self.tk.check_tool(call)
+        self.assertIn("invalid-tool-arg-type", str(cm.exception))
 
-# -------- New async coverage below -------------------------------------------
-
-
-class TestToolsAsyncDefinition(unittest.TestCase):
-    def setUp(self):
-        self.tools = Tools()
-
-        # Define an async tool via the same decorator
-        @self.tools.define(description="Add two numbers asynchronously")
-        async def async_add(a: int, b: int) -> int:
-            await asyncio.sleep(0)  # yield to event loop
-            return a + b
-
-        self.async_add = async_add
-
-        # Also define a sync tool to test acall with sync functions
-        @self.tools.define(description="Multiply two numbers")
-        def mul(a: int, b: int) -> int:
-            return a * b
-
-        self.mul = mul
-
-    def test_list_contains_async_flag(self):
-        items = {t["name"]: t for t in self.tools.list()}
-        self.assertIn("async_add", items)
-        self.assertTrue(items["async_add"]["async"])
-        self.assertIn("mul", items)
-        self.assertFalse(items["mul"]["async"])
-        # args schemas exist
-        self.assertIn("args", items["async_add"])
-        self.assertIn("args", items["mul"])
-
-    def test_lookup_returns_original_fn(self):
-        call = {"functionName": "async_add", "args": {"a": 1, "b": 2}}
-        fn = self.tools.lookup(call)
-        self.assertTrue(inspect.iscoroutinefunction(fn))
-        self.assertIs(fn, self.async_add)
+    def test_call_tool_wraps_internal_typeerror(self) -> None:
+        call = {
+            "type": "tool-call",
+            "tool": "bad_type_tool",
+            "args": {"x": 10},
+        }
+        with self.assertRaises(TransformError) as cm:
+            self.tk.call_tool(call)
+        self.assertIn("tool-call-failed", str(cm.exception))
 
 
-class TestToolsAsyncExecution(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.tools = Tools()
+class TestTypeOk(unittest.TestCase):
+    def test_type_ok_simple_builtin(self) -> None:
+        self.assertTrue(ToolKit._type_ok(1, int))
+        self.assertFalse(ToolKit._type_ok("1", int))
 
-        @self.tools.define(description="Async add")
-        async def async_add(a: int, b: int) -> int:
-            await asyncio.sleep(0)
-            return a + b
+    def test_type_ok_optional(self) -> None:
+        opt_str = Optional[str]
+        self.assertTrue(ToolKit._type_ok("hello", opt_str))
+        self.assertTrue(ToolKit._type_ok(None, opt_str))
+        self.assertFalse(ToolKit._type_ok(123, opt_str))
 
-        @self.tools.define(description="Sync mul")
-        def mul(a: int, b: int) -> int:
-            return a * b
+    def test_type_ok_literal(self) -> None:
+        lit = Literal["a", "b"]
+        self.assertTrue(ToolKit._type_ok("a", lit))
+        self.assertTrue(ToolKit._type_ok("b", lit))
+        self.assertFalse(ToolKit._type_ok("c", lit))
 
-    async def test_acall_async_tool(self):
-        res = await self.tools.acall(
-            {"functionName": "async_add", "args": {"a": 2, "b": 5}}
-        )
-        self.assertEqual(res, 7)
+    def test_type_ok_list_and_dict(self) -> None:
+        list_int = List[int]
+        dict_str_any = Dict[str, Any]
 
-    async def test_araw_call_async_tool(self):
-        res = await self.tools.araw_call(
-            {"functionName": "async_add", "args": {"a": 3, "b": 4}}
-        )
-        self.assertEqual(res, 7)
+        self.assertTrue(ToolKit._type_ok([1, 2, 3], list_int))
+        self.assertFalse(ToolKit._type_ok("not-a-list", list_int))
 
-    async def test_acall_sync_tool(self):
-        """acall should work on sync tools without awaiting anything."""
-        res = await self.tools.acall({"functionName": "mul", "args": {"a": 3, "b": 5}})
-        self.assertEqual(res, 15)
+        self.assertTrue(ToolKit._type_ok({"k": 1}, dict_str_any))
+        self.assertFalse(ToolKit._type_ok(["k", 1], dict_str_any))
 
-    async def test_call_async_tool_inside_running_loop(self):
-        """
-        call() is sync but should still be usable even when an event loop is running.
-        It must execute the coroutine in a worker thread and return the result.
-        """
-        res = self.tools.call({"functionName": "async_add", "args": {"a": 10, "b": 7}})
-        self.assertEqual(res, 17)
 
-    async def test_raw_call_async_tool_inside_running_loop(self):
-        res = self.tools.raw_call(
-            {"functionName": "async_add", "args": {"a": 1, "b": 2}}
-        )
-        self.assertEqual(res, 3)
-
-    async def test_extras_merge_sync_call(self):
-        """
-        call() should merge extras; with override=True (default) extras win.
-        """
-        tools = Tools(extras={"b": 99})
-
-        @tools.define(description="echo add")
-        def add(a: int, b: int = 0) -> int:
-            return a + b
-
-        # User provides b=5, extras b=99, extras override => result 1+99
-        res = tools.call({"functionName": "add", "args": {"a": 1, "b": 5}})
-        self.assertEqual(res, 100)
-
-    async def test_extras_merge_override_false(self):
-        """
-        call_with_extras(..., override=False) should allow user args to override extras.
-        """
-        tools = Tools(extras={"b": 10})
-
-        @tools.define(description="echo add")
-        def add(a: int, b: int = 0) -> int:
-            return a + b
-
-        call = {"functionName": "add", "args": {"a": 1, "b": 5}}
-        # Explicitly use call_with_extras with override=False
-        res = tools.call_with_extras({"b": 10}, call, override=False)
-        self.assertEqual(res, 6)  # user b=5 wins over extras b=10
-
-    async def test_async_extras_merge_both_paths(self):
-        """
-        acall_with_extras works with both async and sync tools.
-        """
-        # Async tool
-        toolsA = Tools(extras={"b": 5})
-
-        @toolsA.define(description="async add")
-        async def add_async(a: int, b: int = 0) -> int:
-            await asyncio.sleep(0)
-            return a + b
-
-        resA = await toolsA.acall({"functionName": "add_async", "args": {"a": 2}})
-        self.assertEqual(resA, 7)
-
-        # Sync tool via async API
-        toolsB = Tools(extras={"b": 3})
-
-        @toolsB.define(description="sync add")
-        def add_sync(a: int, b: int = 0) -> int:
-            return a + b
-
-        resB = await toolsB.acall({"functionName": "add_sync", "args": {"a": 10}})
-        self.assertEqual(resB, 13)
-
-    async def test_validate_and_transform_with_async_tool(self):
-        tools = Tools()
-
-        @tools.define(description="async add")
-        async def add(a: int, b: int) -> int:
-            await asyncio.sleep(0)
-            return a + b
-
-        payload = {"functionName": "add", "args": {"a": 3, "b": 4}}
-        self.assertTrue(tools.validate(payload))
-
-        s = '{"functionName":"add","args":{"a":3,"b":4}}'
-        parsed = tools.transform(s)
-        self.assertEqual(parsed, payload)
-
-        multi = '[{"functionName":"add","args":{"a":1,"b":2}}]'
-        parsed_multi = tools.transform_multi(multi)
-        self.assertEqual(len(parsed_multi), 1)
-        self.assertEqual(parsed_multi[0]["functionName"], "add")
+if __name__ == "__main__":
+    unittest.main()
