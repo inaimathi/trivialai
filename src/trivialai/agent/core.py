@@ -11,7 +11,7 @@ from .. import util
 from ..bistream import BiStream, repeat_until, sequentially
 from ..llm import LLMMixin
 from ..ollama import Ollama
-from ..tools import Tools
+from ..tools import ToolKit
 from ..vectorstore.core import Whim
 from . import prompting
 
@@ -56,7 +56,7 @@ def run_pdb_test(path: str):
         if parsed.get("type") not in {"summary", "tool-call"}:
             raise util.TransformError("invalid-object-structure")
         if parsed["type"] == "tool-call":
-            return tk.check_tool(parsed)
+            return tools.check_tool(parsed)
         return parsed
 
     def _per_file_stream(f: str):
@@ -65,8 +65,8 @@ def run_pdb_test(path: str):
             f"You are currently working on file {f}. Your response should be either\n"
             "1. a tool call (in which case the tool will be called, and once it completes, you "
             "   will be given its result to evaluate). In this case it is IMPORTANT that your "
-            "   response be ONLY the tool call structure (a JSON object of type "
-            "   {type: 'tool-call', tool: ToolName, args: {ParamName: ParamValue}}) and no other commentary.\n"
+            f"   response be ONLY the tool call structure (a JSON object like {tools.to_tool_shape()}) "
+            " and no other commentary.\n"
             "2. a summary of what you've done so far and an approval to move on to the next phase. "
             "   In this case, it is IMPORTANT that your response be ONLY a summary structure "
             "   {type: 'summary', summary: MarkdownString}. The markdown string should be a concise "
