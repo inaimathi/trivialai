@@ -218,9 +218,38 @@ class ToolKit:
         - Sequence / list[...] -> value must be a list
         - Mapping / dict[...] -> value must be a dict
         - Plain class -> isinstance(value, annotation)
+        - Simple string annotations like "int", "str", "Optional[str]" handled specially
         - Everything else -> permissive True (don't over-reject)
         """
         if annotation is Any or annotation is inspect._empty:
+            return True
+
+        # Handle string annotations (from `from __future__ import annotations`)
+        if isinstance(annotation, str):
+            ann_str = annotation.strip()
+
+            # Simple builtin type names
+            builtin_map = {
+                "int": int,
+                "str": str,
+                "float": float,
+                "bool": bool,
+                "dict": dict,
+                "list": list,
+                "tuple": tuple,
+                "set": set,
+            }
+            if ann_str in builtin_map:
+                return isinstance(value, builtin_map[ann_str])
+
+            # Optional[T] in string form
+            if ann_str.startswith("Optional[") and ann_str.endswith("]"):
+                inner_str = ann_str[len("Optional[") : -1].strip()
+                if value is None:
+                    return True
+                return ToolKit._type_ok(value, inner_str)
+
+            # If it's some complex string we don't recognize, be permissive
             return True
 
         origin = get_origin(annotation)

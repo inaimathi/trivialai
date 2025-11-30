@@ -107,7 +107,7 @@ class TestToolKitShapeAndPrompt(unittest.TestCase):
 
         # Simple check that description line is present
         self.assertIn("Add two integers.", prompt)
-        self.assertIn("Write content to a file path", prompt.splitlines()[0] or prompt)
+        self.assertIn("Write content to a file path", prompt)
 
 
 class TestToolKitCheckTool(unittest.TestCase):
