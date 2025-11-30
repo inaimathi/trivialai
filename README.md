@@ -1,6 +1,6 @@
 # TrivialAI
 
-*(A set of **httpx** / **boto3**-based, trivial bindings for AI models — now with optional streaming)*
+*(A set of trivial bindings for AI models)*
 
 ## Install
 
@@ -10,7 +10,7 @@ pip install trivialai
 # pip install "trivialai[http2]"
 # Optional: AWS Bedrock support (via boto3)
 # pip install "trivialai[bedrock]"
-```
+````
 
 * Requires **Python ≥ 3.9**.
 * Uses **httpx** for HTTP-based providers and **boto3** for Bedrock.
@@ -156,11 +156,20 @@ No special-casing required in downstream code.
 
 ---
 
-## Streaming (NDJSON-style events)
+## Streaming (NDJSON-style events, via `BiStream`)
 
-All providers expose a common streaming shape via `stream(...)` (sync iterator) and `astream(...)` (async):
+All providers expose a common streaming shape via `stream(...)`.
+
+**Important:** `stream(...)` (and the higher-level `stream_checked(...)`, `stream_json(...)`, `stream_tool_calls(...)`) now return a **`BiStream`**, which:
+
+* acts as a **normal iterator** in sync code (`for ev in client.stream(...): ...`), and
+* acts as an **async iterator** in async code (`async for ev in client.stream(...): ...`).
+
+You almost never need to touch `astream(...)` directly anymore; `stream(...)` is the unified interface.
 
 **Event schema**
+
+Each streaming LLM yields NDJSON-style events:
 
 * `{"type":"start", "provider": "<ollama|openai|anthropic|gcp|bedrock>", "model": "..."}`
 * `{"type":"delta", "text":"...", "scratchpad":"..."}`
@@ -169,6 +178,12 @@ All providers expose a common streaming shape via `stream(...)` (sync iterator) 
   * For **ChatGPT**, **Claude API**, **GCP**, and **Bedrock**, `scratchpad` is `""` (empty) in deltas.
 * `{"type":"end", "content":"...", "scratchpad": <str|None>, "tokens": <int>}`
 * `{"type":"error", "message":"..."}`
+
+On top of that, the `stream_checked(...)` / `stream_json(...)` helpers append a **final** event with a parsed payload:
+
+* `{"type":"final", "ok": true|false, "parsed": ..., "error": ..., "raw": ...}`
+
+(See below.)
 
 ### Example: streaming Ollama (sync)
 
@@ -201,33 +216,114 @@ All providers expose a common streaming shape via `stream(...)` (sync iterator) 
 {'type': 'end', 'content': 'Yes, I can hear you! ... margarine ...', 'scratchpad': None, 'tokens': 36}
 ```
 
-### Example: parse-at-end streaming
+### Parse-at-end streaming (`stream_checked` / `stream_json`)
 
-If you want incremental updates *and* a structured parse at the end:
+If you want incremental updates *and* a structured parse at the end, use the LLM-level helpers:
+
+```py
+from trivialai.util import loadch
+
+# Parse final output as JSON, with retries, but still get deltas for UI.
+for ev in client.stream_checked(loadch, "sys", "Return a JSON object gradually."):
+    if ev["type"] in {"start", "delta", "end"}:
+        # good for UI updates
+        print(ev)
+    elif ev["type"] == "final":
+        print("Parsed JSON:", ev["parsed"])
+```
+
+Shortcut: `stream_json(...)` is just `stream_checked(loadch, ...)`:
+
+```py
+for ev in client.stream_json("sys", "Return {'name':'Platypus'} as JSON."):
+    if ev["type"] == "final":
+        print("Parsed:", ev["parsed"])
+```
+
+You can also use the *utility-level* `stream_checked` on arbitrary streams (not just LLMs):
 
 ```py
 from trivialai.util import stream_checked, loadch
 
-for ev in client.stream("sys", "Return a JSON object gradually."):
-    # pass-through for UI
-    if ev["type"] in {"start","delta"}:
-        print(ev)
-    elif ev["type"] == "end":
-        # now emit the final parsed event
-        for final_ev in stream_checked(iter([ev]), loadch):
-            print(final_ev)  # {"type":"final","ok":True,"parsed":{...}}
+raw_stream = client.stream("sys", "Return JSON gradually.")
+for ev in stream_checked(raw_stream, loadch):
+    ...
 ```
 
-Shortcut: `stream_json(system, prompt)` yields the same stream and a final parsed event using `loadch`.
+In all cases, `stream_checked(...)` returns a **`BiStream`**, so you can use it in sync or async code.
 
-### Async flavor
+### Async flavor (using `BiStream`)
+
+Because `stream(...)` returns a `BiStream`, you can use it directly in async code:
 
 ```py
+# Recommended: use .stream(...) everywhere, even in async code
+async for ev in client.stream("sys", "Stream something."):
+    ...
+
+# If you really want the provider's raw async stream:
 async for ev in client.astream("sys", "Stream something."):
     ...
 ```
 
 *(For Bedrock, `stream(...)` is the native streaming interface; `astream(...)` currently falls back to the default `LLMMixin` behavior unless you wrap it yourself.)*
+
+---
+
+## `BiStream`: sync/async bridge for streams
+
+`BiStream` is a tiny adapter type that underpins all of TrivialAI’s streaming APIs.
+
+```py
+from trivialai.bistream import BiStream
+```
+
+### What it does
+
+`BiStream[T]` wraps:
+
+* a **synchronous** `Iterable[T]` (e.g. generator, list, `range(...)`),
+* an **asynchronous** `AsyncIterable[T]` (e.g. `async def` generator), or
+* another `BiStream[T]`,
+
+and presents **both** of these interfaces:
+
+* `Iterator[T]` — usable with `for`, `next()`, `list()`, `itertools`, etc.
+* `AsyncIterator[T]` — usable with `async for`.
+
+In other words:
+
+```py
+bs = BiStream(async_stream())   # or BiStream(sync_stream())
+
+# Sync code:
+for item in bs:
+    ...
+
+# Async code:
+async for item in bs:
+    ...
+```
+
+### How it behaves
+
+* **Single-shot:** it’s a stream, not a list. Once you’ve iterated it fully (sync *or* async), it’s exhausted.
+* **One underlying source:** if the source is async, there’s a single async iterator and the sync side bridges via a background loop.
+  If the source is sync, the async side bridges via a tiny async wrapper.
+* **Idempotent construction:** `BiStream.ensure(bs)` returns `bs` unchanged if it’s already a `BiStream`.
+* **Sharing progress:** `BiStream` constructed from another `BiStream` reuses its underlying iterators, so partial consumption is shared.
+
+A few practical notes:
+
+* It’s great for **library boundaries**: your code can accept or return “something stream-like” and not care if callers are sync or async.
+* It’s not a random-access container. Don’t rely on indexing or resetting; if you need that, buffer into a list yourself.
+* Avoid consuming the same `BiStream` concurrently in multiple tasks; it’s single-consumer by design.
+
+TrivialAI uses `BiStream` for:
+
+* LLM methods: `stream(...)`, `stream_checked(...)`, `stream_json(...)`, `stream_tool_calls(...)`
+* Utility helpers: `util.stream_checked(...)`, `util.astream_checked(...)` (the latter normalizes to `BiStream` internally)
+* Higher-level orchestration code (e.g., RAG + chat pipelines) that wants a single streaming interface for Tornado handlers and REPLs.
 
 ---
 
@@ -375,6 +471,13 @@ vec = embed("hello world")
 
 * **Dependencies**: `httpx` replaces `requests`. Use `httpx[http2]` if you want HTTP/2 for OpenAI/Anthropic. Use `boto3` for AWS Bedrock.
 * **Python**: ≥ **3.9** (we use `asyncio.to_thread`).
-* **Scratchpad**: only **Ollama** surfaces `<think>` content; others emit `scratchpad` as `""` in deltas and `None` in the final event.
-* **GCP/Vertex AI**: primarily for setup/auth. No native provider streaming; `astream` falls back to a single final chunk unless you override.
+* **Scratchpad**:
+
+  * **Ollama** surfaces `<think>` content as `scratchpad` deltas and a final scratchpad string.
+  * Other providers emit `scratchpad` as `""` in deltas and `None` in the final event.
+* **GCP/Vertex AI**: primarily for setup/auth. No native provider streaming; `stream(...)` falls back to a single final chunk unless you override.
 * **Bedrock**: `stream(...)` uses `converse_stream()`; token counts (when available) are surfaced as `tokens` in the final `end` event.
+* **BiStream**:
+
+  * All `stream*` helpers return `BiStream` so you can write code once and use it in both sync + async contexts.
+  * A `BiStream` is single-use; don’t try to consume the same instance from multiple tasks at once.

@@ -1,6 +1,6 @@
 import unittest
 
-from src.trivialai.embedding import Embedder, OllamaEmbedder
+from src.trivialai.embedding.core import Embedder, OllamaEmbedder
 
 
 class TestEmbeddingRegistry(unittest.TestCase):
