@@ -219,6 +219,87 @@ def sequentially(
     return reduce(lambda acc, f: _chain_on(acc, f, pred=pred), thens, src)
 
 
+def repeat_until(
+    src: BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any],
+    step: Callable[[Any], ABCIterable[Any]],  # e.g. your generator _proceed
+    *,
+    pred: Callable[[Any], bool],
+    stop: Callable[[Any, int], bool],  # (final_ev, iteration) -> bool
+    max_iters: int = 10,
+) -> BiStream[Any]:
+    """
+    Repeatedly:
+      - stream all events from the current stream,
+      - take its last `final` event,
+      - if stop(final, iteration) or iteration >= max_iters: break
+      - else: set the next stream to `step(final)` and continue.
+    """
+
+    def _gen():
+        stream: ABCIterable[Any] = BiStream.ensure(src)
+        iteration = 0
+
+        while True:
+            final_ev = None
+
+            # Drain current stream, remembering its last final and yielding as we go.
+            for ev in stream:
+                if pred(ev):
+                    final_ev = ev
+                yield ev
+
+            if final_ev is None:
+                # Nothing to drive the next step.
+                break
+
+            iteration += 1
+            if stop(final_ev, iteration) or iteration >= max_iters:
+                break
+
+            # Next stream is whatever the step produces.
+            stream = step(final_ev)
+
+    return BiStream(_gen())
+
+
+def tap(
+    src: "BiStream[T] | ABCIterable[T] | ABCAsyncIterable[T]",
+    cb: Callable[[T], Any],
+    *,
+    focus: Optional[Callable[[T], bool]] = None,
+    ignore: Optional[Callable[[T], bool]] = None,
+) -> "BiStream[T]":
+    """
+    Run `cb(ev)` for selected events in `src`, but yield events unchanged.
+
+    - If `focus` is provided: only events where focus(ev) is True are sent to cb.
+    - If `ignore` is provided: events where ignore(ev) is True are *not* sent to cb.
+    - If both are provided: cb is called when focus(ev) and not ignore(ev).
+    - If neither is provided: cb is called for every event.
+
+    Returns a BiStream[T] that streams the same events as `src`.
+    """
+
+    stream = BiStream.ensure(src)
+
+    def _want(ev: T) -> bool:
+        if focus is not None and ignore is not None:
+            return focus(ev) and not ignore(ev)
+        if focus is not None:
+            return focus(ev)
+        if ignore is not None:
+            return not ignore(ev)
+        return True
+
+    def _gen():
+        for ev in stream:
+            if _want(ev):
+                cb(ev)
+            yield ev
+
+    return BiStream(_gen())
+
+
 class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
     """
     Bidirectional stream wrapper.
@@ -345,3 +426,15 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         pred: Optional[Callable[[T], bool]] = None,
     ) -> BiStream[T | U]:
         return _chain_on(self, fn, pred=pred)
+
+    def tap(
+        self,
+        cb: Callable[[T], Any],
+        *,
+        focus: Optional[Callable[[T], bool]] = None,
+        ignore: Optional[Callable[[T], bool]] = None,
+    ) -> "BiStream[T]":
+        """
+        Convenience: self.tap(cb, focus=..., ignore=...) == tap(self, cb, ...)
+        """
+        return tap(self, cb, focus=focus, ignore=ignore)

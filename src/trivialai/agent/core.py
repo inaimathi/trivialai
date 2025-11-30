@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 from .. import util
-from ..bistream import BiStream, sequentially
+from ..bistream import BiStream, repeat_until, sequentially
 from ..llm import LLMMixin
 from ..ollama import Ollama
 from ..tools import Tools
@@ -41,6 +41,11 @@ def tool_call(tools, call):
 
 def run_pdb_test(path: str):
     agent_name = "pdb_agent_001"
+
+    def log_event_to_file(ev: dict[str, Any]) -> None:
+        line = json.dumps(ev, default=str)
+        util.spit("agent_log.ndjson", line + "\n", mode="a")
+
     qwq = Ollama("qwq:latest", "http://localhost:11435/")
     tools = [util.slurp, util.spit]
     tool_names = {t.__name__ for t in tools}
@@ -87,37 +92,66 @@ def run_pdb_test(path: str):
             "   check further on in the process.\n"
         )
 
+        # First LLM pass for this file
         base = qwq.stream_checked(
             _check_resp,
             prompting.build_prompt(system, prompt, tools=tools),
             prompt,
         )
 
+        # Step: what to do after each "final" event
         def _proceed(final_ev: dict[str, Any]):
-            parsed = final_ev["parsed"]
+            """
+            `final_ev` is expected to look like:
+              {"type": "final", "ok": bool, "parsed": {...}}
+
+            This generator:
+              - if parsed["type"] == "tool-call": runs the tool, logs, then
+                yields a *second* LLM stream
+              - if parsed["type"] == "summary": does nothing here; repeat_until
+                will see it and stop further calls
+            """
+            parsed = final_ev.get("parsed", {})
 
             if parsed.get("type") == "tool-call":
                 res = tool_call(tools, parsed)
-                yield (
-                    {"type": "trivialai.agent.log", "message": "Running a tool call..."}
-                )
+
+                # stitched log event
+                yield {
+                    "type": "trivialai.agent.log",
+                    "message": f"Running a tool call {parsed} -> {type(res)}",
+                }
+
                 pr = (
                     f"You previously asked me to run the tool call {parsed}. "
                     f"The result of that call is {res}."
                     f"{prompt}\n"
                 )
 
+                # Second (and subsequent) LLM passes
                 yield from qwq.stream_checked(
                     _check_resp,
                     prompting.build_prompt(system, pr, tools=tools),
                     pr,
                 )
 
-            if parsed.get("type") == "summary":
-                yield {"type": "summary", "summary": parsed["summary"]}
+            # For parsed["type"] == "summary" we don't do anything here.
+            # repeat_until will notice the summary and stop scheduling more passes.
 
-        return sequentially(base, [_proceed])
+        # Repeatedly run LLM -> tool -> LLM until we see a summary in parsed["type"]
+        return repeat_until(
+            base,
+            _proceed,
+            pred=lambda ev: isinstance(ev, dict) and ev.get("type") == "final",
+            stop=lambda final_ev, i: final_ev.get("parsed", {}).get("type")
+            == "summary",
+            max_iters=10,  # or whatever upper bound you like
+        ).tap(
+            log_event_to_file,
+            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
+        )
 
+    # Top-level: flatten per-file streams
     for f in src_files[0:1]:
         yield from _per_file_stream(f)
 

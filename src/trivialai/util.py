@@ -126,7 +126,9 @@ def slurp(pathname: str) -> str:
 
 
 def spit(file_path: str, content: str, mode: Optional[str] = None) -> None:
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    dr = os.path.dirname(file_path)
+    if dr:
+        os.makedirs(dr, exist_ok=True)
     with open(file_path, mode or "w") as dest:
         dest.write(content)
 
