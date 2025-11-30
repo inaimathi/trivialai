@@ -9,9 +9,9 @@ import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .agent import Agent, AgentScope, AgentStep
-from .llm import LLMMixin, LLMResult
-from .tools import Tools
+from ..llm import LLMMixin, LLMResult
+from ..tools import Tools
+from .core import Agent, AgentScope, AgentStep
 
 
 def _run_cmd(

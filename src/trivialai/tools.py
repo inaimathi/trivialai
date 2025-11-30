@@ -34,6 +34,21 @@ def to_llm_snippet(
         ann = getattr(fn, "__annotations__", {}) or {}
         raw_schema = {k: v for k, v in ann.items() if k != "return"}
 
+        # Fallback: if no annotations, use inspect.signature to get parameter names
+        if not raw_schema:
+            try:
+                sig = inspect.signature(fn)
+                # Create a basic schema with parameter names but no type info
+                raw_schema = {
+                    name: Any  # or you could use a placeholder like 'unknown'
+                    for name, param in sig.parameters.items()
+                    if param.kind != param.VAR_POSITIONAL
+                    and param.kind != param.VAR_KEYWORD
+                }
+            except (ValueError, TypeError):
+                # Some built-ins don't have accessible signatures
+                raw_schema = {}
+
     norm_schema: Dict[str, Any] = {arg: _to_schema(t) for arg, t in raw_schema.items()}
 
     return {

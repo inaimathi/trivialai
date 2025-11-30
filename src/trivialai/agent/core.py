@@ -1,635 +1,338 @@
-# trivialai/agent/core.py
+# src/trivialai/agent.py
+from __future__ import annotations
 
-import asyncio
 import json
-import logging
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
-from uuid import uuid4
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
-from ..bistream import BiStream
-from ..tools import to_llm_snippet
-from .prompting import DEFAULT_CONTEXT_SIZE_CHARS, build_prompt
-
-Message = Dict[str, Any]
-
-_EVENT_PREFIX = "trivialai.agent."
-
-
-def _etype(local: str) -> str:
-    """Prefix event type names for streamed events."""
-    return _EVENT_PREFIX + local
-
-
-@dataclass
-class Task:
-    id: str
-    kind: str  # "do" | "loop"
-    prompt: str
-    until: Optional[str] = None
-    max_iter: int = 1
-    status: str = "pending"
-    result: Optional[Any] = None
+from ..llm import LLMMixin
+from ..tools import Tools
 
 
 class Agent:
+    """
+    A lightweight planning/execution wrapper around an LLMMixin instance.
+
+    - Memory: pointers to files/dirs, URLs, and text snippets.
+    - Context: built *per step* from memory + event history.
+    - Plan: ordered list of AgentStep.
+    - Execution:
+        * .run()  -> generator of events for all remaining steps
+        * .do(s) -> sugar: .plan(s).run(); returns self
+
+    Events yielded by .run() include both:
+      - agent meta-events: "agent-step-start", "agent-step-end", etc.
+      - raw LLM stream events, augmented with `agent_step` index.
+    """
+
     def __init__(
         self,
-        llm,
-        name: Optional[str] = None,
-        log_path: Optional[Union[str, Path]] = None,
-        logger: Optional[logging.Logger] = None,
+        llm: LLMMixin,
         *,
-        base_system_prompt: str = "",
-        context_size: int = DEFAULT_CONTEXT_SIZE_CHARS,
-        memory: Optional[Any] = None,  # VectorStore | Collection | None (duck-typed)
-        context_summary: Optional[str] = None,
+        name: Optional[str] = None,
+        root: Optional[Union[str, Path]] = None,
     ):
-        """
-        Agent that uses an LLMMixin-compatible LLM with a streaming API.
-
-        Config:
-        - base_system_prompt: high-level behaviour / goals for build_prompt
-        - context_size: max char length for system prompt built by build_prompt
-        - memory: optional VectorStore/Collection for retrieved context
-        - context_summary: optional short summary of what has happened so far
-        """
         self.llm = llm
-        self.name = name or f"agent-{uuid4().hex[:8]}"
-        self.log_path = (
-            Path(log_path) if log_path else Path(f"./agent_log_{self.name}.jsonl")
-        )
+        self.name = name or "agent-task"
 
-        self.base_system_prompt = base_system_prompt
-        self.context_size = context_size
-        self.memory = memory
-        self.context_summary = context_summary
+        root_path = Path(root or ".").expanduser().resolve()
+        internal = root_path / "."
+        scratch = root_path / ".agent-scratchpad"
+        scratch.mkdir(parents=True, exist_ok=True)
 
-        self.logger = logger or logging.getLogger(f"trivialai.agent.{self.name}")
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(
-                logging.Formatter("[%(asctime)s] %(name)s %(levelname)s: %(message)s")
-            )
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+        self.log_path: Path = root_path / f"{self.name}.agent"
 
-        self._logs: List[Dict[str, Any]] = []
-        self._tasks: List[Task] = []
-
-        # tools: name -> fn; snippets: name -> to_llm_snippet(fn, ...)
-        self._tools: Dict[str, Callable[..., Any]] = {}
-        self._tool_snippets: Dict[str, Dict[str, Any]] = {}
-
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_file = self.log_path.open("a", encoding="utf-8")
-
-        self.log("agent.created", {"name": self.name, "log_path": str(self.log_path)})
-
-    # -------------------------------------------------------------------------
-    # Logging
-    # -------------------------------------------------------------------------
-
-    def log(self, event_type: str, payload: Dict[str, Any]) -> None:
-        event = {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "agent": self.name,
-            "event_type": event_type,
-            "payload": payload,
-        }
-        self._logs.append(event)
-        self._log_file.write(json.dumps(event, ensure_ascii=False) + "\n")
-        self._log_file.flush()
-        self.logger.info("%s: %s", event_type, payload)
-
-    # -------------------------------------------------------------------------
-    # Constructors
-    # -------------------------------------------------------------------------
+    # --------- Construction / builder API ---------
 
     @classmethod
     def from_llm(
         cls,
-        llm,
-        log_path: Optional[Union[str, Path]] = None,
-        **kwargs: Any,
-    ) -> "Agent":
-        """
-        Convenience constructor; forwards extra kwargs to Agent.__init__.
-        """
-        return cls(llm=llm, name=None, log_path=log_path, **kwargs)
-
-    @classmethod
-    def from_logs(cls, log_path: Union[str, Path]) -> "Agent":
-        """
-        Rebuild basic Agent state from an NDJSON log file.
-        You can't reconstruct function objects or memory; you'll need to
-        re-equip tools and reattach memory after creating the Agent.
-        """
-        log_path = Path(log_path)
-        events = [json.loads(line) for line in log_path.open("r", encoding="utf-8")]
-
-        meta = next((e for e in events if e["event_type"] == "agent.created"), None)
-        name = meta["payload"]["name"] if meta else None
-
-        agent = cls(llm=None, name=name, log_path=log_path)
-        agent._logs = events
-
-        for ev in events:
-            if ev["event_type"] == "task.enqueued":
-                p = ev["payload"]
-                agent._tasks.append(
-                    Task(
-                        id=p["id"],
-                        kind=p["kind"],
-                        prompt=p["prompt"],
-                        until=p.get("until"),
-                        max_iter=p.get("max_iter", 1),
-                        status=p.get("status", "pending"),
-                    )
-                )
-
-        return agent
-
-    # -------------------------------------------------------------------------
-    # Tools: functions-as-tools (for prompt description now, tool-calls later)
-    # -------------------------------------------------------------------------
-
-    def equip(
-        self,
-        fn: Callable[..., Any],
+        llm: LLMMixin,
         *,
         name: Optional[str] = None,
-        types: Optional[Dict[str, Any]] = None,
-        description: Optional[str] = None,
-        is_async: Optional[bool] = None,
-    ) -> str:
+        root: Optional[Union[str, Path]] = None,
+    ) -> Agent:
+        return cls(llm, name=name, root=root)
+
+    # --- Memory (pointers) ---
+
+    def consider(self, item: Union[str, Path]) -> Agent:
         """
-        Register a Python function as a tool.
-
-        Uses type annotations and docstring by default (via to_llm_snippet),
-        but allows overrides.
+        Register a read-only memory pointer:
+          - str starting with http(s) -> URL
+          - other str / Path         -> file or directory path
         """
-        snippet = to_llm_snippet(
-            fn,
-            name=name,
-            types=types,
-            description=description,
-            is_async=is_async,
-        )
-        tool_name = snippet["name"]
-
-        self._tools[tool_name] = fn
-        self._tool_snippets[tool_name] = snippet
-
-        self.log(
-            "tool.equipped",
-            {
-                "name": tool_name,
-                "description": snippet["description"],
-                "args": snippet["args"],
-                "async": snippet["async"],
-            },
-        )
-        return tool_name
-
-    def unequip(self, tool: Union[str, Callable[..., Any]]) -> None:
-        if callable(tool):
-            to_remove = [name for name, fn in self._tools.items() if fn is tool]
-        else:
-            to_remove = [tool]
-
-        for name in to_remove:
-            if name in self._tools:
-                self._tools.pop(name, None)
-                self._tool_snippets.pop(name, None)
-                self.log("tool.unequipped", {"name": name})
-
-    async def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Any:
-        """
-        Execute a tool function with the given args.
-
-        Handles sync vs async, and logs results. This isn't wired into the
-        streaming loop yet, but is ready for future auto tool-calls.
-        """
-        fn = self._tools[name]
-        snip = self._tool_snippets[name]
-        is_async = bool(snip.get("async"))
-
-        self.log("tool.called", {"name": name, "args": args})
-
-        try:
-            if is_async:
-                result = await fn(**args)  # type: ignore[misc]
+        if isinstance(item, Path):
+            p = item.expanduser().resolve()
+            self.memory_items.append(MemoryFile(path=p, writable=False))
+        elif isinstance(item, str):
+            if item.startswith("http://") or item.startswith("https://"):
+                self.memory_items.append(MemoryURL(url=item))
             else:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, lambda: fn(**args))
-        except Exception as e:
-            self.log("tool.error", {"name": name, "args": args, "error": repr(e)})
-            raise
+                p = Path(item).expanduser().resolve()
+                self.memory_items.append(MemoryFile(path=p, writable=False))
+        else:
+            raise TypeError(f"Unsupported memory item type: {type(item)}")
+        return self
 
-        self.log("tool.result", {"name": name, "args": args, "result": result})
-        return result
-
-    # -------------------------------------------------------------------------
-    # Tasks
-    # -------------------------------------------------------------------------
-
-    def do(self, prompt: str) -> str:
-        task = Task(id=uuid4().hex, kind="do", prompt=prompt)
-        self._tasks.append(task)
-        self.log(
-            "task.enqueued",
-            {"id": task.id, "kind": task.kind, "prompt": task.prompt, "max_iter": 1},
-        )
-        return task.id
-
-    def loop(self, prompt: str, until: str, max_iter: int = 5) -> str:
-        task = Task(
-            id=uuid4().hex,
-            kind="loop",
-            prompt=prompt,
-            until=until,
-            max_iter=max_iter,
-        )
-        self._tasks.append(task)
-        self.log(
-            "task.enqueued",
-            {
-                "id": task.id,
-                "kind": task.kind,
-                "prompt": task.prompt,
-                "until": until,
-                "max_iter": max_iter,
-            },
-        )
-        return task.id
-
-    # -------------------------------------------------------------------------
-    # Run: single BiStream interface (sync OR async)
-    # -------------------------------------------------------------------------
-
-    def run(self) -> BiStream[Dict[str, Any]]:
+    def consider_with_write_access(self, path: Union[str, Path]) -> Agent:
         """
-        Run all planned tasks and return a BiStream of agent events.
-
-        Usage:
-
-            # sync
-            for ev in agent.run():
-                ...
-
-            # async
-            async for ev in agent.run():
-                ...
+        Register a memory pointer and explicitly grant write access
+        to that path (file or directory).
         """
+        p = Path(path).expanduser().resolve()
+        self.memory_items.append(MemoryFile(path=p, writable=True))
+        self.scope.allowed_writes.append(p)
+        return self
 
-        async def _agen():
-            for task in self._tasks:
-                if task.status == "done":
-                    continue
+    def remember_text(self, label: str, text: str) -> Agent:
+        """
+        Register a raw text snippet as a memory item.
+        """
+        self.memory_items.append(MemoryText(label=label, text=text))
+        return self
 
-                task.status = "running"
-                self.log("task.started", {"id": task.id, "kind": task.kind})
-                yield {
-                    "type": _etype("task.started"),
-                    "task_id": task.id,
-                    "kind": task.kind,
+    # --- Tooling ("equip" instead of "use") ---
+
+    def equip(self, tools: Any) -> Agent:
+        """
+        Attach tools to this agent.
+
+        Accepts:
+          - a Tools instance (merged into self.tools),
+          - a single callable (registered via self.tools.define),
+          - an iterable of the above.
+        """
+        # Tools instance
+        if isinstance(tools, Tools):
+            # Merge into self.tools, respecting existing entries.
+            for name, spec in tools._env.items():  # type: ignore[attr-defined]
+                if name not in self.tools._env:  # type: ignore[attr-defined]
+                    self.tools._env[name] = spec  # type: ignore[attr-defined]
+            return self
+
+        # Iterable of things?
+        if isinstance(tools, Iterable) and not isinstance(tools, (str, bytes)):
+            for t in tools:
+                self.equip(t)
+            return self
+
+        # Assume single callable
+        if callable(tools):
+            self.tools.define(tools)
+            return self
+
+        raise TypeError(f"Unsupported tools/equipment type: {type(tools)}")
+
+    # --- Planning API ---
+
+    def plan(self, description: str, *, kind: str = "do") -> Agent:
+        """
+        Add a step to the internal plan. Does not execute it.
+        """
+        self.steps.append(AgentStep(kind=kind, description=description))
+        return self
+
+    def loop(self, description: str) -> Agent:
+        """
+        Convenience for planning a 'loop' step.
+        Semantics are up to _run_loop_step; currently v0 is simple.
+        """
+        return self.plan(description, kind="loop")
+
+    def do(self, description: str) -> Agent:
+        """
+        Sugar: plan a 'do' step and immediately execute all pending steps.
+
+        Equivalent to:
+          agent.plan(description)
+          for _ in agent.run():
+              pass
+          return agent
+        """
+        self.plan(description, kind="do")
+        for _ in self.run():
+            # side-effects: history & log update
+            pass
+        return self
+
+    # --------- Execution API ---------
+
+    def run(self, max_steps: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """
+        Execute all planned steps from the current cursor onward,
+        optionally limited by `max_steps`.
+
+        Yields a stream of events:
+          - agent meta events (type starts with "agent-...")
+          - LLM stream events (start/delta/end/error) with extra 'agent_step' key.
+
+        This is intentionally a generator so it composes well with itertools.chain.
+        """
+        # Figure out which step indices to run
+        start = self._next_step_index
+        end = len(self.steps)
+        if max_steps is not None:
+            end = min(end, start + max_steps)
+
+        if start >= end:
+            return iter(())  # nothing to do
+
+        # Append to the task log; one line per event
+        with self.log_path.open("a", encoding="utf-8") as logf:
+            for step_index in range(start, end):
+                step = self.steps[step_index]
+
+                ev_start = {
+                    "type": "agent-step-start",
+                    "agent_step": step_index,
+                    "kind": step.kind,
+                    "description": step.description,
                 }
+                yield ev_start
+                self._record_event(ev_start, logf)
 
-                if task.kind == "do":
-                    async for ev in self._run_single_stream(task):
+                if step.kind == "do":
+                    for ev in self._run_do_step(step_index, step):
                         yield ev
-                elif task.kind == "loop":
-                    async for ev in self._run_loop_stream(task):
+                        self._record_event(ev, logf)
+                elif step.kind == "loop":
+                    for ev in self._run_loop_step(step_index, step):
                         yield ev
+                        self._record_event(ev, logf)
                 else:
-                    err = ValueError(f"Unknown task kind {task.kind}")
-                    self.log("task.failed", {"id": task.id, "error": repr(err)})
-                    yield {
-                        "type": _etype("task.failed"),
-                        "task_id": task.id,
-                        "error": repr(err),
+                    # Unknown kind; just mark as skipped
+                    ev_unknown = {
+                        "type": "agent-step-unknown-kind",
+                        "agent_step": step_index,
+                        "kind": step.kind,
                     }
-                    task.status = "failed"
-                    continue
+                    yield ev_unknown
+                    self._record_event(ev_unknown, logf)
 
-                task.status = "done"
-                self.log(
-                    "task.done",
-                    {"id": task.id, "kind": task.kind, "result": task.result},
-                )
-                yield {
-                    "type": _etype("task.done"),
-                    "task_id": task.id,
-                    "kind": task.kind,
-                    "result": task.result,
+                ev_end = {
+                    "type": "agent-step-end",
+                    "agent_step": step_index,
+                    "kind": step.kind,
                 }
+                yield ev_end
+                self._record_event(ev_end, logf)
 
-        return BiStream.ensure(_agen())
+                # advance cursor
+                self._next_step_index = step_index + 1
 
-    # -------------------------------------------------------------------------
-    # Internal: LLM streaming helpers
-    # -------------------------------------------------------------------------
+    # --------- Internal helpers ---------
 
-    async def _llm_stream_once(
-        self,
-        *,
-        task_id: str,
-        phase: str,
-        user_prompt: str,
-        iteration: Optional[int] = None,
-    ):
+    def _record_event(self, ev: Dict[str, Any], logf) -> None:
         """
-        Single LLM call (streaming) as an async generator of events.
-
-        Yields:
-          - {"type": "trivialai.agent.llm.start", ...}
-          - {"type": "trivialai.agent.llm.delta", ...}
-          - {"type": "trivialai.agent.llm.end", ...}
+        Append event to in-memory history and to the NDJSON log.
         """
-        system = build_prompt(
-            base_system_prompt=self.base_system_prompt,
-            user_prompt=user_prompt,
-            tools=list(self._tool_snippets.values()),
-            context_size=self.context_size,
-            memory=self.memory,
-            context_summary=self.context_summary,
+        self.history_events.append(ev)
+        print(_json_line(ev), file=logf)
+
+    # --- Context building (late-bound) ---
+
+    def _build_system_prompt(self, step_index: int, step: AgentStep) -> str:
+        """
+        Build the system prompt for a given step from:
+          - a generic agent persona,
+          - current memory pointers,
+          - recent history of events.
+        """
+        lines: List[str] = []
+
+        lines.append(
+            "You are an autonomous coding and text-editing agent that follows "
+            "instructions carefully and respects file write permissions enforced "
+            "by the host. You MUST NOT write outside the directories explicitly "
+            "granted write access, except for the agent's own scratchpad."
         )
 
-        log_payload: Dict[str, Any] = {
-            "task_id": task_id,
-            "phase": phase,
-            "system_len": len(system),
-            "prompt": user_prompt,
-        }
-        if iteration is not None:
-            log_payload["iteration"] = iteration
-
-        self.log("llm.call", log_payload)
-
-        stream = self.llm.stream(system, user_prompt, images=None)  # BiStream
-
-        content_parts: List[str] = []
-        scratch_parts: List[str] = []
-        final_content: Optional[str] = None
-        final_scratch: Optional[str] = None
-
-        async for ev in stream:
-            ev_type = ev.get("type")
-            if ev_type == "start":
-                out = {
-                    "type": _etype("llm.start"),
-                    "task_id": task_id,
-                    "phase": phase,
-                    "iteration": iteration,
-                    "provider": ev.get("provider"),
-                    "model": ev.get("model"),
-                }
-                self.log(
-                    "llm.stream.start",
-                    {
-                        "task_id": task_id,
-                        "phase": phase,
-                        "iteration": iteration,
-                        "provider": out["provider"],
-                        "model": out["model"],
-                    },
-                )
-                yield out
-
-            elif ev_type == "delta":
-                text = (ev.get("text") or "") if isinstance(ev.get("text"), str) else ""
-                scratch = (
-                    (ev.get("scratchpad") or "")
-                    if isinstance(ev.get("scratchpad"), str)
-                    else ""
-                )
-                if text:
-                    content_parts.append(text)
-                if scratch:
-                    scratch_parts.append(scratch)
-
-                yield {
-                    "type": _etype("llm.delta"),
-                    "task_id": task_id,
-                    "phase": phase,
-                    "iteration": iteration,
-                    "text": text,
-                    "scratchpad": scratch,
-                }
-
-            elif ev_type == "end":
-                if "content" in ev and ev["content"] is not None:
-                    final_content = ev["content"]
-                if "scratchpad" in ev and ev["scratchpad"] is not None:
-                    final_scratch = ev["scratchpad"]
-
-        if final_content is not None:
-            content = final_content
+        # Memory summary
+        if self.memory_items:
+            lines.append("")
+            lines.append("MEMORY POINTERS (read-only unless marked [rw]):")
+            for idx, item in enumerate(self.memory_items, start=1):
+                if isinstance(item, MemoryFile):
+                    mode = "[rw]" if item.writable else "[ro]"
+                    lines.append(f"- [{idx}] FILE {mode}: {item.path}")
+                elif isinstance(item, MemoryURL):
+                    lines.append(f"- [{idx}] URL: {item.url}")
+                elif isinstance(item, MemoryText):
+                    preview = item.text.replace("\n", " ")
+                    if len(preview) > 80:
+                        preview = preview[:77] + "..."
+                    lines.append(f"- [{idx}] TEXT '{item.label}': {preview}")
         else:
-            content = "".join(content_parts)
+            lines.append("")
+            lines.append("MEMORY POINTERS: (none)")
 
-        if final_scratch is not None:
-            scratch = final_scratch
-        else:
-            scratch = "".join(scratch_parts) if scratch_parts else None
-
-        self.log(
-            "llm.final",
-            {
-                "task_id": task_id,
-                "phase": phase,
-                "iteration": iteration,
-                "content": content,
-                "scratchpad": scratch,
-            },
-        )
-        yield {
-            "type": _etype("llm.end"),
-            "task_id": task_id,
-            "phase": phase,
-            "iteration": iteration,
-            "content": content,
-            "scratchpad": scratch,
-        }
-
-    # -------------------------------------------------------------------------
-    # Agent loops: "do" and "loop" in streaming form
-    # -------------------------------------------------------------------------
-
-    async def _run_single_stream(self, task: Task):
-        """
-        Single-step task:
-        - One streaming LLM call
-        - Task.result set to final content
-        """
-        last_content: Optional[str] = None
-
-        async for ev in self._llm_stream_once(
-            task_id=task.id, phase="do", user_prompt=task.prompt
-        ):
-            if ev["type"] == _etype("llm.end"):
-                last_content = ev.get("content") or ""
-            yield ev
-
-        task.result = last_content or ""
-        yield {
-            "type": _etype("task.result"),
-            "task_id": task.id,
-            "result": task.result,
-        }
-
-    async def _run_loop_stream(self, task: Task):
-        """
-        Iterative task:
-        - For each iteration:
-            * stream a "progress" LLM call
-            * stream an "until-check" LLM call
-        - At the end, stream a "final summary" call
-        - Task.result is the final summary content
-        """
-        iteration_summaries: List[str] = []
-
-        for iteration in range(1, task.max_iter + 1):
-            # Progress phase
-            self.log(
-                "loop.iteration.start",
-                {"task_id": task.id, "iteration": iteration},
-            )
-            yield {
-                "type": _etype("loop.iteration.start"),
-                "task_id": task.id,
-                "iteration": iteration,
-            }
-
-            progress_prompt = (
-                "You are working on the following task:\n\n"
-                f"{task.prompt}\n\n"
-                f"This is iteration {iteration} of at most {task.max_iter}. "
-                "Describe the concrete actions you would take or have taken, "
-                "and what you achieved in this iteration."
-            )
-
-            if iteration_summaries:
-                prev = "\n\n".join(
-                    f"Iteration {i+1}: {s}" for i, s in enumerate(iteration_summaries)
-                )
-                progress_prompt += (
-                    "\n\nHere is a summary of previous iterations:\n\n" f"{prev}"
-                )
-
-            iter_content: Optional[str] = None
-            async for ev in self._llm_stream_once(
-                task_id=task.id,
-                phase="loop-iteration",
-                user_prompt=progress_prompt,
-                iteration=iteration,
-            ):
-                if ev["type"] == _etype("llm.end"):
-                    iter_content = ev.get("content") or ""
-                yield ev
-
-            iter_summary = iter_content or ""
-            iteration_summaries.append(iter_summary)
-            self.log(
-                "loop.iteration.summary",
-                {
-                    "task_id": task.id,
-                    "iteration": iteration,
-                    "content": iter_summary,
-                },
-            )
-            yield {
-                "type": _etype("loop.iteration.summary"),
-                "task_id": task.id,
-                "iteration": iteration,
-                "content": iter_summary,
-            }
-
-            # Until-check phase
-            if task.until:
-                summaries_text = "\n\n".join(
-                    f"Iteration {i+1}: {s}" for i, s in enumerate(iteration_summaries)
-                )
-                check_prompt = (
-                    "You are evaluating whether the task is complete.\n\n"
-                    f"Task description:\n{task.prompt}\n\n"
-                    f"Work done so far:\n{summaries_text}\n\n"
-                    "Now, answer STRICTLY 'yes' or 'no':\n"
-                    f"{task.until!r}"
-                )
-
-                answer_raw: Optional[str] = None
-                async for ev in self._llm_stream_once(
-                    task_id=task.id,
-                    phase="loop-until-check",
-                    user_prompt=check_prompt,
-                    iteration=iteration,
-                ):
-                    if ev["type"] == _etype("llm.end"):
-                        answer_raw = ev.get("content") or ""
-                    yield ev
-
-                answer_norm = (answer_raw or "").strip().lower()
-                self.log(
-                    "loop.until.check",
-                    {"task_id": task.id, "iteration": iteration, "answer": answer_norm},
-                )
-                yield {
-                    "type": _etype("loop.until.check"),
-                    "task_id": task.id,
-                    "iteration": iteration,
-                    "answer": answer_norm,
-                }
-
-                if answer_norm.startswith("yes"):
-                    self.log(
-                        "loop.stopped",
-                        {"task_id": task.id, "iteration": iteration},
+        # Recent history (very compressed)
+        if self.history_events:
+            lines.append("")
+            lines.append("RECENT HISTORY (most recent last):")
+            for ev in self.history_events[-8:]:
+                t = ev.get("type")
+                if t == "delta":
+                    txt = str(ev.get("text", "")).replace("\n", " ")
+                    if len(txt) > 60:
+                        txt = txt[:57] + "..."
+                    lines.append(f"- LLM delta: {txt}")
+                elif t == "agent-step-start":
+                    lines.append(
+                        f"- START step {ev.get('agent_step')}: {ev.get('description')}"
                     )
-                    yield {
-                        "type": _etype("loop.stopped"),
-                        "task_id": task.id,
-                        "iteration": iteration,
-                    }
-                    break
+                elif t == "agent-step-end":
+                    lines.append(
+                        f"- END step {ev.get('agent_step')}: kind={ev.get('kind')}"
+                    )
+                elif t and t.startswith("agent-"):
+                    lines.append(f"- {t}: {ev}")
 
-        # Final summary phase
-        summaries_text = "\n\n".join(
-            f"Iteration {i+1}:\n{s}" for i, s in enumerate(iteration_summaries)
-        )
-        summary_prompt = (
-            "Summarize the work done across all iterations into a concise report "
-            "for the user, focusing on what was attempted, what worked, and what "
-            "remains to be done (if anything).\n\n"
-            f"{summaries_text}"
+        lines.append("")
+        lines.append(
+            "You will now perform the NEXT STEP in the plan based on the user "
+            "instruction. If you need to refer to prior actions, rely on the "
+            "RECENT HISTORY and MEMORY POINTERS summaries."
         )
 
-        final_summary: Optional[str] = None
-        async for ev in self._llm_stream_once(
-            task_id=task.id,
-            phase="loop-final-summary",
-            user_prompt=summary_prompt,
-            iteration=None,
-        ):
-            if ev["type"] == _etype("llm.end"):
-                final_summary = ev.get("content") or ""
-            yield ev
+        return "\n".join(lines)
 
-        task.result = final_summary or ""
-        self.log(
-            "loop.final.summary",
-            {"task_id": task.id, "content": task.result},
-        )
-        yield {
-            "type": _etype("loop.final.summary"),
-            "task_id": task.id,
-            "content": task.result,
-        }
-        yield {
-            "type": _etype("task.result"),
-            "task_id": task.id,
-            "result": task.result,
-        }
+    # --- Step executors (v0: plain LLM streaming) ---
+
+    def _run_do_step(
+        self,
+        step_index: int,
+        step: AgentStep,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        v0: simple 'do' step.
+        - Builds a system prompt from memory + history.
+        - Streams a single LLM call with step.description as the user prompt.
+        - Yields the raw LLM events, tagged with agent_step.
+        """
+        system = self._build_system_prompt(step_index, step)
+        prompt = step.description
+
+        for ev in self.llm.stream(system, prompt):
+            ev2 = dict(ev)
+            ev2["agent_step"] = step_index
+            yield ev2
+
+    def _run_loop_step(
+        self,
+        step_index: int,
+        step: AgentStep,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        v0 loop semantics:
+          - currently behaves like a single 'do' step but is factored out
+            so we can later:
+              * orchestrate repeated LLM+tool cycles,
+              * inspect test results via equipped tools,
+              * stop when some condition is met.
+        """
+        # For now, this just forwards to _run_do_step once.
+        # Future: repeated iterations with tool calls and condition checks.
+        yield from self._run_do_step(step_index, step)
