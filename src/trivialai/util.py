@@ -120,8 +120,8 @@ def loadch(resp: Any) -> Any:
     raise TransformError("parse-failed")
 
 
-def slurp(pathname: str) -> str:
-    with open(pathname, "r") as f:
+def slurp(file_path: str) -> str:
+    with open(file_path, "r") as f:
         return f.read()
 
 

@@ -24,7 +24,6 @@ _DEFAULT_IGNORE = r"(^__pycache__|^node_modules|\.git/|/env-.*|\.egg-info/.*|^ve
 
 
 def run_pdb_test(path: str):
-    agent_name = "pdb_agent_001"
 
     def log_event_to_file(ev: dict[str, Any]) -> None:
         line = json.dumps(ev, default=str)
@@ -40,7 +39,7 @@ def run_pdb_test(path: str):
         " respects file write permissions enforced by the host."
         " You MUST NOT write outside the directories explicitly "
         "granted write access, except for the agent's own scratchpad."
-        f" Your scratchpad file is ./{agent_name}.md; write to it freely using the `spit` tool."
+        "You may write to the scratchpad by calling the `write_own_scratchpad` tool."
         " Your current task is to look over a git repository and find potential bugs."
         " The way you should go about doing this is by using the Hypothesis testing module "
         "to write properties in new test files and then run them. You should propose tests "
@@ -50,6 +49,11 @@ def run_pdb_test(path: str):
         "general shell or commit permissions so at worst any mistakes can be easily rolled "
         "back once they're reviewed."
     )
+    # agent = Agent(
+    #     Ollama("qwq:latest", "http://localhost:11435/"),
+    #     system=system,
+    #     name="pdb_agent_001",
+    # )
 
     def _check_resp(resp: str) -> dict[str, Any]:
         parsed = util.loadch(resp)
@@ -74,31 +78,18 @@ def run_pdb_test(path: str):
             "   check further on in the process.\n"
         )
 
-        # First LLM pass for this file
         base = qwq.stream_checked(
             _check_resp,
             prompting.build_prompt(system, prompt, tools=tools),
             prompt,
         )
 
-        # Step: what to do after each "final" event
         def _proceed(final_ev: dict[str, Any]):
-            """
-            `final_ev` is expected to look like:
-              {"type": "final", "ok": bool, "parsed": {...}}
-
-            This generator:
-              - if parsed["type"] == "tool-call": runs the tool, logs, then
-                yields a *second* LLM stream
-              - if parsed["type"] == "summary": does nothing here; repeat_until
-                will see it and stop further calls
-            """
             parsed = final_ev.get("parsed", {})
 
             if parsed.get("type") == "tool-call":
                 res = tools.call_tool(parsed)
 
-                # stitched log event
                 yield {
                     "type": "trivialai.agent.log",
                     "message": f"Running a tool call {parsed} -> {type(res)}",
@@ -110,7 +101,6 @@ def run_pdb_test(path: str):
                     f"{prompt}\n"
                 )
 
-                # Second (and subsequent) LLM passes
                 yield from qwq.stream_checked(
                     _check_resp,
                     prompting.build_prompt(system, pr, tools=tools),
@@ -134,7 +124,7 @@ def run_pdb_test(path: str):
         )
 
     # Top-level: flatten per-file streams
-    for f in src_files[0:1]:
+    for f in src_files:
         yield from _per_file_stream(f)
 
 
@@ -187,217 +177,50 @@ class Agent:
         self,
         llm: LLMMixin,
         *,
+        system: str,
+        tools: Optional[ToolKit] = None,
         name: Optional[str] = None,
         root: Optional[Union[str, Path]] = None,
     ):
         self.llm = llm
         self.name = name or "agent-task"
+        self.tools = ToolKit() if tools is None else tools
 
-        root_path = Path(root or ".").expanduser().resolve()
-        internal = root_path / "."
-        scratch = root_path / ".agent-scratchpad"
+        self.system = system
+
+        root_path = Path(root or f"./agent-{self.name}").expanduser().resolve()
+        self.root = root_path
+        scratch = root_path / "scratchpad.md"
         scratch.mkdir(parents=True, exist_ok=True)
+        self.scratch_path = scratch
+        self.log_path: Path = self.root / f"agent-log.ndjson"
 
-        self.log_path: Path = root_path / f"{self.name}.agent"
+        def write_own_scratchpad(text: str) -> None:
+            util.spit(self.scratch_path, text, mode="w")
 
-    @classmethod
-    def from_logs(cls, log_path: Path) -> Agent:
-        return TODO
+        self.tools.ensure_tool(write_own_scratchpad)
 
-    def consider(self, item: Union[str, Path]) -> Agent:
-        return TODO
+    # @classmethod
+    # def from_logs(cls, log_path: Path) -> Agent:
+    #     return TODO
 
-    def consider_with_write_access(self, path: Union[str, Path]) -> Agent:
-        return TODO
+    def log(self, ev):
+        line = json.dumps(ev, default=str)
+        util.spit(self.log_path, line + "\n", mode="a")
 
-    def remember_text(self, label: str, text: str) -> Agent:
-        return TODO
-
-    def equip(self, tools: Any) -> Agent:
-        return TODO
-
-    def plan(self, description: str, *, kind: str = "do") -> Agent:
-        return TODO
-
-    def do(self, description: str) -> Agent:
-        return TODO
-
-    # --------- Execution API ---------
-
-    def run(self, max_steps: Optional[int] = None) -> Iterator[Dict[str, Any]]:
-        """
-        Execute all planned steps from the current cursor onward,
-        optionally limited by `max_steps`.
-
-        Yields a stream of events:
-          - agent meta events (type starts with "agent-...")
-          - LLM stream events (start/delta/end/error) with extra 'agent_step' key.
-
-        This is intentionally a generator so it composes well with itertools.chain.
-        """
-        # Figure out which step indices to run
-        start = self._next_step_index
-        end = len(self.steps)
-        if max_steps is not None:
-            end = min(end, start + max_steps)
-
-        if start >= end:
-            return iter(())  # nothing to do
-
-        # Append to the task log; one line per event
-        with self.log_path.open("a", encoding="utf-8") as logf:
-            for step_index in range(start, end):
-                step = self.steps[step_index]
-
-                ev_start = {
-                    "type": "agent-step-start",
-                    "agent_step": step_index,
-                    "kind": step.kind,
-                    "description": step.description,
-                }
-                yield ev_start
-                self._record_event(ev_start, logf)
-
-                if step.kind == "do":
-                    for ev in self._run_do_step(step_index, step):
-                        yield ev
-                        self._record_event(ev, logf)
-                elif step.kind == "loop":
-                    for ev in self._run_loop_step(step_index, step):
-                        yield ev
-                        self._record_event(ev, logf)
-                else:
-                    # Unknown kind; just mark as skipped
-                    ev_unknown = {
-                        "type": "agent-step-unknown-kind",
-                        "agent_step": step_index,
-                        "kind": step.kind,
-                    }
-                    yield ev_unknown
-                    self._record_event(ev_unknown, logf)
-
-                ev_end = {
-                    "type": "agent-step-end",
-                    "agent_step": step_index,
-                    "kind": step.kind,
-                }
-                yield ev_end
-                self._record_event(ev_end, logf)
-
-                # advance cursor
-                self._next_step_index = step_index + 1
-
-    # --------- Internal helpers ---------
-
-    def _record_event(self, ev: Dict[str, Any], logf) -> None:
-        """
-        Append event to in-memory history and to the NDJSON log.
-        """
-        self.history_events.append(ev)
-        print(_json_line(ev), file=logf)
-
-    # --- Context building (late-bound) ---
-
-    def _build_system_prompt(self, step_index: int, step: AgentStep) -> str:
-        """
-        Build the system prompt for a given step from:
-          - a generic agent persona,
-          - current memory pointers,
-          - recent history of events.
-        """
-        lines: List[str] = []
-
-        lines.append(
-            "You are an autonomous agent that follows "
-            "instructions carefully and respects file write permissions enforced "
-            "by the host. You MUST NOT write outside the directories explicitly "
-            "granted write access, except for the agent's own scratchpad."
+    def stream(self, prompt):
+        return self.llm.stream(prompting.build_prompt(self.system), prompt).tap(
+            self.log,
+            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
         )
 
-        # Memory summary
-        if self.memory_items:
-            lines.append("")
-            lines.append("MEMORY POINTERS (read-only unless marked [rw]):")
-            for idx, item in enumerate(self.memory_items, start=1):
-                if isinstance(item, MemoryFile):
-                    mode = "[rw]" if item.writable else "[ro]"
-                    lines.append(f"- [{idx}] FILE {mode}: {item.path}")
-                elif isinstance(item, MemoryURL):
-                    lines.append(f"- [{idx}] URL: {item.url}")
-                elif isinstance(item, MemoryText):
-                    preview = item.text.replace("\n", " ")
-                    if len(preview) > 80:
-                        preview = preview[:77] + "..."
-                    lines.append(f"- [{idx}] TEXT '{item.label}': {preview}")
-        else:
-            lines.append("")
-            lines.append("MEMORY POINTERS: (none)")
-
-        # Recent history (very compressed)
-        if self.history_events:
-            lines.append("")
-            lines.append("RECENT HISTORY (most recent last):")
-            for ev in self.history_events[-8:]:
-                t = ev.get("type")
-                if t == "delta":
-                    txt = str(ev.get("text", "")).replace("\n", " ")
-                    if len(txt) > 60:
-                        txt = txt[:57] + "..."
-                    lines.append(f"- LLM delta: {txt}")
-                elif t == "agent-step-start":
-                    lines.append(
-                        f"- START step {ev.get('agent_step')}: {ev.get('description')}"
-                    )
-                elif t == "agent-step-end":
-                    lines.append(
-                        f"- END step {ev.get('agent_step')}: kind={ev.get('kind')}"
-                    )
-                elif t and t.startswith("agent-"):
-                    lines.append(f"- {t}: {ev}")
-
-        lines.append("")
-        lines.append(
-            "You will now perform the NEXT STEP in the plan based on the user "
-            "instruction. If you need to refer to prior actions, rely on the "
-            "RECENT HISTORY and MEMORY POINTERS summaries."
+    def stream_checked(self, check_fn, prompt, retries=5):
+        return self.llm.stream_checked(
+            check_fn,
+            prompting.build_prompt(self.system),
+            prompt,
+            retries=retries,
+        ).tap(
+            self.log,
+            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
         )
-
-        return "\n".join(lines)
-
-    # --- Step executors (v0: plain LLM streaming) ---
-
-    def _run_do_step(
-        self,
-        step_index: int,
-        step: AgentStep,
-    ) -> Iterator[Dict[str, Any]]:
-        """
-        v0: simple 'do' step.
-        - Builds a system prompt from memory + history.
-        - Streams a single LLM call with step.description as the user prompt.
-        - Yields the raw LLM events, tagged with agent_step.
-        """
-        system = self._build_system_prompt(step_index, step)
-        prompt = step.description
-
-        for ev in self.llm.stream(system, prompt):
-            ev2 = dict(ev)
-            ev2["agent_step"] = step_index
-            yield ev2
-
-    def _run_loop_step(
-        self,
-        step_index: int,
-        step: AgentStep,
-    ) -> Iterator[Dict[str, Any]]:
-        """
-        v0 loop semantics:
-          - currently behaves like a single 'do' step but is factored out
-            so we can later:
-              * orchestrate repeated LLM+tool cycles,
-              * inspect test results via equipped tools,
-              * stop when some condition is met.
-        """
-        # For now, this just forwards to _run_do_step once.
-        # Future: repeated iterations with tool calls and condition checks.
-        yield from self._run_do_step(step_index, step)

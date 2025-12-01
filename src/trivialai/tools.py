@@ -44,7 +44,74 @@ class ToolKit:
             self._tools[name] = fn
             self._tool_summaries[name] = to_summary(fn)
 
+    def __bool__(self) -> bool:
+        """
+        Truthy if this toolkit has any tools, falsy if it is empty.
+        """
+        return bool(self._tools)
+
+    def __len__(self) -> int:
+        return len(self._tools)
+
     # ---------- Public API ----------
+    def add_tool(self, fn: Callable[..., Any], *, name: Optional[str] = None) -> None:
+        """
+        Register a new tool function after initialization.
+
+        - If `name` is provided, use that as the tool name.
+        - Otherwise, use `fn.__name__`.
+
+        Raises:
+            ValueError if:
+              * the function has no usable name AND no explicit `name` is given
+              * a tool with the same name already exists
+        """
+        tool_name = name or getattr(fn, "__name__", None)
+        if not tool_name:
+            # This is the "anonymous function with no explicit name" case
+            raise ValueError(f"Tool {fn!r} has no __name__ and no explicit name")
+
+        if tool_name in self._tools:
+            raise ValueError(f"Duplicate tool name: {tool_name!r}")
+
+        self._tools[tool_name] = fn
+        self._tool_summaries[tool_name] = to_summary(fn, name=tool_name)
+
+    def ensure_tool(
+        self, fn: Callable[..., Any], *, name: Optional[str] = None
+    ) -> None:
+        """
+        Upsert a tool function.
+
+        - If a tool with this name already exists, overwrite it.
+        - If not, add it.
+
+        Name resolution is the same as in `add_tool`:
+        - If `name` is provided, use it.
+        - Otherwise, use `fn.__name__`.
+
+        Raises:
+            ValueError if the function has no usable name and no explicit `name`.
+        """
+        tool_name = name or getattr(fn, "__name__", None)
+        if not tool_name:
+            raise ValueError(f"Tool {fn!r} has no __name__ and no explicit name")
+
+        self._tools[tool_name] = fn
+        self._tool_summaries[tool_name] = to_summary(fn, name=tool_name)
+
+    def remove_tool(self, name: str) -> None:
+        """
+        Unregister an existing tool by name.
+
+        Raises KeyError if the tool is not present.
+        """
+        try:
+            del self._tools[name]
+            del self._tool_summaries[name]
+        except KeyError:
+            raise KeyError(f"No such tool: {name!r}") from None
+
     def to_summary(self) -> Dict[str, Any]:
         """
         Return a machine-usable summary of tools:
@@ -70,6 +137,8 @@ class ToolKit:
 
             spit(file_path: str, content: str, mode: Optional[str] = None) -> None
         """
+        if len(self._tools) == 0:
+            return ""
         summary = self.to_summary()
         shape = self.to_tool_shape()
         shape_json = json.dumps(shape, indent=2)
