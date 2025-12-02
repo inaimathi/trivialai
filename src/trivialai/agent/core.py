@@ -53,7 +53,7 @@ class Agent:
     def tool_shape(self):
         return self.tools.to_tool_shape()
 
-    def check_tool(self, pased):
+    def check_tool(self, parsed):
         return self.tools.check_tool(parsed)
 
     def call_tool(self, parsed):
