@@ -54,7 +54,7 @@ class Agent:
         return self.tools.to_tool_shape()
 
     def check_tool(self, pased):
-        return agent.tools.check_tool(parsed)
+        return self.tools.check_tool(parsed)
 
     def call_tool(self, parsed):
         return self.tools.call_tool(parsed)
