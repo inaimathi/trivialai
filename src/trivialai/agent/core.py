@@ -24,13 +24,6 @@ _DEFAULT_IGNORE = r"(^__pycache__|^node_modules|\.git/|/env-.*|\.egg-info/.*|^ve
 
 
 def run_pdb_test(path: str):
-
-    def log_event_to_file(ev: dict[str, Any]) -> None:
-        line = json.dumps(ev, default=str)
-        util.spit("agent_log.ndjson", line + "\n", mode="a")
-
-    qwq = Ollama("qwq:latest", "http://localhost:11435/")
-    tools = ToolKit(util.slurp, util.spit)
     files = list(util.deep_ls(path, ignore=_DEFAULT_IGNORE))
     src_files = [f for f in files if f.endswith(".py")]
 
@@ -49,18 +42,19 @@ def run_pdb_test(path: str):
         "general shell or commit permissions so at worst any mistakes can be easily rolled "
         "back once they're reviewed."
     )
-    # agent = Agent(
-    #     Ollama("qwq:latest", "http://localhost:11435/"),
-    #     system=system,
-    #     name="pdb_agent_001",
-    # )
+    agent = Agent(
+        Ollama("qwq:latest", "http://localhost:11435/"),
+        system=system,
+        tools=ToolKit(util.slurp, util.spit),
+        name="pdb_agent_001",
+    )
 
     def _check_resp(resp: str) -> dict[str, Any]:
         parsed = util.loadch(resp)
         if parsed.get("type") not in {"summary", "tool-call"}:
             raise util.TransformError("invalid-object-structure")
         if parsed["type"] == "tool-call":
-            return tools.check_tool(parsed)
+            return agent.tools.check_tool(parsed)
         return parsed
 
     def _per_file_stream(f: str):
@@ -69,7 +63,7 @@ def run_pdb_test(path: str):
             f"You are currently working on file {f}. Your response should be either\n"
             "1. a tool call (in which case the tool will be called, and once it completes, you "
             "   will be given its result to evaluate). In this case it is IMPORTANT that your "
-            f"   response be ONLY the tool call structure (a JSON object like {tools.to_tool_shape()}) "
+            f"   response be ONLY the tool call structure (a JSON object like {agent.tool_shape()}) "
             " and no other commentary.\n"
             "2. a summary of what you've done so far and an approval to move on to the next phase. "
             "   In this case, it is IMPORTANT that your response be ONLY a summary structure "
@@ -78,22 +72,19 @@ def run_pdb_test(path: str):
             "   check further on in the process.\n"
         )
 
-        base = qwq.stream_checked(
-            _check_resp,
-            prompting.build_prompt(system, prompt, tools=tools),
-            prompt,
-        )
+        base = agent.stream_checked(_check_resp, prompt)
 
         def _proceed(final_ev: dict[str, Any]):
             parsed = final_ev.get("parsed", {})
 
             if parsed.get("type") == "tool-call":
-                res = tools.call_tool(parsed)
-
-                yield {
-                    "type": "trivialai.agent.log",
-                    "message": f"Running a tool call {parsed} -> {type(res)}",
-                }
+                res = agent.call_tool(parsed)
+                agent.log(
+                    {
+                        "type": "trivialai.agent.log",
+                        "message": f"Running a tool call {parsed} -> {type(res)}",
+                    }
+                )
 
                 pr = (
                     f"You previously asked me to run the tool call {parsed}. "
@@ -101,11 +92,7 @@ def run_pdb_test(path: str):
                     f"{prompt}\n"
                 )
 
-                yield from qwq.stream_checked(
-                    _check_resp,
-                    prompting.build_prompt(system, pr, tools=tools),
-                    pr,
-                )
+                yield from agent.stream_checked(_check_resp, pr)
 
             # For parsed["type"] == "summary" we don't do anything here.
             # repeat_until will notice the summary and stop scheduling more passes.
@@ -118,9 +105,6 @@ def run_pdb_test(path: str):
             stop=lambda final_ev, i: final_ev.get("parsed", {}).get("type")
             == "summary",
             max_iters=10,  # or whatever upper bound you like
-        ).tap(
-            log_event_to_file,
-            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
         )
 
     # Top-level: flatten per-file streams
@@ -178,21 +162,20 @@ class Agent:
         llm: LLMMixin,
         *,
         system: str,
-        tools: Optional[ToolKit] = None,
+        tools: Optional(List[Callable[..., Any]]) = None,
         name: Optional[str] = None,
         root: Optional[Union[str, Path]] = None,
     ):
         self.llm = llm
         self.name = name or "agent-task"
-        self.tools = ToolKit() if tools is None else tools
+        self.tools = ToolKit(*([] if tools is None else tools))
 
         self.system = system
 
         root_path = Path(root or f"./agent-{self.name}").expanduser().resolve()
         self.root = root_path
-        scratch = root_path / "scratchpad.md"
-        scratch.mkdir(parents=True, exist_ok=True)
-        self.scratch_path = scratch
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.scratch_path = self.root / "scratchpad.md"
         self.log_path: Path = self.root / f"agent-log.ndjson"
 
         def write_own_scratchpad(text: str) -> None:
@@ -208,17 +191,33 @@ class Agent:
         line = json.dumps(ev, default=str)
         util.spit(self.log_path, line + "\n", mode="a")
 
-    def stream(self, prompt):
-        return self.llm.stream(prompting.build_prompt(self.system), prompt).tap(
+    def build_prompt(self, user_prompt):
+        return prompting.build_prompt(self.system, user_prompt, self.tools)
+
+    def tool_shape(self):
+        return self.tools.to_tool_shape()
+
+    def call_tool(self, parsed):
+        return self.tools.call_tool(parsed)
+
+    def stream(self, prompt, images: Optional[list] = None) -> BiStream[Dict[str, Any]]:
+        return self.llm.stream(self.build_prompt(prompt), prompt, images=images).tap(
             self.log,
             ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
         )
 
-    def stream_checked(self, check_fn, prompt, retries=5):
+    def stream_checked(
+        self,
+        check_fn: Callable[[str], Any],
+        prompt: str,
+        images: Optional[list] = None,
+        retries: int = 5,
+    ) -> BiStream[Dict[str, Any]]:
         return self.llm.stream_checked(
             check_fn,
-            prompting.build_prompt(self.system),
+            self.build_prompt(prompt),
             prompt,
+            images=images,
             retries=retries,
         ).tap(
             self.log,
