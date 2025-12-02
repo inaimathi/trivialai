@@ -148,8 +148,6 @@ The `Bedrock` client fully participates in the same higher-level helpers:
 
 * `generate_checked(...)`
 * `generate_json(...)`
-* `generate_tool_call(...)`
-* `generate_many_tool_calls(...)`
 * `stream_checked(...)` / `stream_json(...)`
 
 No special-casing required in downstream code.
@@ -160,7 +158,7 @@ No special-casing required in downstream code.
 
 All providers expose a common streaming shape via `stream(...)`.
 
-**Important:** `stream(...)` (and the higher-level `stream_checked(...)`, `stream_json(...)`, `stream_tool_calls(...)`) now return a **`BiStream`**, which:
+**Important:** `stream(...)` (and the higher-level `stream_checked(...)`, `stream_json(...)`) now return a **`BiStream`**, which:
 
 * acts as a **normal iterator** in sync code (`for ev in client.stream(...): ...`), and
 * acts as an **async iterator** in async code (`async for ev in client.stream(...): ...`).
@@ -321,133 +319,11 @@ A few practical notes:
 
 TrivialAI uses `BiStream` for:
 
-* LLM methods: `stream(...)`, `stream_checked(...)`, `stream_json(...)`, `stream_tool_calls(...)`
+* LLM methods: `stream(...)`, `stream_checked(...)`, `stream_json(...)`
 * Utility helpers: `util.stream_checked(...)`, `util.astream_checked(...)` (the latter normalizes to `BiStream` internally)
 * Higher-level orchestration code (e.g., RAG + chat pipelines) that wants a single streaming interface for Tornado handlers and REPLs.
 
 ---
-
-## Tool Calls
-
-Use `Tools` to register Python functions, describe them to the model, and safely execute the model’s chosen call.
-
-### 1) Define tools
-
-You can register functions directly or with a decorator. Docstring = description. Type hints become the argument schema.
-
-```python
-from typing import Optional, List
-from trivialai.tools import Tools
-
-tools = Tools()  # or Tools(extras={"api_key": "..."}), see below
-
-@tools.define()
-def screenshot(url: str, selectors: Optional[List[str]] = None) -> None:
-    """Take a screenshot of a page; optionally highlight CSS selectors."""
-    print("shot", url, selectors)
-
-# Or:
-def search(query: str, top_k: int = 5) -> List[str]:
-    """Search and return top results."""
-    return [f"res{i}" for i in range(top_k)]
-tools.define(search)
-```
-
-### 2) Show tools to the model
-
-`tools.list()` returns LLM-friendly metadata:
-
-```python
->>> tools.list()
-[{
-  "name": "screenshot",
-  "description": "Take a screenshot of a page; optionally highlight CSS selectors.",
-  "type": {"url": <class 'str'>, "selectors": typing.Optional[typing.List[str]]},
-  "args": {
-    "url": {"type": "string"},
-    "selectors": {"type": "array", "items": {"type": "string"}, "nullable": True}
-  }
-},
-{
-  "name": "search",
-  "description": "Search and return top results.",
-  "type": {"query": <class 'str'>, "top_k": <class 'int'>},
-  "args": {
-    "query": {"type": "string"},
-    "top_k": {"type": "int"}
-  }
-}]
-```
-
-### 3) Ask the model to choose a tool
-
-All LLM clients (Ollama, Claude API, ChatGPT, GCP, Bedrock) support a helper that prompts for a tool call and validates it:
-
-```python
-from trivialai import ollama
-client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
-
-res = client.generate_tool_call(
-    tools,
-    system="You are a tool-use router.",
-    prompt="Take a screenshot of https://example.com and highlight the search box."
-)
-
-# Validated, parsed dict:
->>> res.content
-{'functionName': 'screenshot', 'args': {'url': 'https://example.com', 'selectors': ['#search']}}
-```
-
-Multiple calls? Use `generate_many_tool_calls(...)`:
-
-```python
-multi = client.generate_many_tool_calls(
-    tools,
-    prompt="Search for 'platypus', then screenshot the first result."
-)
-# -> [{'functionName': 'search', ...}, {'functionName': 'screenshot', ...}]
-```
-
-### 4) Validate/execute (with robust errors)
-
-* **Validation rules:** all required params present; optional params may be omitted; unknown params are rejected.
-* On invalid input, methods **raise** `TransformError` (no `None` returns).
-
-```python
-from trivialai.util import TransformError
-
-tool_call = res.content  # {'functionName': 'screenshot', 'args': {...}}
-
-# Validate explicitly (optional; call() validates too)
-assert tools.validate(tool_call)
-
-# Execute
-try:
-    tools.call(tool_call)
-except TransformError as e:
-    print("Tool call failed:", e.message, e.raw)
-```
-
-If you already have a raw JSON string from a model and want to validate+parse:
-
-```python
-parsed = tools.transform('{"functionName":"search","args":{"query":"platypus"}}')
-# or for a list of calls:
-calls = tools.transform_multi('[{"functionName":"search","args":{"query":"platypus"}}]')
-```
-
-### 5) Extras / environment defaults
-
-Attach fixed kwargs (e.g., tokens, org IDs) that merge into every call:
-
-```python
-tools = Tools(extras={"api_key": "SECRET"})  # extras override user args by default
-tools.call(tool_call)
-
-# Per-call control:
-tools.call_with_extras({"api_key": "OTHER"}, tool_call, override=True)   # extras win
-tools.call_with_extras({"api_key": "OTHER"}, tool_call, override=False)  # user args win
-```
 
 ### Notes
 

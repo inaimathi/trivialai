@@ -302,49 +302,6 @@ class LLMMixin:
             loadch, system, prompt, images=images, retries=retries
         )
 
-    def generate_tool_call(
-        self,
-        tools: Any,
-        system: str,
-        prompt: str,
-        images: Optional[list] = None,
-        retries: int = 5,
-    ) -> LLMResult:
-        """
-        Single tool-call generation: return a single validated tool invocation.
-        """
-        sysprompt = (
-            "You are a computer specialist. Your job is translating client requests "
-            "into tool calls. Your client has sent a request to use a tool; return the "
-            "function call corresponding to the request and no other commentary. "
-            'Return a value of type `{"functionName" :: string, "args" :: {arg_name: arg value}}`. '
-            f"You have access to the tools: {tools.list()}. {system}"
-        )
-        return self.generate_checked(
-            tools.transform, sysprompt, prompt, images=images, retries=retries
-        )
-
-    def generate_many_tool_calls(
-        self,
-        tools: Any,
-        prompt: str,
-        images: Optional[list] = None,
-        retries: int = 5,
-    ) -> LLMResult:
-        """
-        Multiple tool-call generation: return a list of validated tool invocations.
-        """
-        sysprompt = (
-            "You are a computer specialist. Your job is translating client requests into tool calls. "
-            "Your client has sent a request to use some number of tools; return a list of function calls "
-            "corresponding to the request and no other commentary. "
-            'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
-            f"You have access to the tools: {tools.list()}."
-        )
-        return self.generate_checked(
-            tools.transform_multi, sysprompt, prompt, images=images, retries=retries
-        )
-
     # Subclasses must provide this. Keeps sync compatibility.
     def generate(
         self, system: str, prompt: str, images: Optional[list] = None
@@ -527,29 +484,4 @@ class LLMMixin:
         """
         return self.stream_checked(
             loadch, system, prompt, images=images, retries=retries
-        )
-
-    # ---- Streaming tool-calls (BiStream-based) ----
-
-    def stream_tool_calls(
-        self,
-        tools: Any,
-        prompt: str,
-        images: Optional[list] = None,
-        retries: int = 5,
-    ) -> BiStream[Dict[str, Any]]:
-        """
-        Stream a list of tool calls with retries, as a BiStream of events.
-        """
-        sysprompt = (
-            "You are a computer specialist. Your job is translating client requests into tool calls. "
-            "Your client has sent a request to use some number of tools; return a list of function calls "
-            "corresponding to the request and no other commentary. "
-            'Return a value of type `[{"functionName" :: string, "args" :: {arg_name: arg value}}]`. '
-            f"You have access to the tools: {tools.list()}."
-        )
-        return _stream_with_retries(
-            lambda: self.stream(sysprompt, prompt, images),
-            tools.transform_multi,
-            retries=retries,
         )

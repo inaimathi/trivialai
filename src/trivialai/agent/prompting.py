@@ -2,7 +2,7 @@ import textwrap
 from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
                     Tuple, Union)
 
-from ..tools import ToolKit
+from .toolkit import ToolKit
 
 DEFAULT_CONTEXT_SIZE_CHARS = 3000
 

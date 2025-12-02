@@ -1,6 +1,6 @@
 [project]
 name = "trivialai"
-version = "0.5.5"
+version = "0.5.6"
 authors = [
   { name="inaimathi", email="leo.zovic@gmail.com" },
 ]
@@ -17,7 +17,8 @@ classifiers = [
 dependencies = [
   "httpx~=0.27",
   "tenacity>=9.1,<10",
-  "json5"
+  "json5",
+  "chromadb==1.0.15",
 ]
 
 [project.optional-dependencies]
