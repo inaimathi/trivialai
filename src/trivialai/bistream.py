@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import sys
 import threading
 import time
 from collections.abc import AsyncIterable as ABCAsyncIterable
@@ -11,7 +12,7 @@ from collections.abc import AsyncIterator as ABCAsyncIterator
 from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
 from functools import reduce
-from typing import Any, Callable, Generic, Iterable, Optional, TypeVar
+from typing import Any, Callable, Generic, Iterable, Optional, TextIO, TypeVar
 
 from .log import getLogger
 
@@ -438,3 +439,92 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         Convenience: self.tap(cb, focus=..., ignore=...) == tap(self, cb, ...)
         """
         return tap(self, cb, focus=focus, ignore=ignore)
+
+
+def force(
+    src: BiStream[dict] | ABCIterable[dict] | ABCAsyncIterable[dict],
+    *,
+    keep: set[str] | None = None,
+    out: TextIO | None = None,
+) -> list[dict]:
+    """
+    REPL helper: consume a (bi)stream of event dicts, pretty-print deltas,
+    and return a list of selected events.
+
+    - `src` may be:
+        * a BiStream[dict]
+        * a synchronous iterable of dicts
+        * an async iterable of dicts
+      In all cases we adapt it through BiStream.ensure() and iterate
+      synchronously, so async producers are driven via the background loop.
+
+    - `keep` is a set of event types (event["type"]) to collect and return.
+      Defaults to {"end", "final"}.
+
+    - `out` is the file-like to print to (defaults to sys.stdout).
+
+    Behaviour:
+      * "delta" events with `scratchpad` / `text` fields are streamed in
+        two modes, labelled "Thinking:" and "Saying:".
+      * Events whose type is in `keep` are collected into the return list.
+      * By default, "end"/"final" events are collected but not printed.
+      * Other events are printed on their own lines.
+    """
+    stream = BiStream.ensure(src)
+    if out is None:
+        out = sys.stdout
+    if keep is None:
+        keep = {"end", "final"}
+
+    end_events: list[dict] = []
+    current_mode: Optional[str] = None  # "thinking", "saying", or None
+
+    for event in stream:
+        # We only know how to pretty-print dict-shaped events.
+        if isinstance(event, dict):
+            etype = event.get("type")
+
+            if etype == "delta":
+                scratchpad = event.get("scratchpad") or ""
+                text = event.get("text") or ""
+
+                # Handle scratchpad
+                if scratchpad:
+                    if current_mode != "thinking":
+                        if current_mode is not None:
+                            print(file=out)  # newline between modes
+                        print("Thinking: ", end="", file=out)
+                        current_mode = "thinking"
+                    print(scratchpad, end="", file=out)
+
+                # Handle user-visible text
+                if text:
+                    if current_mode != "saying":
+                        if current_mode is not None:
+                            print(file=out)
+                        print("Saying: ", end="", file=out)
+                        current_mode = "saying"
+                    print(text, end="", file=out)
+
+                # We've handled this event fully
+                continue
+
+            # Non-delta dict events: maybe collect them.
+            if etype in keep:
+                end_events.append(event)
+
+            # By default we *don't* print end/final; they just control semantics.
+            if etype in {"end", "final"}:
+                continue
+
+        # Fallback: any non-delta (including non-dict) is printed as-is.
+        if current_mode is not None:
+            print(file=out)
+            current_mode = None
+        print(event, file=out)
+
+    # Add final newline if we were mid-stream in a content mode.
+    if current_mode is not None:
+        print(file=out)
+
+    return end_events
