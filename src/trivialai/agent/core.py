@@ -65,6 +65,16 @@ class Agent:
             ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
         )
 
+    def stream_json(
+        self, prompt, images: Optional[list] = None
+    ) -> BiStream[Dict[str, Any]]:
+        return self.llm.stream_json(
+            self.build_prompt(prompt), prompt, images=images
+        ).tap(
+            self.log,
+            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
+        )
+
     def stream_checked(
         self,
         check_fn: Callable[[str], Any],

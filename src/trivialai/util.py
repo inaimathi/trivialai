@@ -16,6 +16,20 @@ from .log import getLogger
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
+ShapeSpec = Union[
+    Type[int],
+    Type[float],
+    Type[str],
+    Type[bool],
+    List["ShapeSpec"],
+    Dict[str, "ShapeSpec"],
+    Dict[Type, "ShapeSpec"],
+]
+
+JsonValue = Union[
+    None, bool, int, float, str, List["JsonValue"], Dict[str, "JsonValue"]
+]
+
 
 class TransformError(Exception):
     def __init__(self, message: str = "Transformation Error", raw: Any = None):
@@ -100,13 +114,20 @@ def relative_path(base: str, path: str, must_exist: bool = True) -> str:
     return stripped
 
 
-def loadch(resp: Any) -> Any:
+def loadch(resp: Any) -> JsonValue:
     """
-    "Load Chat" helper: parse a JSON-ish response into Python.
+    Parse a JSON-ish response into Python.
 
     - If resp is a string, it may contain a Markdown code block; we strip it and json5-load it.
     - If resp is already a list/dict/tuple, pass it through.
     - Otherwise raise TransformError("parse-failed").
+
+    Note that this uses the JSON5 parser, which is more permissive than the Python
+    built-in json library. Meaning this function will happily parse values like
+
+      {foo: 1, 'bar': 2, "baz": 3}
+
+    which would normally not be valid JSON.
     """
     if resp is None:
         raise TransformError("no-message-given")
@@ -118,6 +139,128 @@ def loadch(resp: Any) -> Any:
     except (TypeError, ValueError):
         pass
     raise TransformError("parse-failed")
+
+
+def json_shape(shape: ShapeSpec) -> Callable[[str], JsonValue]:
+    """
+    Create a JSON validator from a shape specification.
+
+    Shape specification language:
+    - Basic types: int, float, str, bool
+    - Lists: [element_type]
+    - Dicts with specific keys: {"key1": type1, "key2": type2}
+    - Dicts with general types: {key_type: value_type}
+
+    Returns a callable that takes a JSON string and validates it against the shape.
+    The callable uses `loadch` under the hood.
+    """
+
+    def validator(json_str):
+        parsed = util.loadch(json_str)
+        _validate_shape(parsed, shape, "root")
+        return parsed
+
+    return validator
+
+
+def _validate_shape(data, shape, path):
+    """Recursively validate data against a shape specification."""
+
+    # Handle basic types
+    if shape == int:
+        if not isinstance(data, int) or isinstance(data, bool):
+            raise TransformError(f"At {path}: Expected int, got {type(data).__name__}")
+        return
+    elif shape == float:
+        if not isinstance(data, (int, float)) or isinstance(data, bool):
+            raise TransformError(
+                f"At {path}: Expected float, got {type(data).__name__}"
+            )
+        return
+    elif shape == str:
+        if not isinstance(data, str):
+            raise TransformError(f"At {path}: Expected str, got {type(data).__name__}")
+        return
+    elif shape == bool:
+        if not isinstance(data, bool):
+            raise TransformError(f"At {path}: Expected bool, got {type(data).__name__}")
+        return
+
+    # Handle lists
+    if isinstance(shape, list):
+        if not isinstance(data, list):
+            raise TransformError(f"At {path}: Expected list, got {type(data).__name__}")
+        if len(shape) != 1:
+            raise TransformError(
+                f"Shape specification error: List must have exactly one element type, got {len(shape)}"
+            )
+
+        element_shape = shape[0]
+        for i, item in enumerate(data):
+            _validate_shape(item, element_shape, f"{path}[{i}]")
+        return
+
+    # Handle dicts
+    if isinstance(shape, dict):
+        if not isinstance(data, dict):
+            raise TransformError(f"At {path}: Expected dict, got {type(data).__name__}")
+
+        # Distinguish between specific-key dicts and general-type dicts
+        # If any key is a basic type, treat as general-type dict
+        basic_types = {int, float, str, bool}
+        type_keys = [k for k in shape.keys() if k in basic_types]
+
+        if type_keys:
+            # General type dict like {str: str}
+            if len(shape) != 1:
+                raise TransformError(
+                    f"Shape specification error: Type-based dict must have exactly one key-value pair, got {len(shape)}"
+                )
+
+            key_type, value_type = next(iter(shape.items()))
+            for key, value in data.items():
+                # Validate key type
+                if key_type == int and not (
+                    isinstance(key, int) and not isinstance(key, bool)
+                ):
+                    raise TransformError(
+                        f"At {path}: Key {key!r} should be int, got {type(key).__name__}"
+                    )
+                elif key_type == float and not (
+                    isinstance(key, (int, float)) and not isinstance(key, bool)
+                ):
+                    raise TransformError(
+                        f"At {path}: Key {key!r} should be float, got {type(key).__name__}"
+                    )
+                elif key_type == str and not isinstance(key, str):
+                    raise TransformError(
+                        f"At {path}: Key {key!r} should be str, got {type(key).__name__}"
+                    )
+                elif key_type == bool and not isinstance(key, bool):
+                    raise TransformError(
+                        f"At {path}: Key {key!r} should be bool, got {type(key).__name__}"
+                    )
+
+                # Validate value
+                _validate_shape(value, value_type, f"{path}[{key!r}]")
+        else:
+            # Specific keys dict like {"item_name": str, "price": {...}}
+            required_keys = set(shape.keys())
+            data_keys = set(data.keys())
+
+            missing_keys = required_keys - data_keys
+            if missing_keys:
+                raise TransformError(
+                    f"At {path}: Missing required keys: {missing_keys}"
+                )
+
+            # Validate each required key
+            for key, value_shape in shape.items():
+                if key in data:
+                    _validate_shape(data[key], value_shape, f"{path}.{key}")
+        return
+
+    raise TransformError(f"Invalid shape specification: {shape}")
 
 
 def slurp(file_path: str) -> str:

@@ -12,7 +12,8 @@ from collections.abc import AsyncIterator as ABCAsyncIterator
 from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
 from functools import reduce
-from typing import Any, Callable, Generic, Iterable, Optional, TextIO, TypeVar
+from typing import (Any, Callable, Generic, Iterable, Optional, TextIO,
+                    TypeVar, Union)
 
 from .log import getLogger
 
@@ -444,7 +445,7 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
 def force(
     src: BiStream[dict] | ABCIterable[dict] | ABCAsyncIterable[dict],
     *,
-    keep: set[str] | None = None,
+    keep: Optional[Union[set[str]]] = None,
     out: TextIO | None = None,
 ) -> list[dict]:
     """
@@ -473,6 +474,8 @@ def force(
     stream = BiStream.ensure(src)
     if out is None:
         out = sys.stdout
+    if type(keep) is str:
+        keep = {keep}
     if keep is None:
         keep = {"end", "final"}
 
