@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import Any, Dict, List, Literal, Optional
 
-from src.trivialai.tools import ToolKit, TransformError, to_summary
+from src.trivialai.agent.toolkit import ToolKit, TransformError, to_summary
 
 # ---------- helper functions used as tools ----------
 
