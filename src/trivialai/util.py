@@ -6,7 +6,8 @@ import inspect as _inspect
 import os
 import re
 from collections import namedtuple
-from typing import Any, AsyncIterator, Callable, Dict, Optional
+from typing import (Any, AsyncIterator, Callable, Dict, List, Optional, Type,
+                    Union)
 
 import httpx
 import json5
