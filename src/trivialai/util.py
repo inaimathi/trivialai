@@ -157,7 +157,7 @@ def json_shape(shape: ShapeSpec) -> Callable[[str], JsonValue]:
     """
 
     def validator(json_str):
-        parsed = util.loadch(json_str)
+        parsed = loadch(json_str)
         _validate_shape(parsed, shape, "root")
         return parsed
 
