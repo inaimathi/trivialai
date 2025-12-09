@@ -142,6 +142,130 @@ def loadch(resp: Any) -> JsonValue:
     raise TransformError("parse-failed")
 
 
+def loadchmulti(resp: Any) -> list[JsonValue]:
+    """
+    Like loadch, but return a list of JSON-ish values instead of a single one.
+
+    - If resp is a list/tuple: return list(resp).
+    - If resp is a dict: return [resp].
+    - If resp is a string:
+        * Try to parse all fenced code blocks as JSON5.
+        * If none, scan for top-level {...} blocks in the text and parse each.
+        * As a last resort, try to parse the whole string as a single JSON5 value.
+    - Otherwise raise TransformError("parse-failed").
+
+    This is intentionally more permissive than loadch:
+    it can recover JSON objects embedded in natural-language chatter or
+    multiple adjacent JSON objects, but it still only accepts substrings
+    that json5 can actually parse.
+    """
+    if resp is None:
+        raise TransformError("no-message-given")
+
+    if isinstance(resp, list | tuple):
+        return list(resp)
+    if isinstance(resp, dict):
+        return [resp]
+
+    if not isinstance(resp, str):
+        raise TransformError("parse-failed")
+
+    text = resp.strip()
+    results: list[JsonValue] = []
+
+    # ---- 1) Try all fenced markdown code blocks first ---------------------
+    # Matches ```lang\n<content>\n``` or ```\n<content>\n```
+    code_blocks = re.findall(r"```[^\n]*\n(.*?)\n```", text, re.DOTALL)
+    for block in code_blocks:
+        candidate = block.strip()
+        if not candidate:
+            continue
+        try:
+            value = json5.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        # If the top-level value is a list, we treat it as multiple values
+        # (common pattern for multi-tool results).
+        if isinstance(value, list):
+            results.extend(value)
+        else:
+            results.append(value)
+
+    if results:
+        return results
+
+    # ---- 2) Scan for top-level {...} blocks in the raw text --------------
+    # This recovers things like:
+    #   "Saying: {...}\n\n{\"type\": \"tool-call\", ...}"
+    results.extend(_extract_jsonish_objects(text))
+
+    if results:
+        return results
+
+    # ---- 3) Final fallback: treat the whole thing as one JSON5 value -----
+    try:
+        value = json5.loads(strip_md_code(text))
+    except (TypeError, ValueError):
+        raise TransformError("parse-failed")
+
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def _extract_jsonish_objects(text: str) -> list[JsonValue]:
+    """
+    Best-effort extraction of JSON-ish objects from a string by scanning
+    for balanced {...} blocks outside of markdown fences.
+
+    We only accept substrings that json5 can actually parse.
+    """
+    objs: list[JsonValue] = []
+
+    in_fence = False
+    fence_pattern = re.compile(r"^```")
+    lines = text.splitlines()
+    rebuilt: list[str] = []
+
+    # Strip out fenced code blocks (handled earlier) so brace scanning
+    # isn't confused by arbitrary code inside them.
+    for line in lines:
+        if fence_pattern.match(line.strip()):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            rebuilt.append(line)
+
+    s = "\n".join(rebuilt)
+
+    start = None
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = s[start : i + 1].strip()
+                    if candidate:
+                        try:
+                            value = json5.loads(candidate)
+                        except (TypeError, ValueError):
+                            # Not actually JSON-ish; ignore.
+                            pass
+                        else:
+                            if isinstance(value, list):
+                                objs.extend(value)
+                            else:
+                                objs.append(value)
+                    start = None
+
+    return objs
+
+
 def json_shape(shape: ShapeSpec) -> Callable[[str], JsonValue]:
     """
     Create a JSON validator from a shape specification.
@@ -262,6 +386,41 @@ def _validate_shape(data, shape, path):
         return
 
     raise TransformError(f"Invalid shape specification: {shape}")
+
+
+def read_ndjson(
+    filepath: str, encoding: str = "utf-8"
+) -> Generator[Dict[str, Any], None, None]:
+    """
+    Read an ndjson (newline-delimited JSON) file line by line using json5 parser.
+
+    Args:
+        filepath: Path to the ndjson file
+        encoding: File encoding (default: utf-8)
+
+    Yields:
+        Dict: Each parsed JSON object from the file
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+    """
+    with open(filepath, "r", encoding=encoding) as file:
+        for line_num, line in enumerate(file, 1):
+            line = line.strip()
+            if line:  # Skip empty lines
+                try:
+                    yield json5.loads(line)
+                except (TypeError, ValueError) as e:
+                    error_msg = getattr(e, "msg", str(e))
+                    raise ValueError(
+                        f"Invalid JSON5 on line {line_num}: {error_msg}",
+                        getattr(e, "doc", line),
+                        getattr(e, "pos", 0),
+                    )
+
+
+def slurp_ndjson(filepath: str, encoding: str = "utf-8") -> List[Dict[str, Any]]:
+    return list(read_ndjson(filepath, encoding=encoding))
 
 
 def slurp(file_path: str) -> str:
