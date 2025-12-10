@@ -132,13 +132,46 @@ def loadch(resp: Any) -> JsonValue:
     """
     if resp is None:
         raise TransformError("no-message-given")
+
+    if isinstance(resp, (list, dict, tuple)):
+        return resp
+
+    if not isinstance(resp, str):
+        raise TransformError("parse-failed")
+
+    return _json5_lenient_load(strip_md_code(resp.strip()))
+
+
+def _json5_lenient_load(candidate: str) -> JsonValue:
+    """
+    Parse a JSON5 candidate string with a bit of leniency:
+
+      1. Try json5.loads(candidate) as-is.
+      2. If that fails and there are literal newline characters, try again
+         after replacing '\n' chars with '\\n' so multiline string values
+         become valid JSON string literals.
+
+    On success, return the parsed value.
+    On failure, raise TransformError("parse-failed").
+    """
+    candidate = candidate.strip()
+    if not candidate:
+        raise TransformError("parse-failed")
+
+    # First attempt: as-is
     try:
-        if type(resp) is str:
-            return json5.loads(strip_md_code(resp.strip()))
-        elif type(resp) in {list, dict, tuple}:
-            return resp
+        return json5.loads(candidate)
     except (TypeError, ValueError):
         pass
+
+    # Second attempt: escape bare newlines if any
+    if "\n" in candidate:
+        try:
+            escaped = candidate.replace("\n", "\\n")
+            return json5.loads(escaped)
+        except (TypeError, ValueError):
+            pass
+
     raise TransformError("parse-failed")
 
 
@@ -149,20 +182,19 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
     - If resp is a list/tuple: return list(resp).
     - If resp is a dict: return [resp].
     - If resp is a string:
-        * Try to parse all fenced code blocks as JSON5.
+        * Try to parse all fenced code blocks as JSON5 (leniently).
         * If none, scan for top-level {...} blocks in the text and parse each.
-        * As a last resort, try to parse the whole string as a single JSON5 value.
     - Otherwise raise TransformError("parse-failed").
 
-    This is intentionally more permissive than loadch:
-    it can recover JSON objects embedded in natural-language chatter or
-    multiple adjacent JSON objects, but it still only accepts substrings
-    that json5 can actually parse.
+    This is more permissive than loadch in that it can recover multiple
+    JSON objects from a single string, but it only accepts substrings that
+    our lenient JSON5 loader can actually parse.
     """
     if resp is None:
         raise TransformError("no-message-given")
 
-    if isinstance(resp, list | tuple):
+    # Already-structured values
+    if isinstance(resp, (list, tuple)):
         return list(resp)
     if isinstance(resp, dict):
         return [resp]
@@ -180,12 +212,12 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
         candidate = block.strip()
         if not candidate:
             continue
+
         try:
-            value = json5.loads(candidate)
-        except (TypeError, ValueError):
+            value = _json5_lenient_load(candidate)
+        except TransformError:
             continue
-        # If the top-level value is a list, we treat it as multiple values
-        # (common pattern for multi-tool results).
+
         if isinstance(value, list):
             results.extend(value)
         else:
@@ -195,22 +227,13 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
         return results
 
     # ---- 2) Scan for top-level {...} blocks in the raw text --------------
-    # This recovers things like:
-    #   "Saying: {...}\n\n{\"type\": \"tool-call\", ...}"
     results.extend(_extract_jsonish_objects(text))
 
     if results:
         return results
 
-    # ---- 3) Final fallback: treat the whole thing as one JSON5 value -----
-    try:
-        value = json5.loads(strip_md_code(text))
-    except (TypeError, ValueError):
-        raise TransformError("parse-failed")
-
-    if isinstance(value, list):
-        return list(value)
-    return [value]
+    # No parseable JSON-ish substrings found
+    raise TransformError("parse-failed")
 
 
 def _extract_jsonish_objects(text: str) -> list[JsonValue]:
@@ -218,7 +241,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     Best-effort extraction of JSON-ish objects from a string by scanning
     for balanced {...} blocks outside of markdown fences.
 
-    We only accept substrings that json5 can actually parse.
+    We only accept substrings that _json5_lenient_load can parse.
     """
     objs: list[JsonValue] = []
 
@@ -250,17 +273,21 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
                 depth -= 1
                 if depth == 0 and start is not None:
                     candidate = s[start : i + 1].strip()
-                    if candidate:
-                        try:
-                            value = json5.loads(candidate)
-                        except (TypeError, ValueError):
-                            # Not actually JSON-ish; ignore.
-                            pass
+                    if not candidate:
+                        start = None
+                        continue
+
+                    try:
+                        value = _json5_lenient_load(candidate)
+                    except TransformError:
+                        # Not actually JSON-ish (or too malformed); ignore.
+                        pass
+                    else:
+                        if isinstance(value, list):
+                            objs.extend(value)
                         else:
-                            if isinstance(value, list):
-                                objs.extend(value)
-                            else:
-                                objs.append(value)
+                            objs.append(value)
+
                     start = None
 
     return objs
