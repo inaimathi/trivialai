@@ -12,6 +12,7 @@ from typing import (Any, AsyncIterator, Callable, Dict, List, Optional, Type,
 import httpx
 import json5
 
+from . import jsonesque
 from .bistream import BiStream
 from .log import getLogger
 
@@ -123,11 +124,12 @@ def loadch(resp: Any) -> JsonValue:
     - If resp is already a list/dict/tuple, pass it through.
     - Otherwise raise TransformError("parse-failed").
 
-    Note that this uses the JSON5 parser, which is more permissive than the Python
+    Note that this uses the jsonesque parser, which is much more permissive than the Python
     built-in json library. Meaning this function will happily parse values like
 
       {foo: 1, 'bar': 2, "baz": 3}
 
+    and much crazier things including a JSON/Python pidgin allowing triple-quoted strings,
     which would normally not be valid JSON.
     """
     if resp is None:
@@ -139,40 +141,18 @@ def loadch(resp: Any) -> JsonValue:
     if not isinstance(resp, str):
         raise TransformError("parse-failed")
 
-    return _json5_lenient_load(strip_md_code(resp.strip()))
+    return _lenient_load(strip_md_code(resp.strip()))
 
 
-def _json5_lenient_load(candidate: str) -> JsonValue:
-    """
-    Parse a JSON5 candidate string with a bit of leniency:
-
-      1. Try json5.loads(candidate) as-is.
-      2. If that fails and there are literal newline characters, try again
-         after replacing '\n' chars with '\\n' so multiline string values
-         become valid JSON string literals.
-
-    On success, return the parsed value.
-    On failure, raise TransformError("parse-failed").
-    """
+def _lenient_load(candidate: str) -> JsonValue:
     candidate = candidate.strip()
     if not candidate:
         raise TransformError("parse-failed")
 
-    # First attempt: as-is
     try:
-        return json5.loads(candidate)
+        return jsonesque.loads(candidate)
     except (TypeError, ValueError):
-        pass
-
-    # Second attempt: escape bare newlines if any
-    if "\n" in candidate:
-        try:
-            escaped = candidate.replace("\n", "\\n")
-            return json5.loads(escaped)
-        except (TypeError, ValueError):
-            pass
-
-    raise TransformError("parse-failed")
+        raise TransformError("parse-failed")
 
 
 def loadchmulti(resp: Any) -> list[JsonValue]:
@@ -214,7 +194,7 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
             continue
 
         try:
-            value = _json5_lenient_load(candidate)
+            value = _lenient_load(candidate)
         except TransformError:
             continue
 
@@ -241,7 +221,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     Best-effort extraction of JSON-ish objects from a string by scanning
     for balanced {...} blocks outside of markdown fences.
 
-    We only accept substrings that _json5_lenient_load can parse.
+    We only accept substrings that _lenient_load can parse.
     """
     objs: list[JsonValue] = []
 
@@ -278,7 +258,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
                         continue
 
                     try:
-                        value = _json5_lenient_load(candidate)
+                        value = _lenient_load(candidate)
                     except TransformError:
                         # Not actually JSON-ish (or too malformed); ignore.
                         pass
