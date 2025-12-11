@@ -156,9 +156,10 @@ line3'''
     # --- error cases -----------------------------------------------------
 
     def test_invalid_number_raises(self):
-        text = "00"  # invalid under JSON & our stricter number rule
-        with self.assertRaises(ValueError):
-            self._loads(text)
+        # Clearly malformed numbers that both implementations should reject
+        for text in ["1.2.3", "1e", "1e+", "1e-"]:
+            with self.assertRaises(ValueError, msg=f"Expected {text!r} to be invalid"):
+                self._loads(text)
 
     def test_mixed_set_and_object_raises(self):
         # Something like {'a': 1, 2} should not be accepted

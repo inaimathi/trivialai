@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -42,6 +43,9 @@ class Agent:
     # @classmethod
     # def from_logs(cls, log_path: Path) -> Agent:
     #     return TODO
+
+    def filepath(self, relative_path):
+        return os.path.join(self.root, relative_path)
 
     def log(self, ev):
         line = json.dumps(ev, default=str)

@@ -6,11 +6,10 @@ import inspect as _inspect
 import os
 import re
 from collections import namedtuple
-from typing import (Any, AsyncIterator, Callable, Dict, List, Optional, Type,
-                    Union)
+from typing import (Any, AsyncIterator, Callable, Dict, Generator, List,
+                    Optional, Type, Union)
 
 import httpx
-import json5
 
 from . import jsonesque
 from .bistream import BiStream
@@ -116,21 +115,54 @@ def relative_path(base: str, path: str, must_exist: bool = True) -> str:
     return stripped
 
 
+def lenient_load(candidate: str) -> JsonValue:
+    """
+    Parse a JSON-esque candidate string with a bit of leniency:
+
+      1. Try jsonesque.loads(candidate) as-is.
+      2. If that fails and there are literal newline characters, try again
+         after replacing '\n' chars with '\\n' so multiline string values
+         in *non*-triple-quoted contexts get a second chance.
+
+    On success, return the parsed value.
+    On failure, raise TransformError("parse-failed").
+    """
+    candidate = candidate.strip()
+    if not candidate:
+        raise TransformError("parse-failed", raw=candidate)
+
+    # First attempt: as-is, using the JSON-esque parser
+    try:
+        return jsonesque.loads(candidate)
+    except ValueError:
+        pass
+
+    # Second attempt: escape bare newlines if any
+    if "\n" in candidate:
+        try:
+            escaped = candidate.replace("\n", "\\n")
+            return jsonesque.loads(escaped)
+        except ValueError:
+            pass
+
+    raise TransformError("parse-failed", raw=candidate)
+
+
 def loadch(resp: Any) -> JsonValue:
     """
     Parse a JSON-ish response into Python.
 
-    - If resp is a string, it may contain a Markdown code block; we strip it and json5-load it.
+    - If resp is a string, it may contain a Markdown code block; we strip it and
+      parse it via `lenient_load` (jsonesque-based).
     - If resp is already a list/dict/tuple, pass it through.
     - Otherwise raise TransformError("parse-failed").
 
-    Note that this uses the jsonesque parser, which is much more permissive than the Python
-    built-in json library. Meaning this function will happily parse values like
+    This uses a JSON-esque parser which is more permissive than the Python
+    built-in json library, accepting constructs like
 
       {foo: 1, 'bar': 2, "baz": 3}
 
-    and much crazier things including a JSON/Python pidgin allowing triple-quoted strings,
-    which would normally not be valid JSON.
+    and some Python-ish extensions.
     """
     if resp is None:
         raise TransformError("no-message-given")
@@ -141,18 +173,7 @@ def loadch(resp: Any) -> JsonValue:
     if not isinstance(resp, str):
         raise TransformError("parse-failed")
 
-    return _lenient_load(strip_md_code(resp.strip()))
-
-
-def _lenient_load(candidate: str) -> JsonValue:
-    candidate = candidate.strip()
-    if not candidate:
-        raise TransformError("parse-failed")
-
-    try:
-        return jsonesque.loads(candidate)
-    except (TypeError, ValueError):
-        raise TransformError("parse-failed")
+    return lenient_load(strip_md_code(resp.strip()))
 
 
 def loadchmulti(resp: Any) -> list[JsonValue]:
@@ -162,13 +183,13 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
     - If resp is a list/tuple: return list(resp).
     - If resp is a dict: return [resp].
     - If resp is a string:
-        * Try to parse all fenced code blocks as JSON5 (leniently).
+        * Try to parse all fenced code blocks as JSON-esque (leniently).
         * If none, scan for top-level {...} blocks in the text and parse each.
     - Otherwise raise TransformError("parse-failed").
 
     This is more permissive than loadch in that it can recover multiple
-    JSON objects from a single string, but it only accepts substrings that
-    our lenient JSON5 loader can actually parse.
+    JSON-ish objects from a single string, but it only accepts substrings that
+    our lenient loader can actually parse.
     """
     if resp is None:
         raise TransformError("no-message-given")
@@ -194,7 +215,7 @@ def loadchmulti(resp: Any) -> list[JsonValue]:
             continue
 
         try:
-            value = _lenient_load(candidate)
+            value = lenient_load(candidate)
         except TransformError:
             continue
 
@@ -221,7 +242,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     Best-effort extraction of JSON-ish objects from a string by scanning
     for balanced {...} blocks outside of markdown fences.
 
-    We only accept substrings that _lenient_load can parse.
+    We only accept substrings that `lenient_load` can parse.
     """
     objs: list[JsonValue] = []
 
@@ -258,7 +279,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
                         continue
 
                     try:
-                        value = _lenient_load(candidate)
+                        value = lenient_load(candidate)
                     except TransformError:
                         # Not actually JSON-ish (or too malformed); ignore.
                         pass
@@ -399,31 +420,39 @@ def read_ndjson(
     filepath: str, encoding: str = "utf-8"
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Read an ndjson (newline-delimited JSON) file line by line using json5 parser.
+    Read an ndjson (newline-delimited JSON) file line by line using the
+    jsonesque/lenient parser.
 
     Args:
         filepath: Path to the ndjson file
         encoding: File encoding (default: utf-8)
 
     Yields:
-        Dict: Each parsed JSON object from the file
+        Dict: Each parsed JSON(-esque) object from the file
 
     Raises:
         FileNotFoundError: If the file doesn't exist
+        ValueError: If a line cannot be parsed as JSON-esque
     """
     with open(filepath, "r", encoding=encoding) as file:
         for line_num, line in enumerate(file, 1):
             line = line.strip()
             if line:  # Skip empty lines
                 try:
-                    yield json5.loads(line)
-                except (TypeError, ValueError) as e:
-                    error_msg = getattr(e, "msg", str(e))
+                    # We could call jsonesque.loads directly, but lenient_load
+                    # gives us the same "newline escape" fallback as elsewhere.
+                    value = lenient_load(line)
+                except TransformError as e:
+                    error_msg = e.message or str(e)
+                    # Maintain a similar ValueError shape to json/json5 errors:
+                    # (msg, doc, pos)
                     raise ValueError(
-                        f"Invalid JSON5 on line {line_num}: {error_msg}",
-                        getattr(e, "doc", line),
-                        getattr(e, "pos", 0),
+                        f"Invalid JSON on line {line_num}: {error_msg}",
+                        line,
+                        0,
                     )
+                else:
+                    yield value
 
 
 def slurp_ndjson(filepath: str, encoding: str = "utf-8") -> List[Dict[str, Any]]:
