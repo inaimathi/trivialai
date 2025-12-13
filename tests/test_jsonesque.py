@@ -83,6 +83,30 @@ class TestJsonesque(unittest.TestCase):
         val = self._loads(text)
         self.assertEqual(val, 'line1\nline2\t"quoted"')
 
+    def test_double_quoted_string_with_literal_newline(self):
+        # NOTE: this input contains an actual newline character inside the quotes
+        text = '"hello\nworld"'
+        val = self._loads(text)
+        self.assertEqual(val, "hello\nworld")
+
+    def test_single_quoted_string_with_literal_newline(self):
+        # NOTE: this input contains an actual newline character inside the quotes
+        text = "'hello\nworld'"
+        val = self._loads(text)
+        self.assertEqual(val, "hello\nworld")
+
+    def test_string_with_literal_newline_and_escaped_newline(self):
+        # First newline is literal; second is via \n escape
+        text = '"line1\nline2\\nline3"'
+        val = self._loads(text)
+        self.assertEqual(val, "line1\nline2\nline3")
+
+    def test_string_backslash_newline_is_line_continuation(self):
+        # Backslash + newline is removed (Python line-continuation behavior)
+        text = '"line1\\\nline2"'
+        val = self._loads(text)
+        self.assertEqual(val, "line1line2")
+
     # --- tuples, sets, bytes --------------------------------------------
 
     def test_tuple_literal(self):
@@ -112,6 +136,26 @@ class TestJsonesque(unittest.TestCase):
         val = self._loads(text)
         self.assertIsInstance(val, (bytes, bytearray))
         self.assertEqual(bytes(val), b"hello\nworld")
+
+    def test_bytes_literal_with_literal_newline(self):
+        # NOTE: this input contains an actual newline character inside the quotes
+        text = 'b"hello\nworld"'
+        val = self._loads(text)
+        self.assertIsInstance(val, (bytes, bytearray))
+        self.assertEqual(bytes(val), b"hello\nworld")
+
+    def test_bytes_literal_with_literal_newline_and_escaped_newline(self):
+        # First newline is literal; second is via \n escape
+        text = 'b"line1\nline2\\nline3"'
+        val = self._loads(text)
+        self.assertIsInstance(val, (bytes, bytearray))
+        self.assertEqual(bytes(val), b"line1\nline2\nline3")
+
+    def test_bytes_backslash_newline_is_line_continuation(self):
+        text = 'b"line1\\\nline2"'
+        val = self._loads(text)
+        self.assertIsInstance(val, (bytes, bytearray))
+        self.assertEqual(bytes(val), b"line1line2")
 
     # --- object vs set disambiguation -----------------------------------
 
@@ -153,6 +197,12 @@ line3'''
         self.assertEqual(val["args"]["file_path"], "/tmp/example.py")
         self.assertEqual(val["args"]["content"], "line1\nline2\nline3")
 
+    def test_object_with_literal_newlines_in_string_values(self):
+        # The value string contains literal newlines and should parse fine.
+        text = "{'summary': \"hello\nworld\", 'ok': true}"
+        val = self._loads(text)
+        self.assertEqual(val, {"summary": "hello\nworld", "ok": True})
+
     # --- error cases -----------------------------------------------------
 
     def test_invalid_number_raises(self):
@@ -176,7 +226,3 @@ line3'''
         text = "@@@"
         with self.assertRaises(ValueError):
             self._loads(text)
-
-
-if __name__ == "__main__":
-    unittest.main()
