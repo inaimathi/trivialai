@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 from .. import util
-from ..bistream import BiStream, repeat_until, sequentially
+from ..bistream import BiStream, repeat_until
 from ..llm import LLMMixin
 from ..vectorstore.core import Whim
 from . import prompting, toolkit
