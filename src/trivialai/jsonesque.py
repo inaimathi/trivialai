@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import json
+import unicodedata
 from typing import Any
 
 
@@ -166,6 +167,9 @@ class _JsonesqueParser:
         Return the exact source slice for a Python-like string literal,
         including the starting and ending quotes. Uses a simple scanner
         that understands single vs triple quotes.
+
+        NOTE: We intentionally allow literal newlines inside single/double-quoted
+        strings here; evaluation is handled separately.
         """
         if self.pos >= self.len:
             raise ValueError("Unexpected end of input while parsing string literal")
@@ -189,13 +193,13 @@ class _JsonesqueParser:
                 self.pos = j + 3
                 return literal
         else:
-            # Single-quoted string
+            # Single-quoted string (now allowed to span lines)
             start = self.pos
             i = self.pos + 1
             while i < self.len:
                 ch = self.text[i]
                 if ch == "\\":
-                    # skip escaped char
+                    # skip escaped char (including escaped newline)
                     i += 2
                     continue
                 if ch == quote:
@@ -205,19 +209,217 @@ class _JsonesqueParser:
                 i += 1
             raise ValueError(f"Unterminated string starting at {start}")
 
+    @staticmethod
+    def _unescape_py_string_content(content: str) -> str:
+        out: list[str] = []
+        i = 0
+        n = len(content)
+
+        simple = {
+            "\\": "\\",
+            "'": "'",
+            '"': '"',
+            "a": "\a",
+            "b": "\b",
+            "f": "\f",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+            "v": "\v",
+        }
+
+        while i < n:
+            ch = content[i]
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+
+            if i + 1 >= n:
+                raise ValueError("Trailing backslash in string literal")
+
+            nxt = content[i + 1]
+
+            # Line continuation: backslash + newline (or CRLF) disappears
+            if nxt == "\n":
+                i += 2
+                continue
+            if nxt == "\r":
+                i += 2
+                if i < n and content[i] == "\n":
+                    i += 1
+                continue
+
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+                continue
+
+            if nxt == "x":
+                if i + 3 >= n:
+                    raise ValueError("Truncated \\xXX escape in string literal")
+                hx = content[i + 2 : i + 4]
+                if any(c not in "0123456789abcdefABCDEF" for c in hx):
+                    raise ValueError(f"Invalid hex escape \\x{hx}")
+                out.append(chr(int(hx, 16)))
+                i += 4
+                continue
+
+            if nxt == "u":
+                if i + 5 >= n:
+                    raise ValueError("Truncated \\uXXXX escape in string literal")
+                hx = content[i + 2 : i + 6]
+                if any(c not in "0123456789abcdefABCDEF" for c in hx):
+                    raise ValueError(f"Invalid unicode escape \\u{hx}")
+                out.append(chr(int(hx, 16)))
+                i += 6
+                continue
+
+            if nxt == "U":
+                if i + 9 >= n:
+                    raise ValueError("Truncated \\UNNNNNNNN escape in string literal")
+                hx = content[i + 2 : i + 10]
+                if any(c not in "0123456789abcdefABCDEF" for c in hx):
+                    raise ValueError(f"Invalid unicode escape \\U{hx}")
+                out.append(chr(int(hx, 16)))
+                i += 10
+                continue
+
+            if nxt == "N" and i + 2 < n and content[i + 2] == "{":
+                j = content.find("}", i + 3)
+                if j == -1:
+                    raise ValueError("Unterminated \\N{...} escape in string literal")
+                name = content[i + 3 : j]
+                try:
+                    out.append(unicodedata.lookup(name))
+                except KeyError as e:
+                    raise ValueError(f"Unknown Unicode character name {name!r}") from e
+                i = j + 1
+                continue
+
+            if nxt in "01234567":
+                j = i + 1
+                k = 0
+                while j < n and k < 3 and content[j] in "01234567":
+                    j += 1
+                    k += 1
+                out.append(chr(int(content[i + 1 : j], 8)))
+                i = j
+                continue
+
+            # Unknown escape: keep backslash (Python behavior)
+            out.append("\\")
+            out.append(nxt)
+            i += 2
+
+        return "".join(out)
+
+    @staticmethod
+    def _unescape_py_bytes_content(content: str) -> bytes:
+        out: bytearray = bytearray()
+        i = 0
+        n = len(content)
+
+        simple = {
+            "\\": ord("\\"),
+            "'": ord("'"),
+            '"': ord('"'),
+            "a": 0x07,
+            "b": 0x08,
+            "f": 0x0C,
+            "n": 0x0A,
+            "r": 0x0D,
+            "t": 0x09,
+            "v": 0x0B,
+        }
+
+        while i < n:
+            ch = content[i]
+            if ch != "\\":
+                oc = ord(ch)
+                if oc > 0x7F:
+                    raise ValueError("Non-ASCII character in bytes literal")
+                out.append(oc)
+                i += 1
+                continue
+
+            if i + 1 >= n:
+                raise ValueError("Trailing backslash in bytes literal")
+
+            nxt = content[i + 1]
+
+            # Line continuation
+            if nxt == "\n":
+                i += 2
+                continue
+            if nxt == "\r":
+                i += 2
+                if i < n and content[i] == "\n":
+                    i += 1
+                continue
+
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+                continue
+
+            if nxt == "x":
+                if i + 3 >= n:
+                    raise ValueError("Truncated \\xXX escape in bytes literal")
+                hx = content[i + 2 : i + 4]
+                if any(c not in "0123456789abcdefABCDEF" for c in hx):
+                    raise ValueError(f"Invalid hex escape \\x{hx}")
+                out.append(int(hx, 16))
+                i += 4
+                continue
+
+            if nxt in "01234567":
+                j = i + 1
+                k = 0
+                while j < n and k < 3 and content[j] in "01234567":
+                    j += 1
+                    k += 1
+                out.append(int(content[i + 1 : j], 8) & 0xFF)
+                i = j
+                continue
+
+            # Unknown escape: keep backslash + char (ASCII only)
+            oc = ord(nxt)
+            if oc > 0x7F:
+                raise ValueError("Non-ASCII escape in bytes literal")
+            out.append(ord("\\"))
+            out.append(oc)
+            i += 2
+
+        return bytes(out)
+
     def _parse_string(self) -> str:
+        start_pos = self.pos
         literal = self._parse_string_literal_text()
-        try:
-            # ast.literal_eval handles escapes, triple quotes, etc.
-            value = ast.literal_eval(literal)
-        except (SyntaxError, ValueError) as e:
-            raise ValueError(
-                f"Invalid string literal {literal!r} at position {self.pos}"
-            ) from e
+        quote = literal[0]
+
+        is_triple = len(literal) >= 6 and literal.startswith(quote * 3)
+        if is_triple:
+            # Triple quotes: let Python handle it (already multiline-safe)
+            try:
+                value = ast.literal_eval(literal)
+            except (SyntaxError, ValueError) as e:
+                raise ValueError(
+                    f"Invalid string literal starting at position {start_pos}"
+                ) from e
+        else:
+            # Single/double quotes: allow literal newlines by custom unescape
+            content = literal[1:-1]
+            try:
+                value = self._unescape_py_string_content(content)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid string literal starting at position {start_pos}: {e}"
+                ) from e
+
         if not isinstance(value, str):
-            # Extremely unlikely, but guard against e.g. weird inputs
             raise ValueError(
-                f"String literal did not evaluate to str at position {self.pos}"
+                f"String literal did not evaluate to str at position {start_pos}"
             )
         return value
 
@@ -228,19 +430,31 @@ class _JsonesqueParser:
         self._advance(1)  # consume 'b' / 'B'
 
         literal = self._parse_string_literal_text()
-        full = prefix + literal  # e.g. b"foo"
+        quote = literal[0]
+        is_triple = len(literal) >= 6 and literal.startswith(quote * 3)
 
-        try:
-            value = ast.literal_eval(full)
-        except (SyntaxError, ValueError) as e:
-            raise ValueError(
-                f"Invalid bytes literal {full!r} at position {prefix_pos}"
-            ) from e
+        if is_triple:
+            full = prefix + literal  # e.g. b"""...\n..."""
+            try:
+                value = ast.literal_eval(full)
+            except (SyntaxError, ValueError) as e:
+                raise ValueError(
+                    f"Invalid bytes literal starting at position {prefix_pos}"
+                ) from e
+        else:
+            # Single/double-quoted bytes with literal newlines: custom unescape
+            content = literal[1:-1]
+            try:
+                value = self._unescape_py_bytes_content(content)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid bytes literal starting at position {prefix_pos}: {e}"
+                ) from e
+
         if not isinstance(value, (bytes, bytearray)):
             raise ValueError(
                 f"Bytes literal did not evaluate to bytes at position {prefix_pos}"
             )
-        # Normalize to bytes
         return bytes(value)
 
     # ----- arrays -----
