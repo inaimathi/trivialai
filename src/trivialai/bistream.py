@@ -267,93 +267,71 @@ def branch(
     src: "BiStream[I] | ABCIterable[I] | ABCAsyncIterable[I]",
     mk_stream: Callable[[I], "BiStream[O] | ABCIterable[O] | ABCAsyncIterable[O]"],
 ) -> "FanOut[I, O]":
-    """
-    Fan-out primitive: turns a stream of items into a *fan-out* of streams.
-
-    Returns a FanOut that cannot be consumed as an event stream until you fan-in
-    via .sequence() or .interleave().
-    """
     return FanOut(BiStream.ensure(src), mk_stream)
 
 
 class FanOut(Generic[I, O]):
-    """
-    Represents a fan-out: a (bi)stream of inputs I, where each input produces a branch stream of O.
-
-    You *must* fan-in before you can treat it like a linear event stream:
-      - .sequence()   -> BiStream[O]
-      - .interleave() -> BiStream[O]
-
-    Iterating over FanOut yields BiStream[O] branch streams (not events).
-    """
-
     def __init__(
         self,
         src: "BiStream[I]",
         mk_stream: Callable[[I], "BiStream[O] | ABCIterable[O] | ABCAsyncIterable[O]"],
+        *,
+        prefix: "BiStream[Any] | None" = None,
+        passthrough_prefix: bool = True,
     ):
         self._src = src
         self._mk = mk_stream
+        self._prefix = prefix
+        self._passthrough_prefix = passthrough_prefix
 
-    def __repr__(self) -> str:
-        return f"FanOut(src={self._src!r}, mk={self._mk!r})"
-
-    # ---- fan-out iteration (yields branches, not events) ----
-
-    def __iter__(self) -> ABCIterator["BiStream[O]"]:
-        for item in self._src:
-            yield BiStream.ensure(self._mk(item))
-
-    def __aiter__(self) -> ABCAsyncIterator["BiStream[O]"]:
-        async def _agen() -> ABCAsyncIterator["BiStream[O]"]:
-            async for item in self._src:
-                yield BiStream.ensure(self._mk(item))
-
-        return _agen()
-
-    # ---- required fan-in operations ----
-
-    def sequence(self) -> "BiStream[O]":
-        """
-        Fan-in by sequencing branches:
-          - process branch 1 to completion, then branch 2, etc.
-          - deterministic ordering
-        """
-        upstream = self._src
+    def sequence(self) -> "BiStream[Any]":
+        prefix = self._prefix
+        items = self._src
         mk = self._mk
+        passthrough = self._passthrough_prefix
 
-        def _gen() -> ABCIterator[O]:
-            for item in upstream:
+        def _gen() -> ABCIterator[Any]:
+            if prefix is not None:
+                for ev in prefix:
+                    if passthrough:
+                        yield ev
+            for item in items:
                 b = BiStream.ensure(mk(item))
                 for ev in b:
                     yield ev
 
-        async def _agen() -> ABCAsyncIterator[O]:
-            async for item in upstream:
+        async def _agen() -> ABCAsyncIterator[Any]:
+            if prefix is not None:
+                async for ev in prefix:
+                    if passthrough:
+                        yield ev
+            async for item in items:
                 b = BiStream.ensure(mk(item))
                 async for ev in b:
                     yield ev
 
         return BiStream(Dual(_gen, _agen))
 
-    def interleave(self, *, concurrency: int = 0) -> "BiStream[O]":
-        """
-        Fan-in by interleaving branches (ready-first merge).
-
-        - Uses async scheduling (FIRST_COMPLETED).
-        - `concurrency=0` means unbounded (not recommended for untrusted inputs).
-        - Sync consumption works by driving the async implementation through aiter_to_iter().
-        """
-        upstream = self._src
+    def interleave(self, *, concurrency: int = 0) -> "BiStream[Any]":
+        prefix = self._prefix
+        items = self._src
         mk = self._mk
+        passthrough = self._passthrough_prefix
         limit = concurrency
 
-        async def _agen() -> ABCAsyncIterator[O]:
-            # Active branch async iterators and their in-flight tasks.
-            active: dict[int, ABCAsyncIterator[O]] = {}
-            tasks: dict[asyncio.Task[O], int] = {}
+        async def _agen() -> ABCAsyncIterator[Any]:
+            # 1) Drain prefix first (streaming through, no buffering)
+            if prefix is not None:
+                async for ev in prefix:
+                    if passthrough:
+                        yield ev
+
+            # 2) Then do the existing interleave merge across branches
+            active: dict[int, ABCAsyncIterator[Any]] = {}
+            tasks: dict[asyncio.Task[Any], int] = {}
             next_id = 0
-            src_it = upstream.__aiter__()
+
+            src_it = items.__aiter__()
             src_exhausted = False
 
             async def _start_one_branch() -> bool:
@@ -366,12 +344,10 @@ class FanOut(Generic[I, O]):
                     src_exhausted = True
                     return False
 
-                branch_stream = BiStream.ensure(mk(item))
-                it = branch_stream.__aiter__()
+                it = BiStream.ensure(mk(item)).__aiter__()
                 bid = next_id
                 next_id += 1
                 active[bid] = it
-
                 t = asyncio.create_task(it.__anext__())
                 tasks[t] = bid
                 return True
@@ -379,15 +355,13 @@ class FanOut(Generic[I, O]):
             def _room() -> bool:
                 return (limit <= 0) or (len(active) < limit)
 
-            # Prime initial set of branches.
             while _room():
-                started = await _start_one_branch()
-                if not started:
+                if not await _start_one_branch():
                     break
 
             try:
                 while tasks:
-                    done, _pending = await asyncio.wait(
+                    done, _ = await asyncio.wait(
                         tasks.keys(),
                         return_when=asyncio.FIRST_COMPLETED,
                     )
@@ -399,41 +373,27 @@ class FanOut(Generic[I, O]):
                         try:
                             ev = t.result()
                         except StopAsyncIteration:
-                            # Branch finished.
                             active.pop(bid, None)
-
-                            # Replace finished branch if source still has items.
                             while _room():
-                                started = await _start_one_branch()
-                                if not started:
+                                if not await _start_one_branch():
                                     break
                             continue
                         except Exception:
-                            # Propagate branch error; cancel everyone else.
                             for ot in list(tasks.keys()):
                                 ot.cancel()
                             raise
                         else:
-                            # Yield event and re-arm this branch.
                             yield ev
                             if it is not None:
                                 nt = asyncio.create_task(it.__anext__())
                                 tasks[nt] = bid
-
-                    # If we have no active branches but source not exhausted, try to start more.
-                    if (not tasks) and (not src_exhausted):
-                        while _room():
-                            started = await _start_one_branch()
-                            if not started:
-                                break
             finally:
-                # Best-effort cancellation if consumer stops early.
                 for t in list(tasks.keys()):
                     t.cancel()
                 if tasks:
                     await asyncio.gather(*tasks.keys(), return_exceptions=True)
 
-        def _gen() -> ABCIterator[O]:
+        def _gen() -> ABCIterator[Any]:
             it = aiter_to_iter(_agen())
             try:
                 for ev in it:
@@ -445,7 +405,7 @@ class FanOut(Generic[I, O]):
 
         return BiStream(Dual(_gen, _agen))
 
-    # ---- friendly errors for “forgot to fan-in” misuse ----
+    # ---- friendly “must fan-in” errors ----
 
     def _need_fan_in(self, name: str) -> None:
         raise RuntimeError(
@@ -453,13 +413,13 @@ class FanOut(Generic[I, O]):
             f"Call .sequence() or .interleave() first to fan-in to a BiStream."
         )
 
-    def then(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+    def then(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
         self._need_fan_in("then")
 
-    def tap(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+    def tap(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
         self._need_fan_in("tap")
 
-    def repeat_until(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+    def repeat_until(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
         self._need_fan_in("repeat_until")
 
 
@@ -735,6 +695,21 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         ],
     ) -> "BiStream[T | U]":
         return cast("BiStream[T | U]", _chain_on(self, fn))
+
+    def branch(
+        self: "BiStream[Any]",
+        items: "ABCIterable[I] | ABCAsyncIterable[I] | BiStream[I]",
+        per_item: Callable[[I], "BiStream[O] | ABCIterable[O] | ABCAsyncIterable[O]"],
+        *,
+        passthrough_prefix: bool = True,
+    ) -> "FanOut[I, O]":
+        # “gated” branch: prefix is this stream; items are fanned out afterwards
+        return FanOut(
+            BiStream.ensure(items),
+            per_item,
+            prefix=self,
+            passthrough_prefix=passthrough_prefix,
+        )
 
     def tap(
         self,
