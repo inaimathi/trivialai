@@ -17,18 +17,26 @@ from .log import getLogger
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
+JsonPrimitive = Union[None, bool, int, float, str]
+
+JsonValue = Union[
+    JsonPrimitive,
+    List["JsonValue"],
+    Dict[str, "JsonValue"],
+]
+
 ShapeSpec = Union[
+    # type checks
     Type[int],
     Type[float],
     Type[str],
     Type[bool],
+    # literal checks (NEW)
+    JsonPrimitive,
+    # containers
     List["ShapeSpec"],
-    Dict[str, "ShapeSpec"],
-    Dict[Type, "ShapeSpec"],
-]
-
-JsonValue = Union[
-    None, bool, int, float, str, List["JsonValue"], Dict[str, "JsonValue"]
+    Dict[str, "ShapeSpec"],  # specific keys
+    Dict[Type, "ShapeSpec"],  # general {key_type: value_type}
 ]
 
 
@@ -167,7 +175,7 @@ def loadch(resp: Any) -> JsonValue:
     if resp is None:
         raise TransformError("no-message-given")
 
-    if isinstance(resp, (list, dict, tuple)):
+    if isinstance(resp, (list, dict, tuple, float, int, bool)):
         return resp
 
     if not isinstance(resp, str):
@@ -319,7 +327,35 @@ def json_shape(shape: ShapeSpec) -> Callable[[str], JsonValue]:
 def _validate_shape(data, shape, path):
     """Recursively validate data against a shape specification."""
 
-    # Handle basic types
+    # --- Handle literal values (NEW) ------------------------------------
+    # If the shape is a JSON literal, require the data to match it.
+    # (Also do type-sensitive checks so e.g. False doesn't satisfy 0.)
+    if shape is None:
+        if data is not None:
+            raise TransformError(f"At {path}: Expected None, got {data!r}")
+        return
+    if isinstance(shape, bool):
+        if not isinstance(data, bool) or data != shape:
+            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
+        return
+    if isinstance(shape, str):
+        if not isinstance(data, str) or data != shape:
+            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
+        return
+    if isinstance(shape, int) and not isinstance(shape, bool):
+        if not isinstance(data, int) or isinstance(data, bool) or data != shape:
+            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
+        return
+    if isinstance(shape, float):
+        if (
+            not isinstance(data, (int, float))
+            or isinstance(data, bool)
+            or data != shape
+        ):
+            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
+        return
+
+    # --- Handle basic types ---------------------------------------------
     if shape == int:
         if not isinstance(data, int) or isinstance(data, bool):
             raise TransformError(f"At {path}: Expected int, got {type(data).__name__}")
@@ -339,7 +375,7 @@ def _validate_shape(data, shape, path):
             raise TransformError(f"At {path}: Expected bool, got {type(data).__name__}")
         return
 
-    # Handle lists
+    # --- Handle lists ---------------------------------------------------
     if isinstance(shape, list):
         if not isinstance(data, list):
             raise TransformError(f"At {path}: Expected list, got {type(data).__name__}")
@@ -353,7 +389,7 @@ def _validate_shape(data, shape, path):
             _validate_shape(item, element_shape, f"{path}[{i}]")
         return
 
-    # Handle dicts
+    # --- Handle dicts ---------------------------------------------------
     if isinstance(shape, dict):
         if not isinstance(data, dict):
             raise TransformError(f"At {path}: Expected dict, got {type(data).__name__}")
@@ -394,7 +430,7 @@ def _validate_shape(data, shape, path):
                         f"At {path}: Key {key!r} should be bool, got {type(key).__name__}"
                     )
 
-                # Validate value
+                # Validate value (can now be a literal shape too)
                 _validate_shape(value, value_type, f"{path}[{key!r}]")
         else:
             # Specific keys dict like {"item_name": str, "price": {...}}
