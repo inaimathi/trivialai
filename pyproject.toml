@@ -1,12 +1,12 @@
 [project]
 name = "trivialai"
-version = "0.5.21"
+version = "0.5.22"
 authors = [
   { name="inaimathi", email="leo.zovic@gmail.com" },
 ]
 description = "A trivial set of API bindings for AI models, because I'd like them to be easy to use."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
