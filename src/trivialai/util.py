@@ -25,12 +25,16 @@ JsonValue = Union[
     Dict[str, "JsonValue"],
 ]
 
+JsonInput: TypeAlias = JsonValue | str
+
 ShapeSpec = Union[
     # type checks
     Type[int],
     Type[float],
     Type[str],
     Type[bool],
+    Type[dict],
+    Type[list],
     # literal checks (NEW)
     JsonPrimitive,
     # containers
@@ -302,7 +306,20 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     return objs
 
 
-def json_shape(shape: ShapeSpec) -> Callable[[str], JsonValue]:
+def json_shaped(shape: ShapeSpec) -> Callable[[JsonValue], bool]:
+    cb = json_shape(shape)
+
+    def _validate(thing):
+        try:
+            cb(thing)
+            return True
+        except TransformError:
+            return False
+
+    return _validate
+
+
+def json_shape(shape: ShapeSpec) -> Callable[[JsonInput], JsonValue]:
     """
     Create a JSON validator from a shape specification.
 
@@ -373,6 +390,23 @@ def _validate_shape(data, shape, path):
     elif shape == bool:
         if not isinstance(data, bool):
             raise TransformError(f"At {path}: Expected bool, got {type(data).__name__}")
+        return
+
+    # --- Handle Container Types ----------------------------------------
+    elif shape == dict:
+        if not isinstance(data, dict):
+            raise TransformError(f"At {path}: Expected dict, got {type(data).__name__}")
+        # Optional: enforce JSON object keys are strings
+        for k in data.keys():
+            if not isinstance(k, str):
+                raise TransformError(
+                    f"At {path}: Expected dict with str keys, got key {k!r} of type {type(k).__name__}"
+                )
+        return
+
+    elif shape == list:
+        if not isinstance(data, list):
+            raise TransformError(f"At {path}: Expected list, got {type(data).__name__}")
         return
 
     # --- Handle lists ---------------------------------------------------

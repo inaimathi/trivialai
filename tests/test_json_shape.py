@@ -138,6 +138,16 @@ class TestJsonShape(unittest.TestCase):
         with self.assertRaises(TransformError):
             v("false")
 
+    def test_json_shape_dict_type_accepts_any_object(self):
+        v = json_shape({"parsed": dict})
+        out = v('{"parsed":{"a":1,"b":[2,3]}}')
+        self.assertIsInstance(out["parsed"], dict)
+
+    def test_json_shape_dict_type_rejects_non_object(self):
+        v = json_shape({"parsed": dict})
+        with self.assertRaises(TransformError):
+            v('{"parsed":[1,2,3]}')
+
     # -------- parsing failures --------
 
     def test_json_shape_parse_failed(self):
