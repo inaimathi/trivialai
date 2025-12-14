@@ -10,7 +10,6 @@ from collections.abc import AsyncIterable as ABCAsyncIterable
 from collections.abc import AsyncIterator as ABCAsyncIterator
 from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
-from functools import reduce
 from typing import (Any, Callable, Generic, Optional, TextIO, TypeVar, Union,
                     cast)
 

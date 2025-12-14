@@ -4,12 +4,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from .. import util
-from ..bistream import BiStream, repeat_until
+from ..bistream import BiStream
 from ..llm import LLMMixin
-from ..vectorstore.core import Whim
 from . import prompting, toolkit
 
 
@@ -33,7 +32,7 @@ class Agent:
         self.root = root_path
         self.root.mkdir(parents=True, exist_ok=True)
         self.scratch_path = self.root / "scratchpad.md"
-        self.log_path: Path = self.root / f"agent-log.ndjson"
+        self.log_path: Path = self.root / "agent-log.ndjson"
 
         def write_own_scratchpad(text: str) -> None:
             util.spit(self.scratch_path, text, mode="w")

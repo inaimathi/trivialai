@@ -4,6 +4,7 @@ A tiny parser for a JSON-ish language with a strict superset of JSON:
 
 - Standard JSON values/structures
 - Python-style triple quoted strings with newlines
+- Multiline string support for single quoted strings
 - None, True, False as valid values (in addition to null/true/false)
 - Set literals: {1, 2, 3} when there are no key:value pairs
 - Tuple literals: (1, 2, 3) and (1,) (Python semantics)

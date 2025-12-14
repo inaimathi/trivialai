@@ -1,17 +1,14 @@
 # toolkit.py
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 from collections.abc import Mapping as ABCMapping
 from collections.abc import Sequence as ABCSequence
-from threading import Thread
-from typing import (Any, Callable, Dict, Iterable, List, Literal, Optional,
-                    Tuple, Union, get_args, get_origin)
+from typing import (Any, Callable, Dict, Literal, Optional, Tuple, Union,
+                    get_args, get_origin)
 
 from .. import util
-from ..util import TransformError
 
 
 class ToolKit:

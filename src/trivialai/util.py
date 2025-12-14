@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 import base64
-import inspect as _inspect
 import os
 import re
 from collections import namedtuple
 from typing import (Any, AsyncIterator, Callable, Dict, Generator, List,
-                    Optional, Type, Union)
+                    Optional, Type, TypeAlias, Union)
 
 import httpx
 
 from . import jsonesque
 from .bistream import BiStream
-from .log import getLogger
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 
