@@ -12,6 +12,7 @@ import httpx
 
 from . import jsonesque
 from .bistream import BiStream
+from .log import getLogger
 
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
 

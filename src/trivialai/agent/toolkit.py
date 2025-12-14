@@ -9,6 +9,7 @@ from typing import (Any, Callable, Dict, Literal, Optional, Tuple, Union,
                     get_args, get_origin)
 
 from .. import util
+from ..util import TransformError
 
 
 class ToolKit:
