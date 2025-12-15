@@ -305,7 +305,7 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     return objs
 
 
-def json_shaped(shape: ShapeSpec) -> Callable[[JsonValue], bool]:
+def is_json_shaped(shape: ShapeSpec) -> Callable[[JsonValue], bool]:
     cb = json_shape(shape)
 
     def _validate(thing):
