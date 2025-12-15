@@ -686,6 +686,37 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         return await self._async_iter.__anext__()
 
     # ---- combinators ----
+    def map(
+        self: "BiStream[I]",
+        fn: Callable[[I], O],
+    ) -> "BiStream[O]":
+        upstream = self
+
+        def _gen() -> ABCIterator[O]:
+            for x in upstream:
+                yield fn(x)
+
+        async def _agen() -> ABCAsyncIterator[O]:
+            async for x in upstream:
+                yield fn(x)
+
+        return BiStream(Dual(_gen, _agen))
+
+    def mapcat(
+        self: "BiStream[I]",
+        fn: Callable[[I], "BiStream[O] | ABCIterable[O] | ABCAsyncIterable[O]"],
+        *,
+        concurrency: int = 0,
+    ) -> "BiStream[O]":
+        fo = branch(self, fn)
+        return cast(
+            "BiStream[O]",
+            (
+                fo.sequence()
+                if concurrency <= 0
+                else fo.interleave(concurrency=concurrency)
+            ),
+        )
 
     def then(
         self: "BiStream[T]",
