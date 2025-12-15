@@ -85,8 +85,8 @@ class TestAiterToIterSyncSide(unittest.TestCase):
 
 
 class TestIsType(unittest.TestCase):
-    def test_isType_matches_dict_type(self):
-        p = bistream.isType("final")
+    def test_is_type_matches_dict_type(self):
+        p = bistream.is_type("final")
         self.assertTrue(p({"type": "final"}))
         self.assertFalse(p({"type": "delta"}))
         self.assertFalse(p("final"))
@@ -262,6 +262,58 @@ class TestThenChain(unittest.TestCase):
         self.assertEqual(done, "DONE")
 
 
+class TestThenOptionalArg(unittest.TestCase):
+    def test_then_accepts_zero_arg_follow_sync(self):
+        def gen():
+            yield 1
+            yield 2
+            return "DONE"
+
+        calls = {"n": 0}
+
+        def follow():
+            calls["n"] += 1
+            return ["x"]
+
+        out = list(bistream.BiStream(gen()).then(follow))
+        # done is not yielded unless follow yields it
+        self.assertEqual(out, [1, 2, "x"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_then_accepts_zero_arg_follow_async(self):
+        class AIter:
+            def __init__(self):
+                self.i = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.i == 0:
+                    self.i += 1
+                    return "a"
+                raise StopAsyncIteration("DONE")
+
+        async def agen_follow():
+            yield "x"
+            yield "y"
+
+        async def run():
+            calls = {"n": 0}
+
+            def follow():
+                calls["n"] += 1
+                return agen_follow()
+
+            bs = bistream.BiStream(AIter()).then(follow)
+            out = [x async for x in bs]
+            return out, calls["n"]
+
+        out, n = asyncio.run(run())
+        self.assertEqual(out, ["a", "x", "y"])
+        self.assertEqual(n, 1)
+
+
 class TestTap(unittest.TestCase):
     def test_tap_sync_calls_callback_and_preserves_events(self):
         seen = []
@@ -287,6 +339,66 @@ class TestTap(unittest.TestCase):
         out, seen = asyncio.run(run())
         self.assertEqual(out, [0, 1, 2, 3])
         self.assertEqual(seen, [0, 1, 3])
+
+
+class TestMap(unittest.TestCase):
+    def test_map_sync(self):
+        bs = bistream.BiStream([1, 2, 3]).map(lambda x: x * 10)
+        self.assertEqual(list(bs), [10, 20, 30])
+
+
+class TestMapAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_map_async_over_async_source(self):
+        async def agen():
+            for i in range(3):
+                yield i
+
+        bs = bistream.BiStream(agen()).map(lambda x: x + 1)
+        out = [x async for x in bs]
+        self.assertEqual(out, [1, 2, 3])
+
+    async def test_map_async_over_sync_source(self):
+        bs = bistream.BiStream([1, 2, 3]).map(lambda x: x * 2)
+        out = [x async for x in bs]
+        self.assertEqual(out, [2, 4, 6])
+
+
+class TestMapCat(unittest.TestCase):
+    def test_mapcat_sync_sequence_preserves_order(self):
+        bs = bistream.BiStream([1, 2]).mapcat(lambda x: [x, x + 100])
+        self.assertEqual(list(bs), [1, 101, 2, 102])
+
+    def test_mapcat_empty_input(self):
+        bs = bistream.BiStream([]).mapcat(lambda x: [x])  # pragma: no cover (fn unused)
+        self.assertEqual(list(bs), [])
+
+    def test_mapcat_concurrency_one_is_sequential_for_sync_branches(self):
+        bs = bistream.BiStream([1, 2]).mapcat(
+            lambda x: [f"{x}-a", f"{x}-b"], concurrency=1
+        )
+        self.assertEqual(list(bs), ["1-a", "1-b", "2-a", "2-b"])
+
+
+class TestMapCatAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_mapcat_async_sequence_over_sync_items(self):
+        async def per_item(x):
+            yield f"{x}-a"
+            await asyncio.sleep(0.0001)
+            yield f"{x}-b"
+
+        bs = bistream.BiStream([1, 2]).mapcat(per_item)
+        out = [ev async for ev in bs]
+        self.assertEqual(out, ["1-a", "1-b", "2-a", "2-b"])
+
+    async def test_mapcat_async_interleave_contains_all(self):
+        async def per_item(x):
+            yield f"{x}-a"
+            await asyncio.sleep(0.001 if x % 2 == 0 else 0.002)
+            yield f"{x}-b"
+
+        bs = bistream.BiStream([1, 2, 3]).mapcat(per_item, concurrency=2)
+        out = [ev async for ev in bs]
+        self.assertEqual(set(out), {f"{x}-{s}" for x in (1, 2, 3) for s in ("a", "b")})
 
 
 class TestRepeatUntil(unittest.TestCase):

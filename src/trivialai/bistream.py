@@ -11,15 +11,11 @@ from collections.abc import AsyncIterable as ABCAsyncIterable
 from collections.abc import AsyncIterator as ABCAsyncIterator
 from collections.abc import Iterable as ABCIterable
 from collections.abc import Iterator as ABCIterator
-from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TextIO,
-                    TypeVar, Union, cast)
+from typing import Any, Callable, Generic, Optional, TextIO, Union, cast
 
+from .bistream_types import (I, O, Predicate, StreamLike, StreamLikeAny, T,
+                             ThenFn, U)
 from .log import getLogger
-
-T = TypeVar("T")
-U = TypeVar("U")
-I = TypeVar("I")
-O = TypeVar("O")
 
 __loop: asyncio.AbstractEventLoop | None = None
 __thread: threading.Thread | None = None
@@ -30,17 +26,6 @@ _SYNC_ASYNC_WARN_THRESHOLD = 1.0
 
 logger = getLogger("trivialai.bistream")
 
-# ---- typing helpers ------------------------------------------------------
-
-if TYPE_CHECKING:
-    # NOTE: this block is *not executed at runtime*, so it's safe to use
-    # unions and forward references here without tripping import-time errors.
-    StreamLikeAny = "BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any]"
-    ThenFn = Callable[[], StreamLikeAny | None] | Callable[[Any], StreamLikeAny | None]
-else:
-    # Runtime: keep it permissive; we do our own signature dispatch.
-    ThenFn = Callable[..., Any]  # type: ignore[assignment]
-
 
 class Dual(Generic[T]):
     """
@@ -48,8 +33,6 @@ class Dual(Generic[T]):
 
     - __iter__ returns a fresh sync iterator
     - __aiter__ returns a fresh async iterator
-
-    BiStream can wrap this and remain mode-preserving for combinators.
     """
 
     def __init__(
@@ -70,9 +53,7 @@ class Dual(Generic[T]):
 def _ensure_loop() -> asyncio.AbstractEventLoop:
     """
     Ensure a dedicated background event loop running in a daemon thread.
-
-    This loop is used to drive async iterators when they are consumed
-    from synchronous code.
+    Used to drive async iterators when consumed from sync code.
     """
     global __loop, __thread
     if __loop and __loop.is_running():
@@ -110,13 +91,11 @@ def aiter_to_iter(agen: ABCAsyncIterator[T]) -> ABCIterator[T]:
     sentinel = object()
 
     async def _q_put(obj: object) -> None:
-        # Cooperative backpressure: never block the event loop thread.
         while True:
             try:
                 q.put_nowait(obj)
                 return
             except queue.Full:
-                # Yield so cancellation can be delivered and other tasks can run.
                 await asyncio.sleep(0.005)
 
     async def _pump() -> None:
@@ -124,7 +103,6 @@ def aiter_to_iter(agen: ABCAsyncIterator[T]) -> ABCIterator[T]:
             async for item in agen:
                 await _q_put(item)
         except asyncio.CancelledError:
-            # Graceful termination.
             pass
         except Exception as e:
             await _q_put(e)
@@ -164,7 +142,6 @@ def aiter_to_iter(agen: ABCAsyncIterator[T]) -> ABCIterator[T]:
             if not fut.done():
                 fut.cancel()
 
-            # Unblock a waiting consumer if possible.
             try:
                 q.put_nowait(sentinel)
             except queue.Full:
@@ -206,23 +183,19 @@ def _sync_iter_to_async(sync_iter: ABCIterator[T]) -> ABCAsyncIterator[T]:
     return _agen()
 
 
-def _call_then(
-    fn: "ThenFn", done: Any
-) -> "BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any] | None":
+def _call_then(fn: ThenFn, done: Any) -> StreamLikeAny | None:
     """
     Call a then-function either as fn() or fn(done), depending on its signature.
 
-    We try to avoid the "catch TypeError then retry" pattern, because that can
-    mask real user errors (TypeError inside fn).
+    Avoids "try fn(done) except TypeError: fn()" because that can mask
+    user TypeErrors thrown *inside* the function.
     """
     try:
         sig = inspect.signature(fn)
         params = list(sig.parameters.values())
     except (TypeError, ValueError):
-        # Builtins / odd callables: best effort -> assume it accepts done.
         return cast(Callable[[Any], Any], fn)(done)
 
-    # If it has *args, it's safe to pass done.
     if any(p.kind == p.VAR_POSITIONAL for p in params):
         return cast(Callable[[Any], Any], fn)(done)
 
@@ -235,25 +208,7 @@ def _call_then(
     return cast(Callable[[Any], Any], fn)(done)
 
 
-def _chain_on(
-    src: "BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any]",
-    then: "ThenFn",
-) -> "BiStream[Any]":
-    """
-    Mode-preserving "then" driven by termination, not by inspecting events.
-
-    Drains `src`, yielding all events unchanged. When `src` terminates:
-      - calls `then(...)` exactly once
-      - then yields all events from the follow-up stream (if any)
-
-    `then` may be:
-      - a 0-arg callable: then()
-      - a 1-arg callable: then(done)
-
-    `done` is:
-      - for sync iterators: StopIteration.value (usually None unless a generator `return`s a value)
-      - for async iterators: first StopAsyncIteration arg if present, else None
-    """
+def _chain_on(src: StreamLikeAny, then: ThenFn) -> "BiStream[Any]":
     upstream = BiStream.ensure(src)
 
     def _gen() -> ABCIterator[Any]:
@@ -356,13 +311,11 @@ class FanOut(Generic[I, O]):
         limit = concurrency
 
         async def _agen() -> ABCAsyncIterator[Any]:
-            # 1) Drain prefix first (streaming through, no buffering)
             if prefix is not None:
                 async for ev in prefix:
                     if passthrough:
                         yield ev
 
-            # 2) Interleave merge across branches
             active: dict[int, ABCAsyncIterator[Any]] = {}
             tasks: dict[asyncio.Task[Any], int] = {}
             next_id = 0
@@ -441,8 +394,6 @@ class FanOut(Generic[I, O]):
 
         return BiStream(Dual(_gen, _agen))
 
-    # ---- friendly “must fan-in” errors ----
-
     def _need_fan_in(self, name: str) -> None:
         raise RuntimeError(
             f"You called {name}() on a FanOut. FanOut yields branch streams, not events. "
@@ -460,29 +411,12 @@ class FanOut(Generic[I, O]):
 
 
 def repeat_until(
-    src: "BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any]",
-    step: Callable[[Any], "BiStream[Any] | ABCIterable[Any] | ABCAsyncIterable[Any]"],
+    src: StreamLikeAny,
+    step: Callable[[Any], StreamLikeAny],
     *,
     stop: Callable[[Any], bool],
     max_iters: int = 10,
 ) -> "BiStream[Any]":
-    """
-    Mode-preserving repeat-until with early-exit (event-only stop).
-
-    For up to max_iters iterations:
-      - stream events from current stream, yielding them
-      - if stop(ev) becomes True:
-          * yield that ev
-          * stop immediately (do NOT run step)
-          * close the underlying iterator (best-effort)
-      - otherwise, on natural termination:
-          * driver = StopIteration.value / StopAsyncIteration.args[0] if present,
-                     else last yielded event
-          * if driver is None: stop
-          * else: current stream = step(driver) and continue
-
-    Also closes the underlying iterator on any exception / consumer abort.
-    """
     upstream = BiStream.ensure(src)
 
     def _close_sync(it: Any) -> None:
@@ -525,13 +459,10 @@ def repeat_until(
                     if stop(ev):
                         hit_stop = True
                         break
-
             except BaseException as e:
                 exc = e
                 raise
-
             finally:
-                # Close on early-exit OR any exception/abort. (Normal exhaustion: no need.)
                 if hit_stop or exc is not None:
                     _close_sync(it)
 
@@ -568,11 +499,9 @@ def repeat_until(
                     if stop(ev):
                         hit_stop = True
                         break
-
             except BaseException as e:
                 exc = e
                 raise
-
             finally:
                 if hit_stop or exc is not None:
                     await _close_async(it)
@@ -593,12 +522,9 @@ def tap(
     src: "BiStream[T] | ABCIterable[T] | ABCAsyncIterable[T]",
     cb: Callable[[T], Any],
     *,
-    focus: Optional[Callable[[T], bool]] = None,
-    ignore: Optional[Callable[[T], bool]] = None,
+    focus: Optional[Predicate[T]] = None,
+    ignore: Optional[Predicate[T]] = None,
 ) -> "BiStream[T]":
-    """
-    Mode-preserving tap: runs cb(ev) for selected events but yields unchanged events.
-    """
     upstream = BiStream.ensure(src)
 
     def _want(ev: T) -> bool:
@@ -628,19 +554,12 @@ def tap(
 class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
     """
     Bidirectional stream wrapper.
-
-    Goal:
-      - `for x in BiStream(...)` works in sync contexts (REPL, tests).
-      - `async for x in BiStream(...)` works in async contexts (handlers).
-      - Combinators should be mode-preserving by returning Dual sources.
-      - If a sync producer is consumed async and blocks, we warn (no threads).
     """
 
     def __init__(self, src: "ABCIterable[T] | ABCAsyncIterable[T] | BiStream[T]"):
         self._mode: str | None = None
 
         if isinstance(src, BiStream):
-            # Share the same underlying source and iterators (consumption state).
             self._src = src._src
             self._sync_iter = src._sync_iter
             self._async_iter = src._async_iter
@@ -670,10 +589,7 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
             )
 
     @classmethod
-    def ensure(
-        cls,
-        src: "BiStream[T] | ABCIterable[T] | ABCAsyncIterable[T]",
-    ) -> "BiStream[T]":
+    def ensure(cls, src: StreamLike[T]) -> "BiStream[T]":
         if isinstance(src, BiStream):
             return src
         return cls(src)
@@ -686,7 +602,6 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
             if self._has_sync:
                 self._sync_iter = iter(cast(ABCIterable[T], self._src))
             else:
-                # Async-only source; bridge it now.
                 assert self._has_async
                 if self._async_iter is None:
                     self._async_iter = cast(ABCAsyncIterable[T], self._src).__aiter__()
@@ -708,7 +623,6 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
             if self._has_async:
                 self._async_iter = cast(ABCAsyncIterable[T], self._src).__aiter__()
             else:
-                # Sync-only source; adapt (may block loop; we warn inside wrapper).
                 assert self._has_sync
                 if self._sync_iter is None:
                     self._sync_iter = iter(cast(ABCIterable[T], self._src))
@@ -724,10 +638,7 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
 
     # ---- combinators ----
 
-    def then(
-        self,
-        fn: "ThenFn",
-    ) -> "BiStream[Any]":
+    def then(self, fn: ThenFn) -> "BiStream[Any]":
         return cast("BiStream[Any]", _chain_on(self, fn))
 
     def branch(
@@ -737,7 +648,6 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         *,
         passthrough_prefix: bool = True,
     ) -> "FanOut[I, O]":
-        # “gated” branch: prefix is this stream; items are fanned out afterwards
         return FanOut(
             BiStream.ensure(items),
             per_item,
@@ -749,8 +659,8 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         self,
         cb: Callable[[T], Any],
         *,
-        focus: Optional[Callable[[T], bool]] = None,
-        ignore: Optional[Callable[[T], bool]] = None,
+        focus: Optional[Predicate[T]] = None,
+        ignore: Optional[Predicate[T]] = None,
     ) -> "BiStream[T]":
         return tap(self, cb, focus=focus, ignore=ignore)
 
@@ -792,12 +702,6 @@ def force(
     keep: Optional[Union[set[str], str]] = None,
     out: TextIO | None = None,
 ) -> list[dict]:
-    """
-    REPL helper: consume a (bi)stream of event dicts, pretty-print deltas,
-    and return a list of selected events.
-
-    NOTE: Always consumes synchronously (async producers are driven via background loop).
-    """
     stream = BiStream.ensure(src)
     if out is None:
         out = sys.stdout

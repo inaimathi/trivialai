@@ -195,7 +195,7 @@ from trivialai.bistream import BiStream
 
 …and exposes **both** iterator interfaces.
 
-### Key behavior (new / important)
+### Key behavior (important)
 
 * **Single-consumer:** it’s a stream, not a list. Once consumed, it’s exhausted.
 * **Mode-locked:** a given instance may be consumed **either** sync **or** async.
@@ -212,26 +212,34 @@ from trivialai.bistream import BiStream
 
 ---
 
-## Chaining streams with `then` / `branch` / “merge”
+## Chaining streams with `then` / `map` / `mapcat` / `branch`
 
 TrivialAI uses a small set of *mode-preserving* combinators to build pipelines without caring whether you’re in sync or async code.
 
-### `then(...)`: append a follow-up stream after upstream terminates
+### `then(...)`: append a follow-up stage after upstream terminates
 
 `then` is **termination-driven** (not event-driven):
 
-* it yields all upstream events unchanged
-* when upstream ends, it calls your function exactly once: `fn(done)`
-* it then yields events from the returned follow-up stream (if any)
+* yields all upstream events unchanged
+* when upstream ends, it calls your follow-up exactly once
+* yields all events from the returned follow-up stream (if any)
 
-`done` is the upstream iterator’s return value if the underlying generator explicitly `return`s something; otherwise it’s usually `None`.
+**New behavior:** your follow-up can be either:
 
-**Pseudocode example: append a “summary” stage after streaming completes**
+1. **0-arg**: `then(lambda: stream)`
+2. **1-arg**: `then(lambda done: stream)`
+
+`done` is:
+
+* **sync**: `StopIteration.value` if the generator `return`s a value (else `None`)
+* **async**: first `StopAsyncIteration` arg if present (else `None`)
+
+#### Pseudocode: append a constant postlude
 
 ```py
 base = client.stream("sys", "Answer, streaming.")
 
-pipeline = base.then(lambda done: [
+pipeline = base.then(lambda: [
     {"type": "note", "text": "stream ended"},
     {"type": "done", "ok": True},
 ])
@@ -240,76 +248,110 @@ for ev in pipeline:
     handle(ev)
 ```
 
-**Pseudocode example: append parsing/validation stage**
+#### Pseudocode: use `done` when you have it
+
+```py
+def gen():
+    yield {"type": "delta", "text": "hi"}
+    return {"tokens": 123}
+
+pipeline = BiStream(gen()).then(lambda done: [{"type": "stats", "done": done}])
+# yields: delta, then stats
+```
+
+#### Pattern: parse/validate after end
 
 ```py
 def parse_after_end(_done):
-    # returns a stream (iterable) of extra events
     yield {"type": "final", "ok": True, "parsed": compute_structured_result()}
 
 pipeline = client.stream("sys", "Return JSON gradually.").then(parse_after_end)
 ```
 
-### `branch(...)`: fan-out work over items, then fan-in via `.sequence()` or `.interleave()`
+---
 
-There are two entry points:
+### `map(...)`: transform each event
 
-* **Free function**: `bistream.branch(src_items, mk_stream)`
-
-  * Takes an items stream and produces a `FanOut` (a “stream of branch streams”).
-* **Method**: `BiStream.branch(items, per_item, ...)`
-
-  * “Gated” fan-out: it treats `self` as a **prefix** that is drained first, then it fans out `items`.
-  * This is useful when you want “do A, then spawn B tasks”.
-
-A `FanOut` is not an event stream yet — it must be fanned back in:
-
-* `.sequence()` — run branches one-by-one, preserving order.
-* `.interleave(concurrency=...)` — run branches concurrently and merge events as they arrive.
-
-#### Pseudocode: fan out per-document work and merge
+`map` is the standard per-event transformation:
 
 ```py
-base = client.stream("sys", "Start by describing the plan.")
-docs = ["doc1", "doc2", "doc3"]
+# prefix all delta text with ">> "
+pipeline = client.stream("sys", "Stream.").map(
+    lambda ev: (ev | {"text": ">> " + ev["text"]}) if ev.get("type") == "delta" else ev
+)
+```
 
-def per_doc(doc):
-    # return a stream for each doc (sync or async)
-    return client.stream("sys", f"Summarize: {doc}")
+This stays mode-preserving: sync in → sync out, async in → async out.
 
-# gated fan-out: stream base first, then start doc work
-fan = base.branch(docs, per_doc)
+---
 
-# merge strategy 1: sequential (stable ordering)
-merged = fan.sequence()
+### `mapcat(...)`: per-item stream expansion (flatMap), with optional concurrency
 
-for ev in merged:
+`mapcat` lets you turn each event/item into an entire stream and flatten the result.
+
+* `mapcat(fn)` defaults to sequential flattening (like `sequence()`).
+* `mapcat(fn, concurrency=N)` flattens by interleaving up to `N` active branches.
+
+#### Pseudocode: expand “files” into per-file agent streams (sequential)
+
+```py
+files = BiStream(["a.py", "b.py", "c.py"])
+
+def per_file(path):
+    return agent.streamed(f"Analyze {path}")
+
+events = files.mapcat(per_file)  # sequential
+for ev in events:
     handle(ev)
 ```
 
-#### Pseudocode: concurrent merge with interleave
+#### Pseudocode: concurrent interleaving (async-friendly)
 
 ```py
-fan = base.branch(docs, per_doc)
+files = BiStream(["a.py", "b.py", "c.py"])
 
-# merge strategy 2: interleaved (best throughput / earliest partials)
-merged = fan.interleave(concurrency=8)
+def per_file(path):
+    return agent.streamed(f"Analyze {path}")  # may be async stream
 
-async for ev in merged:
+events = files.mapcat(per_file, concurrency=8)  # interleaved merge
+async for ev in events:
     handle(ev)
 ```
 
 Notes:
 
-* `interleave(...)` is implemented as an async merge internally. If you iterate it synchronously, `BiStream` will bridge it for you via the background loop.
-* If any branch raises, `interleave` cancels the other branches and re-raises.
+* `mapcat(..., concurrency>0)` uses `FanOut.interleave(...)` internally.
+* If you consume the result synchronously, it will be bridged via the background loop (same as any async BiStream).
 
-### “Merge” in this library
+---
 
-There isn’t a separate `merge(...)` function: the fan-in step is **the merge**:
+### `branch(...)`: fan-out, then fan-in via `.sequence()` / `.interleave()`
 
-* `fan.sequence()` == merge sequentially
-* `fan.interleave(...)` == merge concurrently / interleaved
+There are two entry points:
+
+* **Free function**: `bistream.branch(src_items, mk_stream)` → returns `FanOut`
+* **Method**: `BiStream.branch(items, per_item, ...)` → “gated” fan-out (drain prefix first)
+
+A `FanOut` is not an event stream yet — it must be fanned back in:
+
+* `.sequence()` — run branches one-by-one, preserving order
+* `.interleave(concurrency=...)` — run branches concurrently and merge events as they arrive
+
+#### Pseudocode: gated fan-out
+
+```py
+base = client.stream("sys", "First: describe the plan.")
+docs = ["doc1", "doc2", "doc3"]
+
+def per_doc(doc):
+    return client.stream("sys", f"Summarize: {doc}")
+
+fan = base.branch(docs, per_doc)     # base is the prefix
+merged = fan.interleave(concurrency=8)
+
+for ev in merged:
+    handle(ev)
+```
 
 ---
 
@@ -326,17 +368,19 @@ Optional filters:
 * `focus(ev) -> bool`: only tap matching events
 * `ignore(ev) -> bool`: tap everything except matching events
 
+---
+
 ### `repeat_until(...)`: loop a stream-producing step with an event-based stop
 
 Useful for “agent loops” that keep running steps until a “final”/“conclusion”/etc appears.
 
 ```py
-from trivialai.bistream import repeat_until, isType
+from trivialai.bistream import repeat_until, is_type
 
 looped = repeat_until(
     src=client.stream("sys", "First attempt..."),
     step=lambda driver: client.stream("sys", f"Next attempt, based on {driver}..."),
-    stop=isType("final"),
+    stop=is_type("final"),
     max_iters=10,
 )
 ```
