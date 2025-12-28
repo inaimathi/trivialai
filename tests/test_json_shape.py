@@ -1,5 +1,7 @@
 # tests/test_json_shape.py
 import unittest
+from datetime import date, datetime
+from typing import Literal
 
 from src.trivialai.util import TransformError, json_shape
 
@@ -62,6 +64,23 @@ class TestJsonShape(unittest.TestCase):
         with self.assertRaises(TransformError):
             v('[1, "nope", 3]')
 
+    # -------- tuple shapes --------
+
+    def test_json_shape_tuple_fixed_length_success(self):
+        v = json_shape((int, str, bool))
+        out = v('[1, "x", true]')
+        self.assertEqual(out, [1, "x", True])
+
+    def test_json_shape_tuple_length_mismatch(self):
+        v = json_shape((int, str))
+        with self.assertRaises(TransformError):
+            v('[1, "x", true]')
+
+    def test_json_shape_tuple_element_type_mismatch(self):
+        v = json_shape((int, str))
+        with self.assertRaises(TransformError):
+            v("[1, 2]")
+
     # -------- dict shapes (specific keys) --------
 
     def test_json_shape_specific_keys_success(self):
@@ -96,12 +115,11 @@ class TestJsonShape(unittest.TestCase):
 
     def test_json_shape_general_dict_key_type_not_supported_for_json_objects(self):
         # JSON object keys are always strings (after parsing)
-        # Your validator currently tries to validate key types; this should fail.
         v = json_shape({int: str})
         with self.assertRaises(TransformError):
             v('{"1": "x"}')  # key parses as "1" (str), not int
 
-    # -------- literal values (NEW FEATURE) --------
+    # -------- raw literal values (existing feature) --------
 
     def test_json_shape_literal_in_dict_value_success(self):
         v = json_shape({"type": "conclusion", "summary": str})
@@ -137,6 +155,58 @@ class TestJsonShape(unittest.TestCase):
         self.assertTrue(v("true"))
         with self.assertRaises(TransformError):
             v("false")
+
+    # -------- typing.Literal[...] (NEW FEATURE) --------
+
+    def test_json_shape_typing_literal_accepts_allowed(self):
+        v = json_shape(Literal["a", "b", "c"])
+        self.assertEqual(v('"a"'), "a")
+        self.assertEqual(v('"b"'), "b")
+
+    def test_json_shape_typing_literal_rejects_disallowed(self):
+        v = json_shape(Literal["a", "b"])
+        with self.assertRaises(TransformError):
+            v('"c"')
+
+    def test_json_shape_typing_literal_type_sensitive(self):
+        # Should not allow 0 to satisfy Literal[False] or similar
+        v = json_shape(Literal[0])
+        self.assertEqual(v("0"), 0)
+        with self.assertRaises(TransformError):
+            v("false")
+
+    # -------- date / datetime (NEW FEATURE) --------
+
+    def test_json_shape_date_accepts_date_string(self):
+        v = json_shape(date)
+        self.assertEqual(v('"2024-03-15"'), "2024-03-15")
+
+    def test_json_shape_date_rejects_datetime_string(self):
+        v = json_shape(date)
+        with self.assertRaises(TransformError):
+            v('"2024-03-15T09:00:00Z"')
+
+    def test_json_shape_datetime_accepts_datetime_string_z(self):
+        v = json_shape(datetime)
+        self.assertEqual(v('"2024-03-15T17:00:00Z"'), "2024-03-15T17:00:00Z")
+
+    def test_json_shape_datetime_accepts_datetime_string_with_offset(self):
+        v = json_shape(datetime)
+        self.assertEqual(v('"2024-03-15T17:00:00+00:00"'), "2024-03-15T17:00:00+00:00")
+
+    def test_json_shape_datetime_rejects_date_only(self):
+        v = json_shape(datetime)
+        with self.assertRaises(TransformError):
+            v('"2024-03-15"')
+
+    def test_json_shape_datetime_in_dict_rejects_date_only(self):
+        TP = {"start_at": datetime, "end_at": datetime}
+        v = json_shape(TP)
+        ex = '{"start_at":"2024-03-15","end_at":"2024-03-15T17:00:00Z"}'
+        with self.assertRaises(TransformError):
+            v(ex)
+
+    # -------- dict container type checks --------
 
     def test_json_shape_dict_type_accepts_any_object(self):
         v = json_shape({"parsed": dict})
