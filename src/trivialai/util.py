@@ -5,52 +5,21 @@ import base64
 import os
 import re
 from collections import namedtuple
-from datetime import date, datetime
 from typing import (Any, AsyncIterator, Callable, Dict, Generator, List,
-                    Literal, Optional, TypeAlias, Union, get_args, get_origin)
+                    Optional)
 
 import httpx
 
 from . import jsonesque
 from .bistream import BiStream
+from .json_shaped import (JsonInput, JsonPrimitive,  # re-exported symbols
+                          JsonValue, ShapeSpec, TransformError, is_json_shaped,
+                          json_shape)
 from .log import getLogger
 
+logger = getLogger("trivialai.util")
+
 LLMResult = namedtuple("LLMResult", ["raw", "content", "scratchpad"])
-
-JsonPrimitive = Union[None, bool, int, float, str]
-
-JsonValue = Union[
-    JsonPrimitive,
-    List["JsonValue"],
-    Dict[str, "JsonValue"],
-]
-
-JsonInput: TypeAlias = JsonValue | str
-
-ShapeSpec = Union[
-    type[int],
-    type[float],
-    type[str],
-    type[bool],
-    type[dict],
-    type[list],
-    type[tuple],
-    type[date],
-    type[datetime],
-    None | bool | int | float | str,
-    list["ShapeSpec"],
-    tuple["ShapeSpec", ...],
-    dict[str, "ShapeSpec"],
-    dict[type[Any], "ShapeSpec"],
-    Any,  # allows Literal[...] / Union[...] specs
-]
-
-
-class TransformError(Exception):
-    def __init__(self, message: str = "Transformation Error", raw: Any = None):
-        self.message = message
-        self.raw = raw
-        super().__init__(self.message)
 
 
 class GenerationError(Exception):
@@ -308,312 +277,9 @@ def _extract_jsonish_objects(text: str) -> list[JsonValue]:
     return objs
 
 
-def is_json_shaped(shape: ShapeSpec) -> Callable[[JsonValue], bool]:
-    cb = json_shape(shape)
-
-    def _validate(thing):
-        try:
-            cb(thing)
-            return True
-        except TransformError:
-            return False
-
-    return _validate
-
-
-def json_shape(shape: ShapeSpec) -> Callable[[Any], Any]:
-    """
-    Create a JSON validator from a shape specification.
-
-    Supported shapes:
-    - Basic types: int, float, str, bool, dict, list, tuple
-    - datetime: expects an ISO-8601 datetime string (e.g. "...Z" or with offset)
-    - Raw literal values: None, True/False, 0, 1.5, "hello"
-    - typing.Literal[...]: enumerated allowed values
-    - Lists: [element_shape]
-    - Tuples: (s1, s2, s3) fixed length
-    - Dicts with specific keys: {"k": shape, ...}
-    - Dicts with general types: {str: shape} / {int: shape} etc
-    - Unions: shape1 | shape2, Union[shape1, shape2, ...]
-    """
-
-    def validator(json_input: Any) -> Any:
-        parsed = loadch(json_input)
-        _validate_shape(parsed, shape, "root")
-        return parsed
-
-    return validator
-
-
-def _type_sensitive_equal(data: Any, lit: Any) -> bool:
-    """
-    JSON-literal equality, but type-sensitive:
-      - False must not match 0
-      - True must not match 1
-      - int literals must not match bools
-      - float literals may match int/float numerically (like your existing float rule)
-    """
-    if lit is None:
-        return data is None
-
-    if isinstance(lit, bool):
-        return isinstance(data, bool) and data == lit
-
-    if isinstance(lit, str):
-        return isinstance(data, str) and data == lit
-
-    if isinstance(lit, int) and not isinstance(lit, bool):
-        return isinstance(data, int) and not isinstance(data, bool) and data == lit
-
-    if isinstance(lit, float):
-        return (
-            isinstance(data, (int, float))
-            and not isinstance(data, bool)
-            and data == lit
-        )
-
-    return data == lit
-
-
-def _parse_iso_datetime(s: str) -> datetime:
-    """
-    Accepts common ISO-8601 strings:
-      - 2024-03-15T09:00:00Z
-      - 2024-03-15T09:00:00+00:00
-      - 2024-03-15T09:00:00.123456Z
-    """
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
-
-
-def _parse_iso_date(s: str) -> date:
-    return date.fromisoformat(s)
-
-
-def _validate_shape(data: Any, shape: Any, path: str) -> None:
-    """Recursively validate data against a shape specification."""
-
-    # --- Handle typing.Literal[...] -------------------------------
-    origin = get_origin(shape)
-    if origin is Literal:
-        allowed = get_args(shape)
-        if not any(_type_sensitive_equal(data, a) for a in allowed):
-            raise TransformError(
-                f"At {path}: Expected one of {allowed!r}, got {data!r}"
-            )
-        return
-
-    # --- Handle Union / | (optional but useful) -------------------------
-    # e.g. datetime | None, Union[str, None], etc.
-    if origin is Union:
-        last_err: Exception | None = None
-        for opt in get_args(shape):
-            try:
-                _validate_shape(data, opt, path)
-                return
-            except TransformError as e:
-                last_err = e
-        # If none matched:
-        raise TransformError(
-            f"At {path}: Value did not match any allowed union option; last error: {last_err}"
-        )
-
-    # --- date ---
-    if shape is date:
-        if isinstance(data, date) and not isinstance(data, datetime):
-            return
-        if not isinstance(data, str):
-            raise TransformError(
-                f"At {path}: Expected ISO date string, got {type(data).__name__}"
-            )
-        # Must NOT look like a datetime
-        if "T" in data or " " in data:
-            raise TransformError(
-                f"At {path}: Expected date (YYYY-MM-DD), got datetime-like {data!r}"
-            )
-        try:
-            _parse_iso_date(data)
-        except Exception:
-            raise TransformError(f"At {path}: Expected date (YYYY-MM-DD), got {data!r}")
-        return
-
-    # --- datetime (UPDATED: reject date-only) ---
-    if shape is datetime:
-        if isinstance(data, datetime):
-            return
-        if not isinstance(data, str):
-            raise TransformError(
-                f"At {path}: Expected ISO datetime string, got {type(data).__name__}"
-            )
-        # Must have a time component
-        if ("T" not in data) and (" " not in data):
-            raise TransformError(
-                f"At {path}: Expected datetime (with time), got date-only {data!r}"
-            )
-        try:
-            _parse_iso_datetime(data)
-        except Exception:
-            raise TransformError(
-                f"At {path}: Expected ISO datetime string, got {data!r}"
-            )
-        return
-
-    # --- Handle raw literal values (existing behavior) -------------------
-    if shape is None:
-        if data is not None:
-            raise TransformError(f"At {path}: Expected None, got {data!r}")
-        return
-    if isinstance(shape, bool):
-        if not isinstance(data, bool) or data != shape:
-            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
-        return
-    if isinstance(shape, str):
-        if not isinstance(data, str) or data != shape:
-            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
-        return
-    if isinstance(shape, int) and not isinstance(shape, bool):
-        if not isinstance(data, int) or isinstance(data, bool) or data != shape:
-            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
-        return
-    if isinstance(shape, float):
-        if (
-            not isinstance(data, (int, float))
-            or isinstance(data, bool)
-            or data != shape
-        ):
-            raise TransformError(f"At {path}: Expected literal {shape!r}, got {data!r}")
-        return
-
-    # --- Handle basic types ---------------------------------------------
-    if shape == int:
-        if not isinstance(data, int) or isinstance(data, bool):
-            raise TransformError(f"At {path}: Expected int, got {type(data).__name__}")
-        return
-    if shape == float:
-        if not isinstance(data, (int, float)) or isinstance(data, bool):
-            raise TransformError(
-                f"At {path}: Expected float, got {type(data).__name__}"
-            )
-        return
-    if shape == str:
-        if not isinstance(data, str):
-            raise TransformError(f"At {path}: Expected str, got {type(data).__name__}")
-        return
-    if shape == bool:
-        if not isinstance(data, bool):
-            raise TransformError(f"At {path}: Expected bool, got {type(data).__name__}")
-        return
-
-    # --- Handle container type checks -----------------------------------
-    if shape == dict:
-        if not isinstance(data, dict):
-            raise TransformError(f"At {path}: Expected dict, got {type(data).__name__}")
-        for k in data.keys():
-            if not isinstance(k, str):
-                raise TransformError(
-                    f"At {path}: Expected dict with str keys, got key {k!r} of type {type(k).__name__}"
-                )
-        return
-
-    if shape == list:
-        if not isinstance(data, list):
-            raise TransformError(f"At {path}: Expected list, got {type(data).__name__}")
-        return
-
-    if shape == tuple:
-        if not isinstance(data, tuple):
-            raise TransformError(
-                f"At {path}: Expected tuple, got {type(data).__name__}"
-            )
-        return
-
-    # --- Handle list shapes ---------------------------------------------
-    if isinstance(shape, list):
-        if not isinstance(data, (list, tuple)):  # allow tuple data too
-            raise TransformError(
-                f"At {path}: Expected list/tuple, got {type(data).__name__}"
-            )
-        if len(shape) != 1:
-            raise TransformError(
-                f"Shape specification error: List must have exactly one element type, got {len(shape)}"
-            )
-        element_shape = shape[0]
-        for i, item in enumerate(data):
-            _validate_shape(item, element_shape, f"{path}[{i}]")
-        return
-
-    # --- Handle tuple shapes --------------------------------------
-    if isinstance(shape, tuple):
-        if not isinstance(data, (list, tuple)):
-            raise TransformError(
-                f"At {path}: Expected list/tuple, got {type(data).__name__}"
-            )
-        if len(data) != len(shape):
-            raise TransformError(
-                f"At {path}: Expected tuple/list of length {len(shape)}, got {len(data)}"
-            )
-        for i, (item, item_shape) in enumerate(zip(data, shape)):
-            _validate_shape(item, item_shape, f"{path}[{i}]")
-        return
-
-    # --- Handle dict shapes ---------------------------------------------
-    if isinstance(shape, dict):
-        if not isinstance(data, dict):
-            raise TransformError(f"At {path}: Expected dict, got {type(data).__name__}")
-
-        basic_types = {int, float, str, bool}
-        type_keys = [k for k in shape.keys() if k in basic_types]
-
-        if type_keys:
-            if len(shape) != 1:
-                raise TransformError(
-                    f"Shape specification error: Type-based dict must have exactly one key-value pair, got {len(shape)}"
-                )
-            key_type, value_type = next(iter(shape.items()))
-            for key, value in data.items():
-                # Key-type checks (as before)
-                if key_type == int and not (
-                    isinstance(key, int) and not isinstance(key, bool)
-                ):
-                    raise TransformError(
-                        f"At {path}: Key {key!r} should be int, got {type(key).__name__}"
-                    )
-                if key_type == float and not (
-                    isinstance(key, (int, float)) and not isinstance(key, bool)
-                ):
-                    raise TransformError(
-                        f"At {path}: Key {key!r} should be float, got {type(key).__name__}"
-                    )
-                if key_type == str and not isinstance(key, str):
-                    raise TransformError(
-                        f"At {path}: Key {key!r} should be str, got {type(key).__name__}"
-                    )
-                if key_type == bool and not isinstance(key, bool):
-                    raise TransformError(
-                        f"At {path}: Key {key!r} should be bool, got {type(key).__name__}"
-                    )
-
-                _validate_shape(value, value_type, f"{path}[{key!r}]")
-        else:
-            required_keys = set(shape.keys())
-            data_keys = set(data.keys())
-
-            missing_keys = required_keys - data_keys
-            if missing_keys:
-                raise TransformError(
-                    f"At {path}: Missing required keys: {missing_keys}"
-                )
-
-            for key, value_shape in shape.items():
-                _validate_shape(data[key], value_shape, f"{path}.{key}")
-        return
-
-    raise TransformError(f"Invalid shape specification: {shape!r}")
-
-
 def read_ndjson(
-    filepath: str, encoding: str = "utf-8"
+    filepath: str,
+    encoding: str = "utf-8",
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Read an ndjson (newline-delimited JSON) file line by line using the
@@ -648,7 +314,9 @@ def read_ndjson(
                         0,
                     )
                 else:
-                    yield value
+                    # This generator is historically annotated as yielding Dicts.
+                    # If you want stricter behavior, enforce dict here.
+                    yield value  # type: ignore[misc]
 
 
 def slurp_ndjson(filepath: str, encoding: str = "utf-8") -> List[Dict[str, Any]]:
