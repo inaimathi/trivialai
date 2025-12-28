@@ -12,9 +12,9 @@ import httpx
 
 from . import jsonesque
 from .bistream import BiStream
-from .json_shaped import (JsonInput, JsonPrimitive,  # re-exported symbols
-                          JsonValue, ShapeSpec, TransformError, is_json_shaped,
-                          json_shape)
+from .json_shaped import (Exact, JsonInput,  # re-exported symbols
+                          JsonPrimitive, JsonValue, ShapeSpec, TransformError,
+                          is_json_shaped, json_shape)
 from .log import getLogger
 
 logger = getLogger("trivialai.util")

@@ -3,7 +3,7 @@ import unittest
 from datetime import date, datetime
 from typing import Literal
 
-from src.trivialai.util import TransformError, json_shape
+from src.trivialai.util import Exact, TransformError, json_shape
 
 
 class TestJsonShape(unittest.TestCase):
@@ -175,7 +175,7 @@ class TestJsonShape(unittest.TestCase):
         with self.assertRaises(TransformError):
             v("false")
 
-    # -------- date / datetime (NEW FEATURE) --------
+    # -------- date / datetime --------
 
     def test_json_shape_date_accepts_date_string(self):
         v = json_shape(date)
@@ -205,6 +205,40 @@ class TestJsonShape(unittest.TestCase):
         ex = '{"start_at":"2024-03-15","end_at":"2024-03-15T17:00:00Z"}'
         with self.assertRaises(TransformError):
             v(ex)
+
+    # -------- Exact subtrees --------
+    def test_json_shape_exact_rejects_extra_keys(self):
+        v = json_shape(Exact({"a": int, "b": str}))
+        with self.assertRaises(TransformError):
+            v('{"a": 1, "b": "x", "extra": 999}')
+
+    def test_json_shape_exact_allows_only_specified_keys(self):
+        v = json_shape(Exact({"a": int, "b": str}))
+        out = v('{"a": 1, "b": "x"}')
+        self.assertEqual(out, {"a": 1, "b": "x"})
+
+    def test_json_shape_exact_is_local_to_subtree(self):
+        v = json_shape({"outer": Exact({"a": int})})
+        with self.assertRaises(TransformError):
+            v('{"outer": {"a": 1, "extra": 2}}')
+
+        v2 = json_shape({"outer": {"a": int}})
+        out2 = v2('{"outer": {"a": 1, "extra": 2}}')
+        self.assertEqual(out2["outer"]["a"], 1)
+        self.assertEqual(out2["outer"]["extra"], 2)
+
+    # -------- coerce --------
+
+    def test_json_shape_datetime_coerce_true_returns_datetime(self):
+        v = json_shape({"t": datetime}, coerce=True)
+        out = v('{"t":"2024-03-15T17:00:00Z"}')
+        self.assertIsInstance(out["t"], datetime)
+
+    def test_json_shape_date_coerce_true_returns_date(self):
+        v = json_shape({"d": date}, coerce=True)
+        out = v('{"d":"2024-03-15"}')
+        self.assertIsInstance(out["d"], date)
+        self.assertNotIsInstance(out["d"], datetime)
 
     # -------- dict container type checks --------
 
