@@ -341,6 +341,72 @@ class TestTap(unittest.TestCase):
         self.assertEqual(seen, [0, 1, 3])
 
 
+class TestSplice(unittest.TestCase):
+    def test_splice_sync_inserts_after_trigger_and_preserves_events(self):
+        seen = []
+
+        def cb(ev):
+            seen.append(ev)
+            return f"after-{ev}"
+
+        bs = bistream.BiStream([1, 2, 3]).splice(cb, focus=lambda x: x % 2 == 1)
+        out = list(bs)
+
+        self.assertEqual(out, [1, "after-1", 2, 3, "after-3"])
+        self.assertEqual(seen, [1, 3])
+
+    def test_splice_sync_none_means_no_insertion(self):
+        bs = bistream.BiStream([1, 2]).splice(lambda _ev: None)
+        self.assertEqual(list(bs), [1, 2])
+
+    def test_splice_sync_iterable_is_flattened(self):
+        bs = bistream.BiStream([1, 2]).splice(lambda ev: [f"a{ev}", f"b{ev}"])
+        self.assertEqual(list(bs), [1, "a1", "b1", 2, "a2", "b2"])
+
+    def test_splice_sync_dict_is_scalar_event_not_flattened(self):
+        bs = bistream.BiStream([1]).splice(lambda ev: {"type": "note", "n": ev})
+        out = list(bs)
+        self.assertEqual(out, [1, {"type": "note", "n": 1}])
+
+    def test_splice_sync_awaitable_is_resolved(self):
+        async def coro(ev):
+            return [f"aw{ev}"]
+
+        bs = bistream.BiStream([1, 2]).splice(lambda ev: coro(ev))
+        self.assertEqual(list(bs), [1, "aw1", 2, "aw2"])
+
+
+class TestSpliceAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_splice_async_inserts_after_and_accepts_async_iterable(self):
+        async def agen():
+            for i in range(3):
+                yield i
+
+        async def extra(ev):
+            yield f"x{ev}"
+            yield f"y{ev}"
+
+        # ignore=1 means: still emit event 1, but do not splice after it.
+        bs = bistream.BiStream(agen()).splice(
+            lambda ev: extra(ev),
+            ignore=lambda x: x == 1,
+        )
+        out = [x async for x in bs]
+
+        self.assertEqual(out, [0, "x0", "y0", 1, 2, "x2", "y2"])
+
+    async def test_splice_async_awaitable_is_awaited(self):
+        async def agen():
+            yield "a"
+
+        async def coro(_ev):
+            return ["post"]
+
+        bs = bistream.BiStream(agen()).splice(lambda ev: coro(ev))
+        out = [x async for x in bs]
+        self.assertEqual(out, ["a", "post"])
+
+
 class TestMap(unittest.TestCase):
     def test_map_sync(self):
         bs = bistream.BiStream([1, 2, 3]).map(lambda x: x * 10)
@@ -469,6 +535,8 @@ class TestFanOutBranchAndFanIn(unittest.TestCase):
             fan.tap(lambda _: None)
         with self.assertRaises(RuntimeError):
             fan.repeat_until(lambda _: [1])
+        with self.assertRaises(RuntimeError):
+            fan.splice(lambda _: None)
 
     def test_gated_bistream_branch_sequence_passes_prefix_then_branches(self):
         prefix = bistream.BiStream(["p1", "p2"])

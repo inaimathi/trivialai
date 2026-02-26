@@ -1,4 +1,4 @@
-# ollama.py
+# src/trivialai/ollama.py
 from __future__ import annotations
 
 import json

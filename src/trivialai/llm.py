@@ -1,4 +1,4 @@
-# llm.py
+# src/trivialai/llm.py
 from __future__ import annotations
 
 import re

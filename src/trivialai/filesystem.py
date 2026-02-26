@@ -1,3 +1,4 @@
+# src/trivialai/filesystem.py
 import os
 
 from . import util
@@ -18,9 +19,11 @@ class FilesystemMixin:
         full_system = "\n".join(
             [
                 system,
-                f"The current contents of {file_path} is {util.slurp(file_path)}"
-                if (os.path.isfile(file_path) and consider_current)
-                else f"The file {file_path} currently doesn't exist.",
+                (
+                    f"The current contents of {file_path} is {util.slurp(file_path)}"
+                    if (os.path.isfile(file_path) and consider_current)
+                    else f"The file {file_path} currently doesn't exist."
+                ),
                 f"What changes would you make to the file {file_path}? Return only the new contents of {file_path} and no other information.",
             ]
         )
