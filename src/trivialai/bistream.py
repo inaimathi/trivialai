@@ -406,6 +406,9 @@ class FanOut(Generic[I, O]):
     def tap(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
         self._need_fan_in("tap")
 
+    def splice(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
+        self._need_fan_in("splice")
+
     def repeat_until(self, *a: Any, **k: Any) -> Any:  # type: ignore[no-untyped-def]
         self._need_fan_in("repeat_until")
 
@@ -514,6 +517,133 @@ def repeat_until(
                 break
 
             stream = BiStream.ensure(step(driver))
+
+    return BiStream(Dual(_gen, _agen))
+
+
+def _looks_streamlike(x: object) -> bool:
+    # Treat dict/str/bytes as scalar “events”, not iterables to be flattened.
+    if x is None:
+        return False
+    if isinstance(x, (dict, str, bytes)):
+        return False
+    return isinstance(x, (BiStream, ABCAsyncIterable, ABCIterable))
+
+
+def _await_sync(aw: object) -> object:
+    """
+    Resolve an awaitable during sync consumption using the background loop.
+
+    NOTE: If we're already in a running event loop in this thread, blocking here
+    is a bad idea; we fail loudly instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "splice(): callback returned an awaitable during sync consumption "
+            "while an event loop is already running in this thread. "
+            "Consume this stream asynchronously, or make the callback return "
+            "a non-awaitable value in sync mode."
+        )
+
+    loop = _ensure_loop()
+
+    async def _runner() -> object:
+        return await cast(Any, aw)
+
+    fut = asyncio.run_coroutine_threadsafe(_runner(), loop)
+    return fut.result()
+
+
+def splice(
+    src: "BiStream[T] | ABCIterable[T] | ABCAsyncIterable[T]",
+    cb: Callable[[T], Any],
+    *,
+    focus: Optional[Predicate[T]] = None,
+    ignore: Optional[Predicate[T]] = None,
+) -> "BiStream[Any]":
+    """
+    Like tap(), but splices the callback's result into the outgoing stream
+    *after* the triggering event.
+
+    Callback return handling:
+      - None -> splice nothing
+      - scalar (including dict/str/bytes) -> splice that single event
+      - BiStream / iterable / async iterable -> splice all yielded events
+      - awaitable -> awaited in async mode; resolved via bg loop in sync mode
+    """
+    upstream = BiStream.ensure(src)
+
+    def _want(ev: T) -> bool:
+        if focus is not None and ignore is not None:
+            return focus(ev) and not ignore(ev)
+        if focus is not None:
+            return focus(ev)
+        if ignore is not None:
+            return not ignore(ev)
+        return True
+
+    def _as_streamlike(ret: Any) -> StreamLikeAny | None:
+        if ret is None:
+            return None
+        if _looks_streamlike(ret):
+            return cast(StreamLikeAny, ret)
+        # scalar event
+        return [ret]
+
+    def _yield_sync_stream(s: StreamLikeAny) -> ABCIterator[Any]:
+        b = BiStream.ensure(cast(Any, s))
+        it = iter(b)
+        try:
+            for x in it:
+                yield x
+        finally:
+            close = getattr(it, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    async def _yield_async_stream(s: StreamLikeAny) -> ABCAsyncIterator[Any]:
+        b = BiStream.ensure(cast(Any, s))
+        it = b.__aiter__()
+        try:
+            async for x in it:
+                yield x
+        finally:
+            aclose = getattr(it, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:
+                    pass
+
+    def _gen() -> ABCIterator[Any]:
+        for ev in upstream:
+            yield ev
+            if _want(ev):
+                ret = cb(ev)
+                if inspect.isawaitable(ret):
+                    ret = _await_sync(ret)
+                s = _as_streamlike(ret)
+                if s is not None:
+                    yield from _yield_sync_stream(s)
+
+    async def _agen() -> ABCAsyncIterator[Any]:
+        async for ev in upstream:
+            yield ev
+            if _want(ev):
+                ret = cb(ev)
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                s = _as_streamlike(ret)
+                if s is not None:
+                    async for x in _yield_async_stream(s):
+                        yield x
 
     return BiStream(Dual(_gen, _agen))
 
@@ -663,6 +793,15 @@ class BiStream(Generic[T], ABCIterator[T], ABCAsyncIterator[T]):
         ignore: Optional[Predicate[T]] = None,
     ) -> "BiStream[T]":
         return tap(self, cb, focus=focus, ignore=ignore)
+
+    def splice(
+        self,
+        cb: Callable[[T], Any],
+        *,
+        focus: Optional[Predicate[T]] = None,
+        ignore: Optional[Predicate[T]] = None,
+    ) -> "BiStream[Any]":
+        return splice(self, cb, focus=focus, ignore=ignore)
 
     def map(self: "BiStream[I]", fn: Callable[[I], O]) -> "BiStream[O]":
         upstream = self
