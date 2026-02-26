@@ -35,11 +35,17 @@ gcp = [
   "vertexai==1.49.0",
 ]
 
+
+image = [
+  "Pillow>=12,<13",
+]
+
 all = [
   "httpx[http2]~=0.27",
   "boto3==1.40.76",
   "google-auth>=2.31,<3",
   "vertexai==1.49.0",
+  "Pillow>=12,<13",
 ]
 
 [project.urls]
