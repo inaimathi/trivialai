@@ -10,19 +10,71 @@ pip install trivialai
 # pip install "trivialai[http2]"
 # Optional: AWS Bedrock support (via boto3)
 # pip install "trivialai[bedrock]"
-````
+# Optional: Google Gemini support
+# pip install "trivialai[gemini]"
+```
 
 **Requirements**
 
-* **Python ≥ 3.10** (the codebase uses `X | Y` type unions).
-* Uses **httpx** for HTTP-based providers and **boto3** for Bedrock.
+* **Python ≥ 3.10** (the codebase uses `X | Y` type unions)
+* Uses **httpx** for HTTP-based providers, **boto3** for Bedrock, and **google-genai** for Gemini
 
 ---
 
 ## Quick start
 
 ```py
->>> from trivialai import claude, gcp, ollama, chatgpt, bedrock
+>>> from trivialai import claude, gemini, ollama, chatgpt, bedrock
+```
+
+> **Note:** The legacy `gcp` module (backed by `vertexai.generative_models`) has been removed.
+> Use `gemini.Gemini` instead — it supports both the Gemini Developer API and Vertex AI,
+> and provides text *and* image generation through a single client.
+
+---
+
+## Credentials
+
+### Anthropic (Claude)
+
+Use an [Anthropic Console](https://console.anthropic.com) API key directly:
+
+```py
+claude.Claude("claude-3-5-sonnet-20241022", os.environ["ANTHROPIC_API_KEY"])
+```
+
+### OpenAI (ChatGPT)
+
+Use an [OpenAI Platform](https://platform.openai.com) API key:
+
+```py
+chatgpt.ChatGPT("gpt-4o-mini", os.environ["OPENAI_API_KEY"])
+```
+
+### Google Gemini
+
+Go to **[Google AI Studio](https://aistudio.google.com)**, sign in with a Google account, and click
+**"Get API key" → "Create API key"** in the left sidebar. The key starts with `AIza...`.
+No billing setup is required for the free tier.
+
+```py
+gemini.Gemini(api_key=os.environ["GEMINI_API_KEY"])
+```
+
+For Vertex AI (service account or Application Default Credentials), see the
+[Vertex AI auth section](#vertex-ai-auth) below.
+
+### AWS Bedrock
+
+1. Enable Bedrock and request model access in a supported region via the AWS Console.
+2. Ensure your IAM user/role has `bedrock:Converse*` and `bedrock:InvokeModel*` permissions.
+3. Provide credentials via `aws configure`, environment variables, instance role, or explicit keys.
+
+```py
+bedrock.Bedrock(
+    model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    region="us-east-1",
+)
 ```
 
 ---
@@ -33,8 +85,6 @@ pip install trivialai
 
 ```py
 >>> client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
-# or ollama.Ollama("deepseek-coder-v2:latest", "http://localhost:11434/")
-# or ollama.Ollama("mannix/llama3.1-8b-abliterated:latest", "http://localhost:11434/")
 >>> client.generate("sys msg", "Say hi with 'platypus'.").content
 "Hi there—platypus!"
 >>> client.generate_json("sys msg", "Return {'name': 'Platypus'} as JSON").content
@@ -49,14 +99,6 @@ pip install trivialai
 "Hello, platypus!"
 ```
 
-### GCP (Vertex AI)
-
-```py
->>> client = gcp.GCP("gemini-1.5-flash-001", "/path/to/gcp_creds.json", "us-central1")
->>> client.generate("sys msg", "Say hi with 'platypus'.").content
-"Hello, platypus!"
-```
-
 ### ChatGPT (OpenAI API)
 
 ```py
@@ -65,47 +107,114 @@ pip install trivialai
 "Hello, platypus!"
 ```
 
-### AWS Bedrock (Claude / Llama / Nova / etc)
+### Gemini (Google) — text + image
 
-Bedrock support is provided via the `Bedrock` client, which implements the same `LLMMixin` interface as the others.
-
-#### 1) One-time AWS setup
-
-1. Enable Bedrock + model access in a Bedrock-supported region.
-2. Ensure your IAM user/role can call Bedrock runtime APIs (`bedrock:Converse*`, `bedrock:InvokeModel*`, etc).
-3. Provide credentials via the normal AWS credential chain (`aws configure`, env vars, instance role) or explicit keys.
-
-#### 2) Choosing the right `model_id`
-
-Bedrock distinguishes between:
-
-* **Foundation model IDs**, like: `anthropic.claude-3-5-sonnet-20241022-v2:0`
-* **Inference profile IDs**, which are region-prefixed, like: `us.anthropic.claude-3-5-sonnet-20241022-v2:0`
-
-Some models/regions require using the inference profile ID. If you see a validation error about on-demand throughput, switch to the region-prefixed ID.
-
-#### 3) Minimal Bedrock demo
+`Gemini` is a unified client: one object, one set of credentials, two capabilities.
+`model` targets text generation; `image_model` targets image generation.
+Both default to sensible values, so you can use either or both.
 
 ```py
-from trivialai import bedrock
+# Text generation
+>>> gem = gemini.Gemini(api_key=os.environ["GEMINI_API_KEY"])
+>>> gem.generate(
+...     system="Reply concisely.",
+...     prompt="What is the capital of France?",
+... ).content
+"Paris."
 
+# Image generation (txt2img)
+>>> img = gem.generate_image("A corgi in a spacesuit floating above the Earth")
+>>> img.file()
+'/tmp/trivialai-img-ho9ftavj.png'
+
+# Image editing (img2img)
+>>> edited = gem.generate_image("Make it sunset colours", image=img)
+>>> edited.file()
+'/tmp/trivialai-img-x7q2kl1m.png'
+```
+
+Image and text models are independent — you can override either per-call or at construction:
+
+```py
+gem = gemini.Gemini(
+    model="gemini-3-pro-preview",                     # text model
+    image_model="gemini-3-pro-image-preview",         # image model (Nano Banana Pro)
+    api_key=os.environ["GEMINI_API_KEY"],
+)
+```
+
+To discover what models are available on your key:
+
+```py
+>>> gem.models()
+{'text': [{'name': 'models/gemini-3-flash-preview', ...}, ...],
+ 'image': [{'name': 'models/gemini-3.1-flash-image-preview', ...}, ...]}
+
+>>> gem.text_model_names()
+['models/gemini-3-flash-preview', 'models/gemini-3-pro-preview', ...]
+>>> gem.image_model_names()
+['models/gemini-3.1-flash-image-preview', 'models/gemini-3-pro-image-preview', ...]
+```
+
+#### Vertex AI auth
+
+```py
+# Service account JSON file (project auto-read from the file)
+gem = gemini.Gemini(vertex_api_creds="/path/to/sa.json", region="us-central1")
+
+# Application Default Credentials (gcloud auth application-default login)
+gem = gemini.Gemini(project="my-gcp-project", region="us-central1", use_vertexai=True)
+```
+
+### Bedrock (AWS) — text + image
+
+`Bedrock` is also a unified client. `model_id` targets text (via the Converse API);
+`image_model_id` targets image generation (via InvokeModel). Both are optional and independent.
+
+```py
 client = bedrock.Bedrock(
     model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    image_model_id="amazon.nova-canvas-v1:0",           # default
     region="us-east-1",
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
 )
 
+# Text
 res = client.generate(
-    "This is a test message. Make sure your reply contains the word 'margarine'",
-    "Hello there! Can you hear me?"
+    system="You are a helpful assistant.",
+    prompt="Explain neural networks in one sentence.",
 )
 print(res.content)
 
-res_json = client.generate_json(
-    "You are a JSON-only assistant.",
-    "Return {'name':'Platypus'} as JSON."
-)
-print(res_json.content)
+# Image (txt2img)
+img = client.generate_image("A watercolour fox reading a book in an autumn forest")
+img.file()   # → '/tmp/trivialai-img-4ai11zoz.png'
+
+# Image (img2img)
+edited = client.generate_image("Add snow", image=img)
 ```
+
+Supported image models: Nova Canvas (`amazon.nova-canvas-v1:0`), Titan Image
+(`amazon.titan-image-generator-v2:0`), and Stability AI (`stability.*`).
+
+To discover available models in your region:
+
+```py
+>>> client.models()
+{'text': [{'model_id': 'anthropic.claude-3-5-sonnet-20241022-v2:0', ...}, ...],
+ 'image': [{'model_id': 'amazon.nova-canvas-v1:0', ...}, ...]}
+
+>>> client.image_model_ids()
+['amazon.nova-canvas-v1:0', 'amazon.titan-image-generator-v2:0', ...]
+```
+
+#### Choosing the right `model_id`
+
+Bedrock distinguishes between **foundation model IDs** (`anthropic.claude-3-5-sonnet-20241022-v2:0`)
+and **inference profile IDs** (`us.anthropic.claude-3-5-sonnet-20241022-v2:0`).
+Some models/regions require the region-prefixed profile ID. If you get a validation error
+about on-demand throughput, switch to the `us.` / `eu.` prefixed form.
 
 ---
 
@@ -113,30 +222,38 @@ print(res_json.content)
 
 All providers expose a common streaming shape via `stream(...)`.
 
-**Important:** `stream(...)` (and helpers like `stream_checked(...)` / `stream_json(...)`) return a **`BiStream`**, which supports both:
+**Important:** `stream(...)` (and helpers like `stream_checked(...)` / `stream_json(...)`) return a
+**`BiStream`**, which supports both sync and async iteration.
 
-* sync iteration (`for ev in ...`)
-* async iteration (`async for ev in ...`)
+### LLM event schema
 
-You usually don’t need to call provider-specific `astream(...)` anymore.
-
-### Event schema
-
-A streaming LLM yields NDJSON-style events:
-
-* `{"type":"start", "provider":"<ollama|openai|anthropic|gcp|bedrock>", "model":"..."}`
+* `{"type":"start", "provider":"<ollama|openai|anthropic|gemini|bedrock>", "model":"..."}`
 * `{"type":"delta", "text":"...", "scratchpad":"..."}`
-
-  * For **Ollama**, `scratchpad` may contain model “thinking” extracted from `<think>…</think>`.
-  * For other providers, `scratchpad` is typically `""` in deltas.
+  * **Ollama**: `scratchpad` may contain content extracted from `<think>…</think>`.
+  * **Gemini**: `scratchpad` carries native thought tokens (no tag parsing needed).
+  * Other providers: `scratchpad` is typically `""` in deltas.
 * `{"type":"end", "content":"...", "scratchpad": <str|None>, "tokens": <int|None>}`
 * `{"type":"error", "message":"..."}`
 
-On top of that, `stream_checked(...)` / `stream_json(...)` append a final parse event:
+`stream_checked(...)` / `stream_json(...)` append a final parse event:
 
 * `{"type":"final", "ok": true|false, "parsed": ..., "error": ..., "raw": ...}`
 
-### Example: streaming (sync)
+### Image stream event schema
+
+Image generation via `imagestream(...)` yields:
+
+* `{"type":"start", "provider":"...", "model":"...", "mode":"txt2img"|"img2img"}`
+* `{"type":"progress", "progress": 0.0–1.0, "state":"...", "textinfo":"..."}` *(where supported)*
+* `{"type":"end", "image": ImageResult, "model":"...", "mode":"..."}`
+* `{"type":"error", "message":"..."}`
+
+> **Note on Gemini / Bedrock image streaming:** both APIs are single-shot REST calls with no
+> server-sent progress. The stream emits a synthetic `progress: 0.0` event immediately
+> before the blocking call (so progress-bar consumers see activity), then an `end` event
+> when the image resolves. The `end` payload is identical to other providers.
+
+### Example: streaming text (sync)
 
 ```py
 client = ollama.Ollama("gemma2:2b", "http://localhost:11434/")
@@ -155,22 +272,38 @@ for ev in client.stream("sys", "Explain, think step-by-step."):
 from trivialai.util import loadch
 
 for ev in client.stream_checked(loadch, "sys", "Return a JSON object gradually."):
-    if ev["type"] in {"start", "delta", "end"}:
-        # UI updates
-        pass
-    elif ev["type"] == "final":
+    if ev["type"] == "final":
         print("Parsed JSON:", ev["parsed"])
-```
 
-Shortcut:
-
-```py
+# Shortcut:
 for ev in client.stream_json("sys", "Return {'name':'Platypus'} as JSON."):
     if ev["type"] == "final":
         print("Parsed:", ev["parsed"])
 ```
 
-### Example: streaming (async)
+### Example: streaming image (Gemini)
+
+```py
+gem = gemini.Gemini(api_key=os.environ["GEMINI_API_KEY"])
+
+for ev in gem.imagestream("A rainy Tokyo street at night, neon reflections"):
+    if ev["type"] == "progress":
+        print(f"  {ev['textinfo']}")
+    elif ev["type"] == "end":
+        ev["image"].file("tokyo.png")
+```
+
+### Example: streaming image (Bedrock)
+
+```py
+client = bedrock.Bedrock(image_model_id="amazon.nova-canvas-v1:0", region="us-east-1")
+
+for ev in client.imagestream("A watercolour fox reading a book in an autumn forest"):
+    if ev["type"] == "end":
+        ev["image"].file("fox.png")
+```
+
+### Example: streaming text (async)
 
 ```py
 async for ev in client.stream("sys", "Stream something."):
@@ -185,177 +318,61 @@ async for ev in client.stream("sys", "Stream something."):
 from trivialai.bistream import BiStream
 ```
 
-### What it wraps
+`BiStream[T]` wraps a sync `Iterable[T]`, an async `AsyncIterable[T]`, or another `BiStream[T]`
+and exposes **both** iterator interfaces.
 
-`BiStream[T]` can wrap:
+**Key behaviour:**
 
-* a **sync** `Iterable[T]` (generator/list/range/…)
-* an **async** `AsyncIterable[T]` (async generator/…)
-* another `BiStream[T]`
-
-…and exposes **both** iterator interfaces.
-
-### Key behavior (important)
-
-* **Single-consumer:** it’s a stream, not a list. Once consumed, it’s exhausted.
-* **Mode-locked:** a given instance may be consumed **either** sync **or** async.
-  If you start consuming it sync, you can’t later consume the *same instance* async (and vice versa). This prevents subtle “half-sync / half-async” bugs.
-* **Bridging behavior:**
-
-  * async → sync: driven by a dedicated background event loop thread (used only for bridging).
-  * sync → async: an async wrapper calls `next()` inside the event loop thread; if a `next()` blocks, the loop is blocked and `BiStream` will log a warning once.
-
-### Construction notes
-
-* `BiStream.ensure(x)` returns `x` unchanged if it’s already a `BiStream`.
-* `BiStream(other_bistream)` **shares** the same underlying iterators, so consumption progress is shared.
+* **Single-consumer:** once consumed, exhausted.
+* **Mode-locked:** a given instance may be consumed *either* sync *or* async.
+* **Bridging:** async → sync driven by a background event loop thread; sync → async wraps `next()`.
 
 ---
 
 ## Chaining streams with `then` / `map` / `mapcat` / `branch`
 
-TrivialAI uses a small set of *mode-preserving* combinators to build pipelines without caring whether you’re in sync or async code.
+All combinators are mode-preserving (sync in → sync out, async in → async out).
 
 ### `then(...)`: append a follow-up stage after upstream terminates
 
-`then` is **termination-driven** (not event-driven):
-
-* yields all upstream events unchanged
-* when upstream ends, it calls your follow-up exactly once
-* yields all events from the returned follow-up stream (if any)
-
-**New behavior:** your follow-up can be either:
-
-1. **0-arg**: `then(lambda: stream)`
-2. **1-arg**: `then(lambda done: stream)`
-
-`done` is:
-
-* **sync**: `StopIteration.value` if the generator `return`s a value (else `None`)
-* **async**: first `StopAsyncIteration` arg if present (else `None`)
-
-#### Pseudocode: append a constant postlude
-
 ```py
-base = client.stream("sys", "Answer, streaming.")
-
-pipeline = base.then(lambda: [
+pipeline = client.stream("sys", "Answer, streaming.").then(lambda: [
     {"type": "note", "text": "stream ended"},
-    {"type": "done", "ok": True},
 ])
-
-for ev in pipeline:
-    handle(ev)
 ```
 
-#### Pseudocode: use `done` when you have it
-
-```py
-def gen():
-    yield {"type": "delta", "text": "hi"}
-    return {"tokens": 123}
-
-pipeline = BiStream(gen()).then(lambda done: [{"type": "stats", "done": done}])
-# yields: delta, then stats
-```
-
-#### Pattern: parse/validate after end
-
-```py
-def parse_after_end(_done):
-    yield {"type": "final", "ok": True, "parsed": compute_structured_result()}
-
-pipeline = client.stream("sys", "Return JSON gradually.").then(parse_after_end)
-```
-
----
+Your follow-up can be 0-arg or 1-arg (`done` receives `StopIteration.value` if present).
 
 ### `map(...)`: transform each event
 
-`map` is the standard per-event transformation:
-
 ```py
-# prefix all delta text with ">> "
 pipeline = client.stream("sys", "Stream.").map(
     lambda ev: (ev | {"text": ">> " + ev["text"]}) if ev.get("type") == "delta" else ev
 )
 ```
 
-This stays mode-preserving: sync in → sync out, async in → async out.
-
----
-
 ### `mapcat(...)`: per-item stream expansion (flatMap), with optional concurrency
 
-`mapcat` lets you turn each event/item into an entire stream and flatten the result.
-
-* `mapcat(fn)` defaults to sequential flattening (like `sequence()`).
-* `mapcat(fn, concurrency=N)` flattens by interleaving up to `N` active branches.
-
-#### Pseudocode: expand “files” into per-file agent streams (sequential)
-
 ```py
-files = BiStream(["a.py", "b.py", "c.py"])
-
-def per_file(path):
-    return agent.streamed(f"Analyze {path}")
-
-events = files.mapcat(per_file)  # sequential
-for ev in events:
-    handle(ev)
+events = BiStream(["a.py", "b.py", "c.py"]).mapcat(
+    lambda path: agent.streamed(f"Analyze {path}"),
+    concurrency=8,
+)
 ```
-
-#### Pseudocode: concurrent interleaving (async-friendly)
-
-```py
-files = BiStream(["a.py", "b.py", "c.py"])
-
-def per_file(path):
-    return agent.streamed(f"Analyze {path}")  # may be async stream
-
-events = files.mapcat(per_file, concurrency=8)  # interleaved merge
-async for ev in events:
-    handle(ev)
-```
-
-Notes:
-
-* `mapcat(..., concurrency>0)` uses `FanOut.interleave(...)` internally.
-* If you consume the result synchronously, it will be bridged via the background loop (same as any async BiStream).
-
----
 
 ### `branch(...)`: fan-out, then fan-in via `.sequence()` / `.interleave()`
 
-There are two entry points:
-
-* **Free function**: `bistream.branch(src_items, mk_stream)` → returns `FanOut`
-* **Method**: `BiStream.branch(items, per_item, ...)` → “gated” fan-out (drain prefix first)
-
-A `FanOut` is not an event stream yet — it must be fanned back in:
-
-* `.sequence()` — run branches one-by-one, preserving order
-* `.interleave(concurrency=...)` — run branches concurrently and merge events as they arrive
-
-#### Pseudocode: gated fan-out
-
 ```py
 base = client.stream("sys", "First: describe the plan.")
-docs = ["doc1", "doc2", "doc3"]
-
-def per_doc(doc):
-    return client.stream("sys", f"Summarize: {doc}")
-
-fan = base.branch(docs, per_doc)     # base is the prefix
-merged = fan.interleave(concurrency=8)
-
-for ev in merged:
+fan  = base.branch(["doc1", "doc2", "doc3"],
+                   lambda doc: client.stream("sys", f"Summarize: {doc}"))
+for ev in fan.interleave(concurrency=8):
     handle(ev)
 ```
 
 ---
 
-## Extra helpers you’ll see in pipelines
+## Extra helpers
 
 ### `tap(...)`: side effects without changing events
 
@@ -363,16 +380,7 @@ for ev in merged:
 stream = client.stream("sys", "Stream.").tap(lambda ev: log(ev))
 ```
 
-Optional filters:
-
-* `focus(ev) -> bool`: only tap matching events
-* `ignore(ev) -> bool`: tap everything except matching events
-
----
-
-### `repeat_until(...)`: loop a stream-producing step with an event-based stop
-
-Useful for “agent loops” that keep running steps until a “final”/“conclusion”/etc appears.
+### `repeat_until(...)`: agent loops
 
 ```py
 from trivialai.bistream import repeat_until, is_type
@@ -384,8 +392,6 @@ looped = repeat_until(
     max_iters=10,
 )
 ```
-
-`repeat_until` best-effort closes underlying iterators on early exit and on exceptions/consumer abort.
 
 ---
 
@@ -402,10 +408,11 @@ vec = embed("hello world")
 
 ## Notes & compatibility
 
-* **Dependencies**: `httpx` replaces `requests`. Use `httpx[http2]` if you want HTTP/2 for OpenAI/Anthropic. Use `boto3` for AWS Bedrock.
-* **Scratchpad**:
-
-  * **Ollama** may surface `<think>` content as `scratchpad` deltas and a final scratchpad string.
-  * Other providers usually emit `scratchpad=""` in deltas and `None` in the final `end`.
-* **GCP/Vertex AI**: streaming may fall back to a single final chunk unless a native streaming provider implementation is present.
-* **BiStream**: single-use and single-consumer by design — don’t try to consume the same instance concurrently from multiple tasks.
+* **Dependencies:** `httpx` for HTTP providers; `boto3` for Bedrock; `google-genai` + optionally
+  `google-auth` for Gemini.
+* **Scratchpad:** Ollama surfaces `<think>` content; Gemini routes native thought tokens;
+  other providers emit `scratchpad=""` in deltas and `None` in the final `end`.
+* **`gcp` module removed:** the old `gcp.GCP` class (backed by `vertexai.generative_models`,
+  deprecated June 2025) has been removed. Migrate to `gemini.Gemini` — it supports all three
+  auth modes the old class did, plus image generation.
+* **BiStream:** single-use and single-consumer — don't consume the same instance from multiple tasks.
