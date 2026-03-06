@@ -100,7 +100,7 @@ from google.genai import types as genai_types
 from google.oauth2.service_account import Credentials as SACredentials
 
 from .filesystem import FilesystemMixin
-from .image import ImageMixin, ImageResult
+from .image import ImageMixin, Picture
 from .llm import LLMMixin, LLMResult
 
 # ---------------------------------------------------------------------------
@@ -180,10 +180,10 @@ def _to_part(obj: Any) -> genai_types.Part:
     """
     Convert an image-like object into a ``genai_types.Part``.
 
-    Accepts: ``ImageResult``, ``bytes``/``bytearray``, file path (str/Path),
+    Accepts: ``Picture``, ``bytes``/``bytearray``, file path (str/Path),
     or a PIL ``Image``.
     """
-    if isinstance(obj, ImageResult):
+    if isinstance(obj, Picture):
         return genai_types.Part.from_bytes(
             data=obj.bytes(), mime_type=obj.media_type or "image/png"
         )
@@ -215,7 +215,7 @@ def _to_part(obj: Any) -> genai_types.Part:
 
     raise TypeError(
         f"Cannot convert {type(obj).__name__!r} to a Gemini Part. "
-        "Expected ImageResult, bytes, file path, or PIL Image."
+        "Expected Picture, bytes, file path, or PIL Image."
     )
 
 
@@ -226,9 +226,9 @@ def _to_part(obj: Any) -> genai_types.Part:
 
 def _collect_image_results(
     response: Any, *, model: str, mode: str, prompt: str
-) -> List[ImageResult]:
+) -> List[Picture]:
     """Extract all image parts from a generate_content response."""
-    results: List[ImageResult] = []
+    results: List[Picture] = []
     for part in getattr(response, "parts", None) or []:
         inline = getattr(part, "inline_data", None)
         if inline is None:
@@ -238,7 +238,7 @@ def _collect_image_results(
         if not img_bytes:
             continue
         results.append(
-            ImageResult.from_bytes(
+            Picture.from_bytes(
                 img_bytes,
                 media_type=mime,
                 metadata={
@@ -506,7 +506,7 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
     def _build_image_contents(
         self,
         prompt: str,
-        src_img: Optional[ImageResult],
+        src_img: Optional[Picture],
     ) -> List[Any]:
         """
         Assemble contents for an image generation request.
@@ -524,7 +524,7 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
+    ) -> Picture:
         """
         Generate or edit an image (txt2img or img2img).
 
@@ -618,7 +618,7 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
 
           {"type": "start",    "provider": "gemini", "model": ..., "mode": ...}
           {"type": "progress", "progress": 0.0, "state": "generating", ...}
-          {"type": "end",      "image": ImageResult, "model": ..., "mode": ...}
+          {"type": "end",      "image": Picture, "model": ..., "mode": ...}
 
         or on failure::
 
@@ -641,7 +641,7 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
             "textinfo": "Waiting for Gemini image API…",
         }
 
-        gen_task: asyncio.Task[ImageResult] = asyncio.create_task(
+        gen_task: asyncio.Task[Picture] = asyncio.create_task(
             asyncio.to_thread(self.generate_image, prompt, image, model, **kwargs)
         )
 

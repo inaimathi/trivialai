@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 
 from .filesystem import FilesystemMixin
+from .image import Picture
 from .llm import LLMMixin, LLMResult
 
 
@@ -83,7 +84,7 @@ class Ollama(LLMMixin, FilesystemMixin):
             "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
         }
         if images is not None:
-            data["images"] = images
+            data["images"] = [Picture.of(img).b64() for img in images]
 
         url = f"{self.server}/api/generate"
         with httpx.Client(timeout=self.timeout) as client:
@@ -119,7 +120,7 @@ class Ollama(LLMMixin, FilesystemMixin):
             "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
         }
         if images is not None:
-            payload["images"] = images
+            payload["images"] = [Picture.of(img).b64() for img in images]
 
         yield {"type": "start", "provider": "ollama", "model": self.model}
 

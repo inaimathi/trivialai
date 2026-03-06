@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 
 from .filesystem import FilesystemMixin
-from .image import ImageMixin, ImageResult
+from .image import ImageMixin, Picture
 
 
 def _strip_data_url_prefix(b64: str) -> str:
@@ -61,7 +61,7 @@ class StabDiff(ImageMixin, FilesystemMixin):
     If `image` is None:
       - uses /sdapi/v1/txt2img
 
-    If `image` is provided (ImageResult / bytes / file path / PIL image):
+    If `image` is provided (Picture / bytes / file path / PIL image):
       - uses /sdapi/v1/img2img with init_images=[...]
 
     Notes
@@ -317,7 +317,7 @@ class StabDiff(ImageMixin, FilesystemMixin):
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
+    ) -> Picture:
         """
         Unified one-shot generation.
 
@@ -380,7 +380,7 @@ class StabDiff(ImageMixin, FilesystemMixin):
             "image_index": image_index,
         }
 
-        return ImageResult.from_bytes(
+        return Picture.from_bytes(
             img_bytes,
             raw=res,
             metadata=metadata,
@@ -451,8 +451,8 @@ class StabDiff(ImageMixin, FilesystemMixin):
         Emits:
           - {"type":"start", ...}
           - {"type":"progress", "progress":..., "eta_relative":..., ...}
-             (optionally includes a preview ImageResult under "image")
-          - {"type":"end", "image": ImageResult, ...}
+             (optionally includes a preview Picture under "image")
+          - {"type":"end", "image": Picture, ...}
           - {"type":"error", "message":"..."}
         """
         poll_interval = float(
@@ -477,7 +477,7 @@ class StabDiff(ImageMixin, FilesystemMixin):
             "mode": mode,
         }
 
-        gen_task: asyncio.Task[ImageResult] = asyncio.create_task(
+        gen_task: asyncio.Task[Picture] = asyncio.create_task(
             asyncio.to_thread(
                 self.generate_image,
                 prompt,
@@ -515,13 +515,13 @@ class StabDiff(ImageMixin, FilesystemMixin):
                             or (isinstance(textinfo, str) and textinfo != last_textinfo)
                         )
 
-                        preview_img: Optional[ImageResult] = None
+                        preview_img: Optional[Picture] = None
                         if include_previews:
                             cur = pj.get("current_image")
                             if isinstance(cur, str) and cur and cur != last_preview_b64:
                                 try:
                                     b = _decode_b64_image_bytes(cur)
-                                    preview_img = ImageResult.from_bytes(
+                                    preview_img = Picture.from_bytes(
                                         b,
                                         metadata={
                                             "provider": "stabdiff",

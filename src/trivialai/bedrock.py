@@ -70,7 +70,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .filesystem import FilesystemMixin
-from .image import ImageMixin, ImageResult
+from .image import ImageMixin, Picture
 from .llm import LLMMixin, LLMResult
 
 logger = logging.getLogger(__name__)
@@ -228,7 +228,7 @@ def _is_stability(model_id: str) -> bool:
 def _build_image_payload(
     model_id: str,
     prompt: str,
-    src_img: Optional[ImageResult],
+    src_img: Optional[Picture],
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Dispatch to the right payload builder based on model family."""
@@ -553,7 +553,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
+    ) -> Picture:
         """
         Generate or edit an image via InvokeModel.
 
@@ -630,7 +630,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
                 f"({len(image_bytes_list)} image(s) returned)."
             )
 
-        return ImageResult.from_bytes(
+        return Picture.from_bytes(
             image_bytes_list[image_index],
             metadata={
                 "provider": "bedrock",
@@ -659,7 +659,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         this emits:
           ``{"type": "start",    "provider": "bedrock", "model": ..., "mode": ...}``
           ``{"type": "progress", "progress": 0.0, "state": "generating"}``
-          ``{"type": "end",      "image": ImageResult, ...}``
+          ``{"type": "end",      "image": Picture, ...}``
           ``{"type": "error",    "message": "..."}``
         """
         effective_model = model or self.image_model_id

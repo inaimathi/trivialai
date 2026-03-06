@@ -1,6 +1,7 @@
 # src/trivialai/image.py
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 from asyncio import to_thread
@@ -14,7 +15,7 @@ from .bistream import BiStream
 
 
 # ---------------------------------------------------------------------------
-# ImageResult
+# Picture
 # ---------------------------------------------------------------------------
 def _looks_like_pil_image(obj: Any) -> bool:
     return isinstance(obj, PILImage.Image)
@@ -104,7 +105,7 @@ def _guess_media_type_from_bytes(data: Optional[bytes]) -> Optional[str]:
     return None
 
 
-class ImageResult:
+class Picture:
     """
     Lazy image wrapper that can be backed by:
       - raw bytes
@@ -147,7 +148,24 @@ class ImageResult:
             self.format = _mime_to_pil_format(self.media_type)
 
         if self._pil is None and self._bytes is None and self._file_path is None:
-            raise ValueError("ImageResult requires one of: data, file_path, pil")
+            raise ValueError("Picture requires one of: data, file_path, pil")
+
+    @classmethod
+    def of(cls, obj: Any) -> "Picture":
+        """Normalize any image-like object into a Picture."""
+        if isinstance(obj, cls):
+            return obj
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return cls.from_bytes(bytes(obj))
+        if isinstance(obj, (str, os.PathLike)):
+            with open(obj, "rb") as f:
+                return cls.from_bytes(f.read())
+        if hasattr(obj, "save") and hasattr(obj, "mode"):  # PIL Image
+            buf = BytesIO()
+            fmt = getattr(obj, "format", None) or "PNG"
+            obj.save(buf, format=fmt)
+            return cls.from_bytes(buf.getvalue(), media_type=f"image/{fmt.lower()}")
+        raise TypeError(f"Cannot create Picture from {type(obj).__name__!r}")
 
     @classmethod
     def from_bytes(
@@ -158,7 +176,7 @@ class ImageResult:
         fmt: Optional[str] = None,
         raw: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> "ImageResult":
+    ) -> "Picture":
         return cls(
             data=data,
             media_type=media_type,
@@ -176,7 +194,7 @@ class ImageResult:
         fmt: Optional[str] = None,
         raw: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> "ImageResult":
+    ) -> "Picture":
         return cls(
             file_path=path,
             media_type=media_type,
@@ -194,7 +212,7 @@ class ImageResult:
         fmt: Optional[str] = None,
         raw: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> "ImageResult":
+    ) -> "Picture":
         return cls(
             pil=img,
             media_type=media_type,
@@ -258,6 +276,9 @@ class ImageResult:
             self.media_type = _guess_media_type_from_bytes(out) or self.media_type
         return out
 
+    def b64(self) -> str:
+        return base64.b64encode(self.bytes()).decode("ascii")
+
     def bytes(self) -> bytes:
         if self._bytes is not None:
             return self._bytes
@@ -273,7 +294,7 @@ class ImageResult:
             self._bytes = self._serialize_pil_to_bytes()
             return self._bytes
 
-        raise RuntimeError("ImageResult has no source representation")
+        raise RuntimeError("Picture has no source representation")
 
     def pil_image(self):
         if self._pil is not None:
@@ -298,7 +319,7 @@ class ImageResult:
                     self.format = getattr(img, "format", None) or self.format
             return self._pil
 
-        raise RuntimeError("ImageResult has no source representation")
+        raise RuntimeError("Picture has no source representation")
 
     def file(
         self,
@@ -345,7 +366,7 @@ class ImageResult:
             self._pil.save(out_path, format=fmt)
             self.format = fmt
         else:
-            raise RuntimeError("ImageResult has no source representation")
+            raise RuntimeError("Picture has no source representation")
 
         self._file_path = out_path
         if not self.media_type and self._bytes is not None:
@@ -376,7 +397,7 @@ class ImageResult:
             parts.append(f"media_type={self.media_type!r}")
         if self.format:
             parts.append(f"format={self.format!r}")
-        return f"ImageResult({', '.join(parts)})"
+        return f"Picture({', '.join(parts)})"
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +410,8 @@ class ImageMixin:
     Mixin surface for image-generation models.
 
     Unified interface:
-      - imagen(prompt, image=None, model=None, **kwargs) -> ImageResult
-      - aimagen(prompt, image=None, model=None, **kwargs) -> ImageResult
+      - imagen(prompt, image=None, model=None, **kwargs) -> Picture
+      - aimagen(prompt, image=None, model=None, **kwargs) -> Picture
       - imagestream(prompt, image=None, model=None, **kwargs) -> BiStream[dict]
 
     Providers may interpret `image` as:
@@ -400,25 +421,25 @@ class ImageMixin:
       - ignored (for text-only image models)
     """
 
-    def _coerce_image_result(self, obj: Any) -> Optional[ImageResult]:
+    def _coerce_image_result(self, obj: Any) -> Optional[Picture]:
         if obj is None:
             return None
 
-        if isinstance(obj, ImageResult):
+        if isinstance(obj, Picture):
             return obj
 
         if isinstance(obj, (bytes, bytearray, memoryview)):
-            return ImageResult.from_bytes(bytes(obj))
+            return Picture.from_bytes(bytes(obj))
 
         if isinstance(obj, (str, os.PathLike)):
-            return ImageResult.from_file(str(obj))
+            return Picture.from_file(str(obj))
 
         if _looks_like_pil_image(obj):
-            return ImageResult.from_pil(obj)
+            return Picture.from_pil(obj)
 
         return None
 
-    def _event_image_result(self, ev: Dict[str, Any]) -> Optional[ImageResult]:
+    def _event_image_result(self, ev: Dict[str, Any]) -> Optional[Picture]:
         if "image" in ev:
             return self._coerce_image_result(ev.get("image"))
 
@@ -437,11 +458,11 @@ class ImageMixin:
 
         return None
 
-    def _require_image_result(self, obj: Any) -> ImageResult:
+    def _require_image_result(self, obj: Any) -> Picture:
         out = self._coerce_image_result(obj)
         if out is None:
             raise TypeError(
-                "Expected image-like result (ImageResult/bytes/file path/PIL image), "
+                "Expected image-like result (Picture/bytes/file path/PIL image), "
                 f"got {type(obj).__name__}: {obj!r}"
             )
         return out
@@ -452,7 +473,7 @@ class ImageMixin:
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult | bytes | str | os.PathLike[str] | Any:
+    ) -> Picture | bytes | str | os.PathLike[str] | Any:
         raise NotImplementedError
 
     async def agenerate_image(
@@ -461,7 +482,7 @@ class ImageMixin:
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
+    ) -> Picture:
         raw = await to_thread(self.generate_image, prompt, image, model, **kwargs)
         return self._require_image_result(raw)
 
@@ -493,7 +514,7 @@ class ImageMixin:
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
+    ) -> Picture:
         raw = self.generate_image(prompt, image=image, model=model, **kwargs)
         return self._require_image_result(raw)
 
@@ -503,8 +524,8 @@ class ImageMixin:
         image: Any = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> ImageResult:
-        last_preview: Optional[ImageResult] = None
+    ) -> Picture:
+        last_preview: Optional[Picture] = None
         last_error: Optional[str] = None
 
         async for ev in self.imagestream(prompt, image=image, model=model, **kwargs):
@@ -514,7 +535,7 @@ class ImageMixin:
             if t == "error":
                 last_error = str(ev.get("message") or ev.get("error") or "image-error")
             img = ev.get("image")
-            if isinstance(img, ImageResult):
+            if isinstance(img, Picture):
                 last_preview = img
                 if t == "end":
                     return img
@@ -534,7 +555,7 @@ class ImageMixin:
         **kwargs: Any,
     ) -> BiStream[Dict[str, Any]]:
         async def _wrapped() -> AsyncIterator[Dict[str, Any]]:
-            last_image: Optional[ImageResult] = None
+            last_image: Optional[Picture] = None
 
             async for ev in self.astream_image(
                 prompt, image=image, model=model, **kwargs
@@ -556,7 +577,7 @@ class ImageMixin:
 
                 if new_ev.get("type") == "end":
                     if "image" not in new_ev or not isinstance(
-                        new_ev["image"], ImageResult
+                        new_ev["image"], Picture
                     ):
                         if last_image is None:
                             raise RuntimeError(
