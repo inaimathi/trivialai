@@ -169,19 +169,17 @@ class StabDiff(ImageMixin, FilesystemMixin):
                 out.append(fn)
         return out
 
-        def models_full(self) -> List[Dict[str, Any]]:
-            with self._client() as client:
-                res = client.get(self._url("/sdapi/v1/sd-models"), auth=self.auth)
+    def models_full(self) -> List[Dict[str, Any]]:
+        with self._client() as client:
+            res = client.get(self._url("/sdapi/v1/sd-models"), auth=self.auth)
 
-            if res.status_code != 200:
-                raise RuntimeError(f"sd-models failed: HTTP {res.status_code}")
+        if res.status_code != 200:
+            raise RuntimeError(f"sd-models failed: HTTP {res.status_code}")
 
-            data = res.json()
-            if not isinstance(data, list):
-                raise RuntimeError(
-                    f"Unexpected sd-models response: {type(data).__name__}"
-                )
-            return [x for x in data if isinstance(x, dict)]
+        data = res.json()
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected sd-models response: {type(data).__name__}")
+        return [x for x in data if isinstance(x, dict)]
 
     def models(self) -> List[str]:
         out: List[str] = []
