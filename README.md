@@ -25,6 +25,7 @@ pip install trivialai
 
 ```py
 >>> from trivialai import claude, gemini, ollama, chatgpt, bedrock
+>>> from trivialai.stabdiff import StabDiff
 ```
 
 > **Note:** The legacy `gcp` module (backed by `vertexai.generative_models`) has been removed.
@@ -76,6 +77,33 @@ bedrock.Bedrock(
     region="us-east-1",
 )
 ```
+
+### Stable Diffusion (AUTOMATIC1111 WebUI)
+
+Start your AUTOMATIC1111 WebUI with the `--api` flag, then point `StabDiff` at it. No API key
+is required; the client talks directly to the local (or remote) WebUI HTTP server.
+
+```py
+from trivialai.stabdiff import StabDiff
+
+sd = StabDiff("http://127.0.0.1:7860")
+```
+
+If your WebUI is password-protected, pass `auth=("user", "password")`. The constructor performs
+a health-check against `/sdapi/v1/sd-models` on startup; pass `skip_healthcheck=True` to
+suppress this.
+
+Key constructor parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `webui_server` | `"http://127.0.0.1:7860"` | Base URL of the A1111 WebUI |
+| `model` | `None` | Default checkpoint name (overrides per-call) |
+| `timeout` | `300.0` | Generation request timeout in seconds |
+| `progress_poll_interval` | `0.5` | Seconds between progress polls during streaming |
+| `auth` | `None` | `(username, password)` tuple for basic auth |
+| `use_override_settings` | `True` | Apply model via `override_settings` (non-mutating) |
+| `include_previews` | `True` | Include in-progress preview images during streaming |
 
 ---
 
@@ -216,6 +244,72 @@ and **inference profile IDs** (`us.anthropic.claude-3-5-sonnet-20241022-v2:0`).
 Some models/regions require the region-prefixed profile ID. If you get a validation error
 about on-demand throughput, switch to the `us.` / `eu.` prefixed form.
 
+### Stable Diffusion (AUTOMATIC1111 WebUI) — image only
+
+`StabDiff` wraps the AUTOMATIC1111 WebUI REST API, routing to `/sdapi/v1/txt2img` or
+`/sdapi/v1/img2img` automatically based on whether an input image is provided.
+
+```py
+from trivialai.stabdiff import StabDiff
+
+sd = StabDiff("http://127.0.0.1:7860", model="realisticVisionV60B1_v51VAE.safetensors")
+
+# Text-to-image
+img = sd.generate_image("A fox in a moonlit forest, oil painting style")
+img.file()   # → '/tmp/trivialai-img-xxxx.png'
+
+# Image-to-image (pass any Picture, bytes, file path, or PIL image)
+edited = sd.generate_image("Add falling cherry blossoms", image=img)
+edited.file()
+```
+
+Any standard A1111 payload field can be passed as a keyword argument:
+
+```py
+img = sd.generate_image(
+    "Portrait of an astronaut, cinematic lighting",
+    steps=30,
+    width=768,
+    height=1024,
+    cfg_scale=7.5,
+    sampler_name="DPM++ 2M Karras",
+    negative_prompt="blurry, watermark, low quality",
+    seed=42,
+)
+```
+
+By default, the active checkpoint is changed non-destructively via `override_settings` —
+the WebUI's globally loaded model is left untouched after the request completes. To switch the
+globally loaded model instead, use `set_model`:
+
+```py
+sd.set_model("dreamshaper_8.safetensors")          # updates globally
+sd.set_model("another.safetensors", persist=False) # updates self.model only
+```
+
+#### Model and LoRA discovery
+
+```py
+>>> sd.models()
+['realisticVisionV60B1_v51VAE.safetensors', 'dreamshaper_8.safetensors', ...]
+
+>>> sd.loras()
+['add-detail-xl', 'epi_noiseoffset2', ...]
+```
+
+`models_full()` and `loras_full()` return the raw dicts from the WebUI API if you need
+additional metadata such as file paths or hashes.
+
+#### WebUI options
+
+```py
+# Read current WebUI options
+opts = sd.options()
+
+# Write one or more options
+sd.set_options(sd_vae="vae-ft-mse-840000-ema-pruned.safetensors")
+```
+
 ---
 
 ## Streaming (NDJSON-style events) via `BiStream`
@@ -301,6 +395,40 @@ client = bedrock.Bedrock(image_model_id="amazon.nova-canvas-v1:0", region="us-ea
 for ev in client.imagestream("A watercolour fox reading a book in an autumn forest"):
     if ev["type"] == "end":
         ev["image"].file("fox.png")
+```
+
+### Example: streaming image (Stable Diffusion)
+
+`StabDiff` provides real step-by-step progress from the A1111 progress API, including
+optional in-progress preview images.
+
+```py
+sd = StabDiff("http://127.0.0.1:7860")
+
+for ev in sd.imagestream("A misty mountain landscape at dawn, Studio Ghibli style"):
+    if ev["type"] == "progress":
+        pct = (ev["progress"] or 0) * 100
+        eta = ev.get("eta_relative") or 0
+        print(f"  {pct:.0f}%  ETA {eta:.1f}s  {ev.get('textinfo', '')}")
+        if ev.get("image"):          # live preview frame (if include_previews=True)
+            ev["image"].file("preview.png")
+    elif ev["type"] == "end":
+        ev["image"].file("result.png")
+    elif ev["type"] == "error":
+        print("Error:", ev["message"])
+```
+
+The progress event also carries a `"state"` dict with the raw A1111 job state, and a
+`"progress-error"` event type is emitted (non-fatally) if a single poll fails mid-generation.
+
+To cancel an in-progress generation, call `sd.interrupt()` (or `await sd.ainterrupt()` in
+async contexts). When using `imagestream` via an async generator, cancellation is handled
+automatically via `asyncio.CancelledError`.
+
+```py
+# Disable preview frames to reduce polling overhead
+for ev in sd.imagestream("...", include_previews=False):
+    ...
 ```
 
 ### Example: streaming text (async)
@@ -409,10 +537,13 @@ vec = embed("hello world")
 ## Notes & compatibility
 
 * **Dependencies:** `httpx` for HTTP providers; `boto3` for Bedrock; `google-genai` + optionally
-  `google-auth` for Gemini.
+  `google-auth` for Gemini. `StabDiff` uses only `httpx` — no extra install step needed.
 * **Scratchpad:** Ollama surfaces `<think>` content; Gemini routes native thought tokens;
   other providers emit `scratchpad=""` in deltas and `None` in the final `end`.
 * **`gcp` module removed:** the old `gcp.GCP` class (backed by `vertexai.generative_models`,
   deprecated June 2025) has been removed. Migrate to `gemini.Gemini` — it supports all three
   auth modes the old class did, plus image generation.
 * **BiStream:** single-use and single-consumer — don't consume the same instance from multiple tasks.
+* **StabDiff model selection:** by default the checkpoint is applied via `override_settings` so
+  the globally loaded WebUI model is never mutated. Set `use_override_settings=False` or call
+  `set_model(..., persist=True)` if you need to control the global state explicitly.
