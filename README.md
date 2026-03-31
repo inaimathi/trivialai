@@ -44,6 +44,14 @@ Use an [Anthropic Console](https://console.anthropic.com) API key directly:
 claude.Claude("claude-3-5-sonnet-20241022", os.environ["ANTHROPIC_API_KEY"])
 ```
 
+### DeepSeek
+
+Use a [DeepSeek Platform](https://platform.deepseek.com) API key:
+
+```py
+deepseek.DeepSeek("deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"])
+```
+
 ### OpenAI (ChatGPT)
 
 Use an [OpenAI Platform](https://platform.openai.com) API key:
@@ -125,6 +133,27 @@ Key constructor parameters:
 >>> client = claude.Claude("claude-3-5-sonnet-20240620", os.environ["ANTHROPIC_API_KEY"])
 >>> client.generate("sys msg", "Say hi with 'platypus'.").content
 "Hello, platypus!"
+```
+
+### DeepSeek
+
+```py
+>>> client = deepseek.DeepSeek("deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"])
+>>> client.generate("sys msg", "Say hi with 'platypus'.").content
+"Hello, platypus!"
+>>> client.generate_json("sys msg", "Return {'name': 'Platypus'} as JSON").content
+{'name': 'Platypus'}
+```
+
+The `deepseek-reasoner` model returns chain-of-thought tokens in a dedicated API field,
+which `trivialai` maps directly to `LLMResult.scratchpad` — no `<think>` tag parsing is
+performed:
+
+```py
+>>> reasoner = deepseek.DeepSeek("deepseek-reasoner", api_key=os.environ["DEEPSEEK_API_KEY"])
+>>> result = reasoner.generate("You are helpful.", "Prove that sqrt(2) is irrational.")
+>>> result.content     # final answer
+>>> result.scratchpad  # chain-of-thought
 ```
 
 ### ChatGPT (OpenAI API)
@@ -325,6 +354,7 @@ All providers expose a common streaming shape via `stream(...)`.
 * `{"type":"delta", "text":"...", "scratchpad":"..."}`
   * **Ollama**: `scratchpad` may contain content extracted from `<think>…</think>`.
   * **Gemini**: `scratchpad` carries native thought tokens (no tag parsing needed).
+  * **DeepSeek** (`deepseek-reasoner` only): `scratchpad` carries native `reasoning_content` tokens (no tag parsing needed).
   * Other providers: `scratchpad` is typically `""` in deltas.
 * `{"type":"end", "content":"...", "scratchpad": <str|None>, "tokens": <int|None>}`
 * `{"type":"error", "message":"..."}`
@@ -538,8 +568,10 @@ vec = embed("hello world")
 
 * **Dependencies:** `httpx` for HTTP providers; `boto3` for Bedrock; `google-genai` + optionally
   `google-auth` for Gemini. `StabDiff` uses only `httpx` — no extra install step needed.
-* **Scratchpad:** Ollama surfaces `<think>` content; Gemini routes native thought tokens;
-  other providers emit `scratchpad=""` in deltas and `None` in the final `end`.
+* **Scratchpad:** Ollama surfaces `<think>` content via tag parsing; Gemini and DeepSeek
+  (`deepseek-reasoner`) route native thought/reasoning tokens directly into `scratchpad`
+  without any tag parsing; other providers emit `scratchpad=""` in deltas and `None` in
+  the final `end`.
 * **`gcp` module removed:** the old `gcp.GCP` class (backed by `vertexai.generative_models`,
   deprecated June 2025) has been removed. Migrate to `gemini.Gemini` — it supports all three
   auth modes the old class did, plus image generation.
