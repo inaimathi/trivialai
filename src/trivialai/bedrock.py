@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 # Default text model — stored as a bare foundation-model ID (no geo-prefix).
 # The correct cross-region prefix ("us.", "eu.", "ap.") is prepended
 # automatically at construction time based on the `region` argument.
-_DEFAULT_TEXT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
+_DEFAULT_TEXT_MODEL = "anthropic.claude-3-5-haiku-20241022-v1:0"
 
 # ---------------------------------------------------------------------------
 # Cross-region inference profile helpers
@@ -110,53 +110,22 @@ _DEFAULT_TEXT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
 _GEO_PREFIXES = ("us.", "eu.", "ap.")
 
 
-def _region_to_geo_prefix(region: str) -> str:
-    """Map an AWS region string to its Bedrock inference-profile geo-prefix."""
+def _region_to_geo_prefix(region: str) -> Optional[str]:
+    """
+    Map an AWS region string to its Bedrock inference-profile geo-prefix,
+    or ``None`` if the region has no cross-region inference profile support.
+
+    Cross-region inference is only available from us-*, eu-*, and ap-* regions.
+    Other regions (ca-*, sa-*, me-*, af-*, il-*, …) must use bare foundation-
+    model IDs for models that are directly deployed there.
+    """
     if region.startswith("us-"):
         return "us"
     if region.startswith("eu-"):
         return "eu"
     if region.startswith("ap-"):
         return "ap"
-    # Other regions (e.g. ca-*, sa-*, me-*) don't have a dedicated prefix;
-    # "us" profiles are generally accessible from those regions.
-    logger.debug(
-        "No known geo-prefix for region %r; defaulting to 'us' for inference profiles.",
-        region,
-    )
-    return "us"
-
-
-def _apply_geo_prefix(model_id: str, region: str) -> str:
-    """
-    Ensure *model_id* carries the geo-prefix that matches *region*.
-
-    * If *model_id* already has a geo-prefix that matches the region → no-op.
-    * If *model_id* already has a geo-prefix that **doesn't** match → warn and
-      leave it unchanged (caller may have chosen deliberately).
-    * If *model_id* has no geo-prefix → prepend the correct one.
-
-    Bare foundation-model IDs (e.g. ``"anthropic.claude-3-5-haiku-20241022-v1:0"``)
-    and image / other model IDs that don't use cross-region profiles are returned
-    as-is when they carry no recognisable geo-prefix.
-    """
-    expected = _region_to_geo_prefix(region)
-    for prefix in _GEO_PREFIXES:
-        if model_id.startswith(prefix):
-            actual = prefix.rstrip(".")
-            if actual != expected:
-                logger.warning(
-                    "model_id %r has geo-prefix %r but region is %r (expected prefix %r). "
-                    "Leaving model_id unchanged — pass the correct prefix or omit it to "
-                    "have it set automatically.",
-                    model_id,
-                    prefix,
-                    region,
-                    expected + ".",
-                )
-            return model_id  # already prefixed — don't touch
-    # No geo-prefix present — prepend the one that matches the region.
-    return f"{expected}.{model_id}"
+    return None
 
 
 _DEFAULT_IMAGE_MODEL = "amazon.nova-canvas-v1:0"
@@ -357,6 +326,10 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     region:
         AWS region (default ``"us-east-1"``).  Also used to derive the
         geo-prefix (``"us."``, ``"eu."``, ``"ap."``) for inference profile IDs.
+        Cross-region inference profiles are only callable from ``us-*``,
+        ``eu-*``, and ``ap-*`` regions.  For other regions (e.g.
+        ``ca-central-1``) the geo-prefix is omitted and you must supply a bare
+        foundation-model ID that is directly deployed in that region.
     max_tokens, temperature, top_p:
         Text generation inference parameters.
     aws_bearer_token:
@@ -377,7 +350,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
 
     def __init__(
         self,
-        model_id: Optional[str] = _DEFAULT_TEXT_MODEL,
+        model_id: Optional[str] = None,
         *,
         image_model_id: Optional[str] = _DEFAULT_IMAGE_MODEL,
         region: str = "us-east-1",
@@ -395,12 +368,46 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         throttle_base_delay: float = 1.0,
         throttle_max_delay: float = 16.0,
     ):
-        # Prepend the geo-prefix that matches `region` when model_id is a bare
-        # foundation-model ID (no existing prefix).  Explicit prefixes that
-        # contradict `region` produce a warning but are left unchanged.
-        self.model_id = (
-            _apply_geo_prefix(model_id, region) if model_id is not None else None
-        )
+        geo_prefix = _region_to_geo_prefix(region)
+
+        if model_id is None:
+            # No model specified: use the default when the region supports
+            # cross-region inference profiles; otherwise stay in discovery-only
+            # mode (model_id=None) so the caller can inspect .inference_profile_ids()
+            # and construct a new instance with an explicit, valid model.
+            self._model_id: Optional[str] = (
+                f"{geo_prefix}.{_DEFAULT_TEXT_MODEL}"
+                if geo_prefix is not None
+                else None
+            )
+        else:
+            # User specified an explicit model ID — validate region compatibility
+            # eagerly so we fail at construction rather than mid-inference.
+            if geo_prefix is None:
+                raise ValueError(
+                    f"Region {region!r} does not support cross-region inference "
+                    f"profiles (only us-*, eu-*, and ap-* regions do). "
+                    f"Cannot use model_id {model_id!r} here. "
+                    f"Construct Bedrock(region={region!r}) without a model_id to "
+                    f"run discovery, then pick a model available in that region."
+                )
+            # Detect any existing geo-prefix on the supplied model ID.
+            existing_prefix = next(
+                (p.rstrip(".") for p in _GEO_PREFIXES if model_id.startswith(p)),
+                None,
+            )
+            if existing_prefix is not None and existing_prefix != geo_prefix:
+                raise ValueError(
+                    f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
+                    f"but region {region!r} expects {geo_prefix!r}. "
+                    f"Either change the region to match the prefix or supply a "
+                    f"bare model ID and let the prefix be added automatically."
+                )
+            self._model_id = (
+                model_id  # already carries the correct prefix
+                if existing_prefix is not None
+                else f"{geo_prefix}.{model_id}"
+            )
         self.image_model_id = image_model_id
         self.region = region
         self.max_tokens = max_tokens
@@ -524,7 +531,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     def _build_text_kwargs(self, system: str, prompt: str) -> Dict[str, Any]:
         messages = [{"role": "user", "content": [{"text": prompt}]}]
         kwargs: Dict[str, Any] = {
-            "modelId": self.model_id,
+            "modelId": self._model_id,
             "messages": messages,
         }
         if system:
@@ -542,10 +549,12 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     def generate(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> LLMResult:
-        if self.model_id is None:
+        if self._model_id is None:
             raise ValueError(
-                "model_id is not set; cannot run text generation. "
-                "Pass model_id= to the constructor."
+                "No model_id set — this instance is in discovery-only mode "
+                "(region has no cross-region inference profile support). "
+                "Call inference_profile_ids() to find a valid model, then "
+                "construct a new Bedrock instance with that model_id."
             )
         kwargs = self._build_text_kwargs(system, prompt)
         try:
@@ -566,14 +575,19 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     async def astream(
         self, system: str, prompt: str, images: Optional[list] = None
     ) -> AsyncIterator[Dict[str, Any]]:
-        if self.model_id is None:
+        if self._model_id is None:
             yield {
                 "type": "error",
-                "message": "model_id is not set; cannot run text generation.",
+                "message": (
+                    "No model_id set — this instance is in discovery-only mode "
+                    "(region has no cross-region inference profile support). "
+                    "Call inference_profile_ids() to find a valid model, then "
+                    "construct a new Bedrock instance with that model_id."
+                ),
             }
             return
 
-        yield {"type": "start", "provider": "bedrock", "model": self.model_id}
+        yield {"type": "start", "provider": "bedrock", "model": self._model_id}
 
         kwargs = self._build_text_kwargs(system, prompt)
         loop = asyncio.get_running_loop()

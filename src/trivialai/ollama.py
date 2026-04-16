@@ -18,7 +18,7 @@ class Ollama(LLMMixin, FilesystemMixin):
 
     def __init__(
         self,
-        model: str,
+        model: Optional[str] = None,
         ollama_server: Optional[str] = None,
         timeout: Optional[float] = 300.0,
         skip_healthcheck: bool = False,
@@ -26,7 +26,7 @@ class Ollama(LLMMixin, FilesystemMixin):
         close_think: Optional[str] = None,
     ):
         self.server = (ollama_server or "http://localhost:11434").rstrip("/")
-        self.model = model
+        self._model = model
         self.timeout = timeout
 
         # Per-instance override of think tags if provided.
@@ -51,23 +51,57 @@ class Ollama(LLMMixin, FilesystemMixin):
                 f"Ollama server at {self.server} responded with HTTP {tags_resp.status_code} for /api/tags"
             )
 
-        # 2) Model exists exactly as specified (no shorthands, no fallback)
+        # 2) Model exists exactly as specified (no shorthands, no fallback).
+        #    Skipped in discovery-only mode (model=None).
+        if self._model is None:
+            return
+
         try:
             show_resp = httpx.post(
                 f"{self.server}/api/show",
-                json={"name": self.model},
+                json={"name": self._model},
                 timeout=self.timeout,
             )
         except httpx.RequestError as e:
             raise ValueError(
-                f"Failed to query model '{self.model}' on {self.server}: {e}"
+                f"Failed to query model '{self._model}' on {self.server}: {e}"
             ) from e
 
         if show_resp.status_code != 200:
             raise ValueError(
-                f"Model '{self.model}' is not available on Ollama server {self.server} "
+                f"Model '{self._model}' is not available on Ollama server {self.server} "
                 f"(HTTP {show_resp.status_code} from /api/show)."
             )
+
+    def models(self) -> list[dict]:
+        """
+        Return a list of models available on the Ollama server.
+
+        Each entry is the raw dict from /api/tags, including at minimum:
+          ``name``       – model identifier (pass this to the constructor)
+          ``size``       – size on disk in bytes
+          ``details``    – family, parameter size, quantization level, etc.
+
+        Raises ``ValueError`` if the server is unreachable or returns a
+        non-200 response (same conditions as the startup healthcheck).
+        """
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.get(f"{self.server}/api/tags")
+        except httpx.RequestError as e:
+            raise ValueError(f"Cannot reach Ollama server at {self.server}: {e}") from e
+
+        if resp.status_code != 200:
+            raise ValueError(
+                f"Ollama server at {self.server} responded with "
+                f"HTTP {resp.status_code} for /api/tags"
+            )
+
+        return resp.json().get("models", [])
+
+    def model_names(self) -> list[str]:
+        """Convenience: return just the name strings from models()."""
+        return [m["name"] for m in self.models()]
 
     # ---- Sync full-generate (compat) ----
 
@@ -78,8 +112,14 @@ class Ollama(LLMMixin, FilesystemMixin):
         Non-streaming Ollama call via /api/generate with stream=False.
         Scratchpad (think-block) parsing delegated to LLMMixin.split_think_full.
         """
+        if self._model is None:
+            raise ValueError(
+                "No model set — this instance is in discovery-only mode. "
+                "Call model_names() to see available models, then construct "
+                "a new Ollama instance with the desired model name."
+            )
         data: Dict[str, Any] = {
-            "model": self.model,
+            "model": self._model,
             "stream": False,
             "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
         }
@@ -114,15 +154,26 @@ class Ollama(LLMMixin, FilesystemMixin):
         LLMMixin.stream(...) is responsible for splitting out think blocks
         into 'scratchpad' and cleaning the final 'content'.
         """
+        if self._model is None:
+            yield {
+                "type": "error",
+                "message": (
+                    "No model set — this instance is in discovery-only mode. "
+                    "Call model_names() to see available models, then construct "
+                    "a new Ollama instance with the desired model name."
+                ),
+            }
+            return
+
         payload: Dict[str, Any] = {
-            "model": self.model,
+            "model": self._model,
             "stream": True,
             "prompt": f"SYSTEM PROMPT: {system} PROMPT: {prompt}",
         }
         if images is not None:
             payload["images"] = [Picture.of(img).b64() for img in images]
 
-        yield {"type": "start", "provider": "ollama", "model": self.model}
+        yield {"type": "start", "provider": "ollama", "model": self._model}
 
         url = f"{self.server}/api/generate"
 

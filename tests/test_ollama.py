@@ -37,7 +37,7 @@ class FakeStreamOllama(Ollama):
           - route " Hi there" into content,
           - and generate the appropriate deltas/end event.
         """
-        yield {"type": "start", "provider": "ollama", "model": self.model}
+        yield {"type": "start", "provider": "ollama", "model": self._model}
 
         parts = ["<think>abc</think>", "Hi", " there"]
         for p in parts:
@@ -54,12 +54,48 @@ class TestOllama(unittest.TestCase):
     def test_constructor_normalizes_server(self):
         o = Ollama("mistral", "http://host:11434/", skip_healthcheck=True)
         self.assertEqual(o.server, "http://host:11434")
-        self.assertEqual(o.model, "mistral")
+        self.assertEqual(o._model, "mistral")
+
+    def test_model_is_private(self):
+        o = Ollama("mistral", skip_healthcheck=True)
+        self.assertFalse(
+            hasattr(o, "model"),
+            "model should be private (_model); no public attribute expected",
+        )
 
     def test_think_tags_configured(self):
         # Ollama should configure think boundaries for LLMMixin helpers
         self.assertEqual(Ollama.THINK_OPEN, "<think>")
         self.assertEqual(Ollama.THINK_CLOSE, "</think>")
+
+    # ------------------------------------------------------------------ #
+    # Discovery-only mode (model=None)                                     #
+    # ------------------------------------------------------------------ #
+
+    def test_no_model_gives_discovery_only_instance(self):
+        o = Ollama(ollama_server="http://example", skip_healthcheck=True)
+        self.assertIsNone(o._model)
+
+    def test_discovery_only_generate_raises(self):
+        o = Ollama(ollama_server="http://example", skip_healthcheck=True)
+        with self.assertRaises(ValueError) as ctx:
+            o.generate("sys", "prompt")
+        self.assertIn("discovery-only", str(ctx.exception))
+
+    def test_discovery_only_astream_yields_error(self):
+        o = Ollama(ollama_server="http://example", skip_healthcheck=True)
+
+        async def run():
+            return [e async for e in o.astream("sys", "prompt")]
+
+        events = asyncio.run(run())
+        types = [e["type"] for e in events]
+        self.assertIn("error", types)
+        self.assertNotIn("start", types)
+
+    # ------------------------------------------------------------------ #
+    # Streaming / scratchpad behaviour                                     #
+    # ------------------------------------------------------------------ #
 
     def test_stream_facade_includes_scratchpad_deltas(self):
         o = FakeStreamOllama()
