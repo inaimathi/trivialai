@@ -33,8 +33,12 @@ Usage
 -----
     from trivialai.bedrock import Bedrock
 
-    # Text only (original behaviour preserved)
-    b = Bedrock("anthropic.claude-3-5-sonnet-20241022-v2:0")
+    # Text only — bare model ID; "us." prefix is added automatically for us-east-1
+    b = Bedrock("anthropic.claude-3-5-haiku-20241022-v1:0")
+    result = b.generate("You are helpful.", "What is 2+2?")
+
+    # Explicit prefixed ID — used as-is; a warning is logged if it contradicts region
+    b = Bedrock("eu.anthropic.claude-3-5-haiku-20241022-v1:0", region="eu-west-1")
     result = b.generate("You are helpful.", "What is 2+2?")
 
     # Image only
@@ -49,12 +53,24 @@ Usage
     result = b.generate("system", "prompt")
     img    = b.imagen("a red panda")
 
+    # Long-term bearer token (AWS_BEARER_TOKEN_BEDROCK from the AWS console).
+    # SigV4 signing is skipped; the token is sent as an HTTP
+    # "Authorization: Bearer <token>" header on every request.
+    b = Bedrock(
+        model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        aws_bearer_token="<your-long-term-api-key>",
+    )
+    result = b.generate("system", "prompt")
+
     # Model discovery
     info = b.models()
-    # {"text": [{"model_id": ..., "name": ..., "provider": ...}, ...],
-    #  "image": [...]}
-    print(b.text_model_ids())    # ["anthropic.claude...", ...]
-    print(b.image_model_ids())   # ["amazon.nova-canvas-v1:0", ...]
+    # {"text": [...], "image": [...], "inference_profiles": [...]}
+    #
+    # Most newer models (Anthropic Claude 3.5+, etc.) cannot be called by their
+    # bare foundation-model ID — use an inference profile ID instead:
+    print(b.inference_profile_ids())  # ["us.anthropic.claude-3-5-haiku-20241022-v1:0", ...]
+    print(b.text_model_ids())         # foundation model IDs (often not directly callable)
+    print(b.image_model_ids())        # ["amazon.nova-canvas-v1:0", ...]
 """
 
 from __future__ import annotations
@@ -67,6 +83,8 @@ import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .filesystem import FilesystemMixin
@@ -79,7 +97,68 @@ logger = logging.getLogger(__name__)
 # Default model IDs
 # ---------------------------------------------------------------------------
 
-_DEFAULT_TEXT_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+# Default text model — stored as a bare foundation-model ID (no geo-prefix).
+# The correct cross-region prefix ("us.", "eu.", "ap.") is prepended
+# automatically at construction time based on the `region` argument.
+_DEFAULT_TEXT_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
+
+# ---------------------------------------------------------------------------
+# Cross-region inference profile helpers
+# ---------------------------------------------------------------------------
+
+# Geo-prefixes used by Bedrock cross-region inference profiles.
+_GEO_PREFIXES = ("us.", "eu.", "ap.")
+
+
+def _region_to_geo_prefix(region: str) -> str:
+    """Map an AWS region string to its Bedrock inference-profile geo-prefix."""
+    if region.startswith("us-"):
+        return "us"
+    if region.startswith("eu-"):
+        return "eu"
+    if region.startswith("ap-"):
+        return "ap"
+    # Other regions (e.g. ca-*, sa-*, me-*) don't have a dedicated prefix;
+    # "us" profiles are generally accessible from those regions.
+    logger.debug(
+        "No known geo-prefix for region %r; defaulting to 'us' for inference profiles.",
+        region,
+    )
+    return "us"
+
+
+def _apply_geo_prefix(model_id: str, region: str) -> str:
+    """
+    Ensure *model_id* carries the geo-prefix that matches *region*.
+
+    * If *model_id* already has a geo-prefix that matches the region → no-op.
+    * If *model_id* already has a geo-prefix that **doesn't** match → warn and
+      leave it unchanged (caller may have chosen deliberately).
+    * If *model_id* has no geo-prefix → prepend the correct one.
+
+    Bare foundation-model IDs (e.g. ``"anthropic.claude-3-5-haiku-20241022-v1:0"``)
+    and image / other model IDs that don't use cross-region profiles are returned
+    as-is when they carry no recognisable geo-prefix.
+    """
+    expected = _region_to_geo_prefix(region)
+    for prefix in _GEO_PREFIXES:
+        if model_id.startswith(prefix):
+            actual = prefix.rstrip(".")
+            if actual != expected:
+                logger.warning(
+                    "model_id %r has geo-prefix %r but region is %r (expected prefix %r). "
+                    "Leaving model_id unchanged — pass the correct prefix or omit it to "
+                    "have it set automatically.",
+                    model_id,
+                    prefix,
+                    region,
+                    expected + ".",
+                )
+            return model_id  # already prefixed — don't touch
+    # No geo-prefix present — prepend the one that matches the region.
+    return f"{expected}.{model_id}"
+
+
 _DEFAULT_IMAGE_MODEL = "amazon.nova-canvas-v1:0"
 
 
@@ -264,17 +343,32 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     ----------
     model_id:
         Foundation model or inference profile ID for **text** generation.
+        Newer models (Claude 3.5+, etc.) require a cross-region inference
+        profile ID such as ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``.
+        You may supply the bare foundation-model ID (without a geo-prefix) and
+        the correct prefix will be derived automatically from ``region``.  If
+        you supply a prefixed ID whose prefix contradicts ``region``, a warning
+        is logged and the ID is used as-is.
         Can be ``None`` if you only need image generation.
     image_model_id:
         Foundation model ID for **image** generation.
         Defaults to ``"amazon.nova-canvas-v1:0"`` (Nova Canvas).
         Can be ``None`` if you only need text generation.
     region:
-        AWS region (default ``"us-east-1"``).
+        AWS region (default ``"us-east-1"``).  Also used to derive the
+        geo-prefix (``"us."``, ``"eu."``, ``"ap."``) for inference profile IDs.
     max_tokens, temperature, top_p:
         Text generation inference parameters.
+    aws_bearer_token:
+        Long-term Bedrock API key (``AWS_BEARER_TOKEN_BEDROCK`` in the AWS
+        console).  When supplied, SigV4 request signing is disabled and every
+        request instead carries an ``Authorization: Bearer <token>`` header.
+        This is mutually exclusive with ``aws_profile`` /
+        ``aws_access_key_id`` / ``aws_secret_access_key``; if all are
+        provided, ``aws_bearer_token`` takes precedence.
     aws_profile, aws_access_key_id, aws_secret_access_key, aws_session_token:
-        Authentication (mirrors the original Bedrock class).
+        Standard IAM authentication (mirrors the original Bedrock class).
+        Ignored when ``aws_bearer_token`` is set.
     additional_model_fields:
         Extra fields forwarded to ``additionalModelRequestFields`` for text.
     retry_on_throttle, throttle_max_attempts, throttle_base_delay, throttle_max_delay:
@@ -290,6 +384,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         max_tokens: Optional[int] = 4096,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        aws_bearer_token: Optional[str] = None,
         aws_profile: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
@@ -300,7 +395,12 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         throttle_base_delay: float = 1.0,
         throttle_max_delay: float = 16.0,
     ):
-        self.model_id = model_id
+        # Prepend the geo-prefix that matches `region` when model_id is a bare
+        # foundation-model ID (no existing prefix).  Explicit prefixes that
+        # contradict `region` produce a warning but are left unchanged.
+        self.model_id = (
+            _apply_geo_prefix(model_id, region) if model_id is not None else None
+        )
         self.image_model_id = image_model_id
         self.region = region
         self.max_tokens = max_tokens
@@ -315,20 +415,46 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
 
         # ---- Build a shared boto3 session ----
         session_kwargs: Dict[str, Any] = {}
-        if aws_access_key_id and aws_secret_access_key:
-            session_kwargs["aws_access_key_id"] = aws_access_key_id
-            session_kwargs["aws_secret_access_key"] = aws_secret_access_key
-            if aws_session_token:
-                session_kwargs["aws_session_token"] = aws_session_token
-        elif aws_profile:
-            session_kwargs["profile_name"] = aws_profile
+        if not aws_bearer_token:
+            # Standard IAM auth: explicit keys beat a named profile.
+            if aws_access_key_id and aws_secret_access_key:
+                session_kwargs["aws_access_key_id"] = aws_access_key_id
+                session_kwargs["aws_secret_access_key"] = aws_secret_access_key
+                if aws_session_token:
+                    session_kwargs["aws_session_token"] = aws_session_token
+            elif aws_profile:
+                session_kwargs["profile_name"] = aws_profile
 
         session = boto3.Session(**session_kwargs)
 
-        # bedrock-runtime — used for both converse* (text) and invoke_model (image)
-        self._runtime = session.client("bedrock-runtime", region_name=region)
-        # bedrock (control plane) — used only for list_foundation_models
-        self._control = session.client("bedrock", region_name=region)
+        if aws_bearer_token:
+            # Bearer-token mode: disable SigV4 signing entirely and inject
+            # the token as an HTTP Authorization header on every request.
+            # botocore's UNSIGNED sentinel tells the signer to produce no
+            # auth headers, giving us a clean slate for our own header.
+            _unsigned = Config(signature_version=UNSIGNED)
+            self._runtime = session.client(
+                "bedrock-runtime", region_name=region, config=_unsigned
+            )
+            self._control = session.client(
+                "bedrock", region_name=region, config=_unsigned
+            )
+
+            _token = aws_bearer_token  # capture for the closure below
+
+            def _inject_bearer(request, **kwargs) -> None:  # type: ignore[type-arg]
+                request.headers["Authorization"] = f"Bearer {_token}"
+
+            # before-sign fires after the request is prepared but before any
+            # auth header is written — the right place to inject ours.
+            self._runtime.meta.events.register(
+                "before-sign.bedrock-runtime.*", _inject_bearer
+            )
+            self._control.meta.events.register("before-sign.bedrock.*", _inject_bearer)
+        else:
+            # Standard IAM / credential-chain mode.
+            self._runtime = session.client("bedrock-runtime", region_name=region)
+            self._control = session.client("bedrock", region_name=region)
 
         # Precompute inference config for text requests.
         inference_config: Dict[str, Any] = {}
@@ -700,36 +826,58 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
     # Model discovery
     # ------------------------------------------------------------------
 
-    def models(self) -> Dict[str, List[Dict[str, Any]]]:
+    def models(self, active_only: bool = True) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Return a dict with ``"text"`` and ``"image"`` keys, each containing
-        a list of model summary dicts available in the current region.
+        Return a dict with ``"text"``, ``"image"``, and ``"inference_profiles"``
+        keys describing models available in the current region.
 
-        Each entry has:
-          ``model_id``   – the ID to pass to the constructor or per-call
+        Parameters
+        ----------
+        active_only:
+            When ``True`` (the default) only entries with ``status == "ACTIVE"``
+            are returned, filtering out ``"LEGACY"`` and ``"DEPRECATED"`` models
+            that AWS will reject at invocation time.  Pass ``False`` to see the
+            full catalogue.
+
+        ``"text"`` / ``"image"``
+            Foundation model summaries from ``ListFoundationModels``.
+            **Note:** most newer Anthropic (and other) models cannot be invoked
+            directly by their foundation-model ID — you must use an inference
+            profile ID instead.  See ``"inference_profiles"`` below.
+
+        ``"inference_profiles"``
+            System-defined cross-region inference profiles from
+            ``ListInferenceProfiles``.  These are the IDs you should actually
+            pass to the constructor (e.g. ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``).
+            Each entry has:
+              ``profile_id``  – the ID to pass to the constructor
+              ``name``        – human-readable profile name
+              ``models``      – list of underlying foundation-model ARNs
+              ``status``      – ``"ACTIVE"`` | ``"INACTIVE"``
+              ``type``        – ``"SYSTEM_DEFINED"`` | ``"APPLICATION"``
+
+        Each foundation-model entry has:
+          ``model_id``   – the ID (may not be directly invocable; prefer inference profiles)
           ``name``       – human-readable model name
           ``provider``   – provider name (e.g. "Amazon", "Anthropic", ...)
           ``input``      – list of input modalities  (e.g. ["TEXT", "IMAGE"])
           ``output``     – list of output modalities (e.g. ["TEXT"])
           ``streaming``  – bool, whether the model supports streaming
-          ``status``     – "ACTIVE" | "LEGACY" | "DEPRECATED" (when present)
+          ``status``     – "ACTIVE" | "LEGACY" | "DEPRECATED"
 
-        Example::
-
-            b = Bedrock()
-            info = b.models()
-            print(info["image"])   # list of image-capable model dicts
-            print(info["text"])    # list of text-capable model dicts
-
-        Note: this calls the Bedrock *control-plane* API (``bedrock``, not
-        ``bedrock-runtime``), which requires the ``bedrock:ListFoundationModels``
-        IAM permission.
+        Note: requires ``bedrock:ListFoundationModels`` and
+        ``bedrock:ListInferenceProfiles`` IAM permissions.
         """
 
-        def _summarise(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        def _summarise_foundation(
+            summaries: List[Dict[str, Any]]
+        ) -> List[Dict[str, Any]]:
             out = []
             for s in summaries:
                 status_info = s.get("modelLifecycle") or {}
+                status = status_info.get("status", "ACTIVE")
+                if active_only and status != "ACTIVE":
+                    continue
                 out.append(
                     {
                         "model_id": s.get("modelId", ""),
@@ -738,7 +886,28 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
                         "input": s.get("inputModalities", []),
                         "output": s.get("outputModalities", []),
                         "streaming": s.get("responseStreamingSupported", False),
-                        "status": status_info.get("status", "ACTIVE"),
+                        "status": status,
+                    }
+                )
+            return out
+
+        def _summarise_profiles(
+            summaries: List[Dict[str, Any]]
+        ) -> List[Dict[str, Any]]:
+            out = []
+            for s in summaries:
+                status = s.get("status", "ACTIVE")
+                if active_only and status != "ACTIVE":
+                    continue
+                out.append(
+                    {
+                        "profile_id": s.get("inferenceProfileId", ""),
+                        "name": s.get("inferenceProfileName", ""),
+                        "models": [
+                            m.get("modelArn", "") for m in (s.get("models") or [])
+                        ],
+                        "status": status,
+                        "type": s.get("type", "SYSTEM_DEFINED"),
                     }
                 )
             return out
@@ -746,15 +915,44 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         text_resp = self._control.list_foundation_models(byOutputModality="TEXT")
         image_resp = self._control.list_foundation_models(byOutputModality="IMAGE")
 
+        try:
+            profile_resp = self._control.list_inference_profiles(
+                typeEquals="SYSTEM_DEFINED"
+            )
+            profiles = _summarise_profiles(
+                profile_resp.get("inferenceProfileSummaries", [])
+            )
+        except (BotoCoreError, ClientError) as e:
+            logger.warning("Could not list inference profiles: %s", e)
+            profiles = []
+
         return {
-            "text": _summarise(text_resp.get("modelSummaries", [])),
-            "image": _summarise(image_resp.get("modelSummaries", [])),
+            "text": _summarise_foundation(text_resp.get("modelSummaries", [])),
+            "image": _summarise_foundation(image_resp.get("modelSummaries", [])),
+            "inference_profiles": profiles,
         }
 
-    def text_model_ids(self) -> List[str]:
+    def text_model_ids(self, active_only: bool = True) -> List[str]:
         """Convenience: return just the model ID strings for text-output models."""
-        return [m["model_id"] for m in self.models()["text"]]
+        return [m["model_id"] for m in self.models(active_only=active_only)["text"]]
 
-    def image_model_ids(self) -> List[str]:
+    def image_model_ids(self, active_only: bool = True) -> List[str]:
         """Convenience: return just the model ID strings for image-output models."""
-        return [m["model_id"] for m in self.models()["image"]]
+        return [m["model_id"] for m in self.models(active_only=active_only)["image"]]
+
+    def inference_profile_ids(self, active_only: bool = True) -> List[str]:
+        """
+        Convenience: return the profile ID strings for all system-defined
+        cross-region inference profiles.
+
+        These are the IDs you should pass to the constructor for text
+        generation with newer models, e.g.::
+
+            b = Bedrock()
+            print(b.inference_profile_ids())
+            # ['us.amazon.nova-lite-v1:0', 'us.anthropic.claude-3-5-haiku-20241022-v1:0', ...]
+        """
+        return [
+            p["profile_id"]
+            for p in self.models(active_only=active_only)["inference_profiles"]
+        ]
