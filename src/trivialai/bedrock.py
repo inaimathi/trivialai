@@ -107,7 +107,7 @@ _DEFAULT_TEXT_MODEL = "anthropic.claude-3-5-haiku-20241022-v1:0"
 # ---------------------------------------------------------------------------
 
 # Geo-prefixes used by Bedrock cross-region inference profiles.
-_GEO_PREFIXES = ("us.", "eu.", "ap.")
+_GEO_PREFIXES = ("us.", "eu.", "ap.", "global.")
 
 
 def _region_to_geo_prefix(region: str) -> Optional[str]:
@@ -118,6 +118,11 @@ def _region_to_geo_prefix(region: str) -> Optional[str]:
     Cross-region inference is only available from us-*, eu-*, and ap-* regions.
     Other regions (ca-*, sa-*, me-*, af-*, il-*, …) must use bare foundation-
     model IDs for models that are directly deployed there.
+
+    Note: ``"global."`` is a valid prefix (for globally-routed profiles such as
+    ``global.anthropic.claude-sonnet-4-20250514-v1:0``) but does not correspond
+    to any specific region and is therefore not returned here — it is handled
+    separately in the constructor.
     """
     if region.startswith("us-"):
         return "us"
@@ -324,12 +329,15 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         Defaults to ``"amazon.nova-canvas-v1:0"`` (Nova Canvas).
         Can be ``None`` if you only need text generation.
     region:
-        AWS region (default ``"us-east-1"``).  Also used to derive the
-        geo-prefix (``"us."``, ``"eu."``, ``"ap."``) for inference profile IDs.
-        Cross-region inference profiles are only callable from ``us-*``,
-        ``eu-*``, and ``ap-*`` regions.  For other regions (e.g.
+        AWS region (default ``"us-east-1"`` when omitted).  Also used to
+        derive the geo-prefix (``"us."``, ``"eu."``, ``"ap."``) for inference
+        profile IDs.  Cross-region inference profiles are only callable from
+        ``us-*``, ``eu-*``, and ``ap-*`` regions; for other regions (e.g.
         ``ca-central-1``) the geo-prefix is omitted and you must supply a bare
         foundation-model ID that is directly deployed in that region.
+        Passing an explicit ``region`` together with a ``global.`` profile ID
+        is an error — global profiles are region-agnostic and should be used
+        *instead of* specifying a region.
     max_tokens, temperature, top_p:
         Text generation inference parameters.
     aws_bearer_token:
@@ -353,7 +361,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         model_id: Optional[str] = None,
         *,
         image_model_id: Optional[str] = _DEFAULT_IMAGE_MODEL,
-        region: str = "us-east-1",
+        region: Optional[str] = None,
         max_tokens: Optional[int] = 4096,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -368,6 +376,8 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         throttle_base_delay: float = 1.0,
         throttle_max_delay: float = 16.0,
     ):
+        region_explicit = region is not None
+        region = region or "us-east-1"
         geo_prefix = _region_to_geo_prefix(region)
 
         if model_id is None:
@@ -381,33 +391,54 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
                 else None
             )
         else:
-            # User specified an explicit model ID — validate region compatibility
-            # eagerly so we fail at construction rather than mid-inference.
-            if geo_prefix is None:
-                raise ValueError(
-                    f"Region {region!r} does not support cross-region inference "
-                    f"profiles (only us-*, eu-*, and ap-* regions do). "
-                    f"Cannot use model_id {model_id!r} here. "
-                    f"Construct Bedrock(region={region!r}) without a model_id to "
-                    f"run discovery, then pick a model available in that region."
-                )
             # Detect any existing geo-prefix on the supplied model ID.
             existing_prefix = next(
-                (p.rstrip(".") for p in _GEO_PREFIXES if model_id.startswith(p)),
-                None,
+                (p.rstrip(".") for p in _GEO_PREFIXES if model_id.startswith(p)), None
             )
-            if existing_prefix is not None and existing_prefix != geo_prefix:
-                raise ValueError(
-                    f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
-                    f"but region {region!r} expects {geo_prefix!r}. "
-                    f"Either change the region to match the prefix or supply a "
-                    f"bare model ID and let the prefix be added automatically."
-                )
-            self._model_id = (
-                model_id  # already carries the correct prefix
-                if existing_prefix is not None
-                else f"{geo_prefix}.{model_id}"
-            )
+
+            if existing_prefix == "global":
+                # global. profiles are region-agnostic — they should be used
+                # *instead of* specifying a region, not alongside one.
+                if region_explicit:
+                    raise ValueError(
+                        f"model_id {model_id!r} is a global profile and cannot be "
+                        f"combined with an explicit region argument. "
+                        f"Either drop region= or use a regional profile ID "
+                        f"(e.g. 'us.anthropic.…') that matches your region."
+                    )
+                self._model_id = model_id
+
+            elif existing_prefix is not None:
+                # Regional prefix (us./eu./ap.) — must be consistent with region.
+                if geo_prefix is None:
+                    raise ValueError(
+                        f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
+                        f"but region {region!r} does not support cross-region "
+                        f"inference profiles (only us-*, eu-*, and ap-* do). "
+                        f"Use a global. profile or a bare foundation-model ID "
+                        f"available in that region."
+                    )
+                if existing_prefix != geo_prefix:
+                    raise ValueError(
+                        f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
+                        f"but region {region!r} expects {geo_prefix!r}. "
+                        f"Either change the region to match the prefix, supply a "
+                        f"bare model ID and let the prefix be added automatically, "
+                        f"or use a global. profile ID."
+                    )
+                self._model_id = model_id
+
+            else:
+                # No prefix on the supplied model ID — derive from region.
+                if geo_prefix is None:
+                    raise ValueError(
+                        f"Region {region!r} does not support cross-region inference "
+                        f"profiles (only us-*, eu-*, and ap-* regions do). "
+                        f"Cannot use model_id {model_id!r} here. "
+                        f"Construct Bedrock(region={region!r}) without a model_id to "
+                        f"run discovery, then pick a model available in that region."
+                    )
+                self._model_id = f"{geo_prefix}.{model_id}"
         self.image_model_id = image_model_id
         self.region = region
         self.max_tokens = max_tokens
@@ -560,6 +591,17 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         try:
             resp = self._backoff_call(self._runtime.converse, **kwargs)
         except (BotoCoreError, ClientError) as e:
+            # Permanent access/validation errors indicate a misconfigured model
+            # and should be raised immediately rather than silently returned as
+            # LLMResult(content=None) — which looks identical to an empty response.
+            if isinstance(e, ClientError):
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in (
+                    "ResourceNotFoundException",
+                    "ValidationException",
+                    "AccessDeniedException",
+                ):
+                    raise
             return LLMResult(raw=e, content=None, scratchpad=None)
 
         content_blocks = resp.get("output", {}).get("message", {}).get("content", [])
@@ -848,10 +890,14 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         Parameters
         ----------
         active_only:
-            When ``True`` (the default) only entries with ``status == "ACTIVE"``
-            are returned, filtering out ``"LEGACY"`` and ``"DEPRECATED"`` models
-            that AWS will reject at invocation time.  Pass ``False`` to see the
-            full catalogue.
+            When ``True`` (the default) only usable entries are returned.
+            For foundation models this means ``modelLifecycle.status == "ACTIVE"``.
+            For inference profiles, AWS always reports ``status: "ACTIVE"``
+            regardless of the underlying model's lifecycle state, so profiles
+            are instead filtered by cross-referencing their model ARNs against
+            the set of active foundation models — profiles backed entirely by
+            active models are included; those backed by any legacy or deprecated
+            model are excluded.  Pass ``False`` to see the full catalogue.
 
         ``"text"`` / ``"image"``
             Foundation model summaries from ``ListFoundationModels``.
@@ -861,13 +907,15 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
 
         ``"inference_profiles"``
             System-defined cross-region inference profiles from
-            ``ListInferenceProfiles``.  These are the IDs you should actually
-            pass to the constructor (e.g. ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``).
+            ``ListInferenceProfiles``, filtered (when ``active_only=True``) to
+            those backed exclusively by active foundation models.  These are the
+            IDs you should actually pass to the constructor (e.g.
+            ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``).
             Each entry has:
               ``profile_id``  – the ID to pass to the constructor
               ``name``        – human-readable profile name
               ``models``      – list of underlying foundation-model ARNs
-              ``status``      – ``"ACTIVE"`` | ``"INACTIVE"``
+              ``status``      – ``"ACTIVE"`` | ``"INACTIVE"`` (from AWS)
               ``type``        – ``"SYSTEM_DEFINED"`` | ``"APPLICATION"``
 
         Each foundation-model entry has:
@@ -883,13 +931,19 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         ``bedrock:ListInferenceProfiles`` IAM permissions.
         """
 
+        def _model_id_from_arn(arn: str) -> str:
+            # ARN format: arn:aws:bedrock:REGION::foundation-model/MODEL_ID
+            return arn.split("/", 1)[-1] if "/" in arn else arn
+
+        def _lifecycle_status(summary: Dict[str, Any]) -> str:
+            return (summary.get("modelLifecycle") or {}).get("status", "ACTIVE")
+
         def _summarise_foundation(
             summaries: List[Dict[str, Any]]
         ) -> List[Dict[str, Any]]:
             out = []
             for s in summaries:
-                status_info = s.get("modelLifecycle") or {}
-                status = status_info.get("status", "ACTIVE")
+                status = _lifecycle_status(s)
                 if active_only and status != "ACTIVE":
                     continue
                 out.append(
@@ -906,43 +960,61 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             return out
 
         def _summarise_profiles(
-            summaries: List[Dict[str, Any]]
+            summaries: List[Dict[str, Any]],
+            active_model_ids: Optional[set],
         ) -> List[Dict[str, Any]]:
             out = []
             for s in summaries:
-                status = s.get("status", "ACTIVE")
-                if active_only and status != "ACTIVE":
-                    continue
+                arns = [m.get("modelArn", "") for m in (s.get("models") or [])]
+                if active_model_ids is not None:
+                    # Include only profiles whose every underlying model is active.
+                    if not all(
+                        _model_id_from_arn(arn) in active_model_ids for arn in arns
+                    ):
+                        continue
                 out.append(
                     {
                         "profile_id": s.get("inferenceProfileId", ""),
                         "name": s.get("inferenceProfileName", ""),
-                        "models": [
-                            m.get("modelArn", "") for m in (s.get("models") or [])
-                        ],
-                        "status": status,
+                        "models": arns,
+                        "status": s.get("status", "ACTIVE"),
                         "type": s.get("type", "SYSTEM_DEFINED"),
                     }
                 )
             return out
 
-        text_resp = self._control.list_foundation_models(byOutputModality="TEXT")
-        image_resp = self._control.list_foundation_models(byOutputModality="IMAGE")
+        # Fetch all foundation models unconditionally — we need the full set to
+        # build the active-ID lookup used for profile cross-referencing, even
+        # when active_only=True filters what we return to the caller.
+        text_summaries = self._control.list_foundation_models(
+            byOutputModality="TEXT"
+        ).get("modelSummaries", [])
+        image_summaries = self._control.list_foundation_models(
+            byOutputModality="IMAGE"
+        ).get("modelSummaries", [])
+
+        # Build the set of active foundation-model IDs for profile filtering.
+        active_model_ids: Optional[set] = None
+        if active_only:
+            all_summaries = {
+                s["modelId"]: s for s in text_summaries + image_summaries
+            }.values()
+            active_model_ids = {
+                s["modelId"] for s in all_summaries if _lifecycle_status(s) == "ACTIVE"
+            }
 
         try:
-            profile_resp = self._control.list_inference_profiles(
+            profile_summaries = self._control.list_inference_profiles(
                 typeEquals="SYSTEM_DEFINED"
-            )
-            profiles = _summarise_profiles(
-                profile_resp.get("inferenceProfileSummaries", [])
-            )
+            ).get("inferenceProfileSummaries", [])
+            profiles = _summarise_profiles(profile_summaries, active_model_ids)
         except (BotoCoreError, ClientError) as e:
             logger.warning("Could not list inference profiles: %s", e)
             profiles = []
 
         return {
-            "text": _summarise_foundation(text_resp.get("modelSummaries", [])),
-            "image": _summarise_foundation(image_resp.get("modelSummaries", [])),
+            "text": _summarise_foundation(text_summaries),
+            "image": _summarise_foundation(image_summaries),
             "inference_profiles": profiles,
         }
 

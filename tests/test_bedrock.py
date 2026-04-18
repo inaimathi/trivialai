@@ -139,7 +139,7 @@ class TestBedrockConstructor(unittest.TestCase):
         self.assertIn("ca-central-1", str(ctx.exception))
 
     def test_explicit_prefixed_id_unsupported_region_raises(self):
-        # Even an already-prefixed ID is rejected in unsupported regions.
+        # A regional prefix (us./eu./ap.) is rejected in unsupported regions.
         with self.assertRaises(ValueError):
             _make_bedrock(
                 model_id="us.anthropic.claude-3-5-haiku-20241022-v1:0",
@@ -155,6 +155,26 @@ class TestBedrockConstructor(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("eu", msg)
         self.assertIn("us", msg)
+
+    # ------------------------------------------------------------------ #
+    # global. prefix — accepted only when region is not explicitly set    #
+    # ------------------------------------------------------------------ #
+
+    def test_global_prefix_accepted_without_region(self):
+        b, _, _ = _make_bedrock(
+            model_id="global.anthropic.claude-sonnet-4-20250514-v1:0",
+        )
+        self.assertEqual(b._model_id, "global.anthropic.claude-sonnet-4-20250514-v1:0")
+
+    def test_global_prefix_with_explicit_region_raises(self):
+        for region in ("us-east-1", "eu-west-1", "ca-central-1"):
+            with self.subTest(region=region):
+                with self.assertRaises(ValueError) as ctx:
+                    _make_bedrock(
+                        model_id="global.anthropic.claude-sonnet-4-20250514-v1:0",
+                        region=region,
+                    )
+                self.assertIn("global", str(ctx.exception))
 
     def test_model_id_is_private(self):
         b, _, _ = _make_bedrock()
@@ -260,9 +280,26 @@ class TestBedrockGenerate(unittest.TestCase):
         kw = self.mock_runtime.converse.call_args.kwargs
         self.assertEqual(kw["modelId"], self.b._model_id)
 
-    def test_client_error_returns_llmresult_with_none_content(self):
+    def test_permanent_client_error_raises(self):
+        # ResourceNotFoundException / ValidationException / AccessDeniedException
+        # indicate a misconfigured model and should raise rather than silently
+        # returning LLMResult(content=None).
+        for code in (
+            "ResourceNotFoundException",
+            "ValidationException",
+            "AccessDeniedException",
+        ):
+            with self.subTest(code=code):
+                self.mock_runtime.converse.side_effect = _client_error(code)
+                with self.assertRaises(ClientError) as ctx:
+                    self.b.generate("sys", "prompt")
+                self.assertEqual(ctx.exception.response["Error"]["Code"], code)
+
+    def test_transient_client_error_returns_llmresult_with_none_content(self):
+        # Transient/unexpected errors still return LLMResult so callers can
+        # inspect .raw without crashing.
         self.mock_runtime.converse.side_effect = _client_error(
-            "ResourceNotFoundException"
+            "ServiceUnavailableException"
         )
         result = self.b.generate("sys", "prompt")
         self.assertIsNone(result.content)
@@ -394,6 +431,9 @@ class TestBedrockModels(unittest.TestCase):
         "responseStreamingSupported": True,
         "modelLifecycle": {"status": "LEGACY"},
     }
+    # AWS always returns status="ACTIVE" on inference profiles regardless of
+    # whether the underlying model is still accessible — the real filtering has
+    # to be done by cross-referencing against foundation-model lifecycle status.
     _ACTIVE_PROFILE = {
         "inferenceProfileId": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
         "inferenceProfileName": "US Claude 3.5 Haiku",
@@ -405,7 +445,9 @@ class TestBedrockModels(unittest.TestCase):
         "status": "ACTIVE",
         "type": "SYSTEM_DEFINED",
     }
-    _INACTIVE_PROFILE = {
+    # This profile is backed by a legacy model but AWS still reports ACTIVE.
+    # Our code must catch it via cross-reference, not by trusting the status field.
+    _LEGACY_BACKED_PROFILE = {
         "inferenceProfileId": "us.anthropic.claude-3-haiku-20240307-v1:0",
         "inferenceProfileName": "US Claude 3 Haiku",
         "models": [
@@ -413,7 +455,7 @@ class TestBedrockModels(unittest.TestCase):
                 "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
             }
         ],
-        "status": "INACTIVE",
+        "status": "ACTIVE",  # AWS lie — the underlying model is LEGACY
         "type": "SYSTEM_DEFINED",
     }
 
@@ -423,7 +465,10 @@ class TestBedrockModels(unittest.TestCase):
             "modelSummaries": [self._ACTIVE_FOUNDATION, self._LEGACY_FOUNDATION]
         }
         self.mock_control.list_inference_profiles.return_value = {
-            "inferenceProfileSummaries": [self._ACTIVE_PROFILE, self._INACTIVE_PROFILE]
+            "inferenceProfileSummaries": [
+                self._ACTIVE_PROFILE,
+                self._LEGACY_BACKED_PROFILE,
+            ]
         }
 
     def test_active_only_excludes_legacy_foundation_models(self):
@@ -437,13 +482,16 @@ class TestBedrockModels(unittest.TestCase):
         ids = [m["model_id"] for m in result["text"]]
         self.assertIn("anthropic.claude-3-haiku-20240307-v1:0", ids)
 
-    def test_active_only_excludes_inactive_profiles(self):
+    def test_active_only_excludes_profiles_backed_by_legacy_models(self):
+        # The key regression: profiles for legacy models report status=ACTIVE
+        # from AWS, so filtering by status alone is insufficient.  We must
+        # cross-reference against foundation-model lifecycle status.
         result = self.b.models(active_only=True)
         ids = [p["profile_id"] for p in result["inference_profiles"]]
         self.assertIn("us.anthropic.claude-3-5-haiku-20241022-v1:0", ids)
         self.assertNotIn("us.anthropic.claude-3-haiku-20240307-v1:0", ids)
 
-    def test_active_only_false_includes_inactive_profiles(self):
+    def test_active_only_false_includes_legacy_backed_profiles(self):
         result = self.b.models(active_only=False)
         ids = [p["profile_id"] for p in result["inference_profiles"]]
         self.assertIn("us.anthropic.claude-3-haiku-20240307-v1:0", ids)
@@ -463,6 +511,7 @@ class TestBedrockModels(unittest.TestCase):
         self.assertIn("inference_profiles", result)
 
     def test_list_inference_profiles_failure_returns_empty_list(self):
+        # Missing IAM permission should degrade gracefully, not raise.
         self.mock_control.list_inference_profiles.side_effect = _client_error(
             "AccessDeniedException"
         )
