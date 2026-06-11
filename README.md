@@ -28,6 +28,19 @@ pip install trivialai
 >>> from trivialai.stabdiff import StabDiff
 ```
 
+Provider classes (and common helpers like `force`, `BiStream`, `LLMResult`, `Picture`) are
+also available as lazy top-level exports — `import trivialai` never imports boto3 /
+google-genai / pillow; the cost is paid only when the corresponding attribute is first
+touched:
+
+```py
+>>> import trivialai
+>>> m = trivialai.Ollama("gemma2:2b", "http://localhost:11434/")
+```
+
+If you'd rather pick models from configuration than name classes in code, see
+[Configuration-driven model selection](#configuration-driven-model-selection) below.
+
 > **Note:** The legacy `gcp` module (backed by `vertexai.generative_models`) has been removed.
 > Use `gemini.Gemini` instead — it supports both the Gemini Developer API and Vertex AI,
 > and provides text *and* image generation through a single client.
@@ -112,6 +125,119 @@ Key constructor parameters:
 | `auth` | `None` | `(username, password)` tuple for basic auth |
 | `use_override_settings` | `True` | Apply model via `override_settings` (non-mutating) |
 | `include_previews` | `True` | Include in-progress preview images during streaming |
+
+---
+
+## Configuration-driven model selection
+
+Services often want to say "I need a text model" or "I need an image model" — and have
+*which* model that is be a deployment decision (env vars in a `docker-compose` file),
+not a code change. The `text` / `image` factories plus `from_env` provide exactly that:
+
+```py
+import trivialai
+
+mcompiler   = trivialai.text(trivialai.from_env("compiler_"))
+msummarizer = trivialai.text(trivialai.from_env("summarizer_"))
+mdiagram    = trivialai.image(trivialai.from_env("diagram_"))
+```
+
+with the matching environment (e.g. in `docker-compose`):
+
+```yaml
+environment:
+  compiler_PROVIDER: ollama
+  compiler_MODEL: qwen-coder:latest
+  compiler_OLLAMA_SERVER: http://host.docker.internal:11434/
+  compiler_SKIP_HEALTHCHECK: "false"
+
+  summarizer_PROVIDER: bedrock
+  summarizer_MODEL_ID: us.anthropic.claude-3-5-sonnet-20241022-v2:0
+  summarizer_AWS_BEARER_TOKEN: ${AWS_BEARER_TOKEN_BEDROCK}
+  summarizer_MAX_TOKENS: "8192"
+```
+
+Swapping a role from a local Ollama model to Bedrock (or anything else) is then purely a
+config edit — no code changes.
+
+### The convention
+
+For a role prefix like `compiler_`, the variables are:
+
+* `{prefix}PROVIDER` — one of the registered provider names
+  (`ollama`, `claude`, `chatgpt` / `openai`, `deepseek`, `bedrock`, `gemini`, `stabdiff`),
+  case-insensitive.
+* `{prefix}{CAPITALIZED_CONSTRUCTOR_ARG}` — every other variable is the **literal
+  constructor parameter name** of that provider class, capitalized. There is no mapping
+  table: `compiler_OLLAMA_SERVER` ↔ `Ollama(ollama_server=...)`,
+  `summarizer_MODEL_ID` ↔ `Bedrock(model_id=...)`. The constructor signature *is* the
+  schema, and `env_schema` (below) will print it for you.
+
+`from_env("compiler_")` matches the prefix exactly; `from_env("compiler")` (no trailing
+underscore) accepts both `compiler_X` and `compilerX` — and raises if the same key is
+reachable both ways, so a setting can never have two sources.
+
+### Rules (deliberately strict)
+
+* **No defaults, loud errors.** Neither `from_env` nor `text` / `image` invents values.
+  Every problem — unknown provider, missing or unknown constructor parameter, bad value —
+  raises `trivialai.ConfigError` with a specific, actionable message (including
+  did-you-mean suggestions and the accepted parameter list). Catch it at startup, log,
+  exit nonzero; it always means the deployed configuration needs fixing, not the code.
+* **Empty values are unset values.** `compiler_MODEL=` is identical to the variable not
+  existing. This applies to booleans too: to turn a flag off explicitly, say `false`.
+* **Coercion follows the constructor's type annotations.** `"8192"` → `int`, `"0.2"` →
+  `float`, `"true"` / `"false"` (case-insensitive, nothing else accepted) → `bool`.
+  Parameters annotated as `dict` / `list` / `tuple` accept JSON-encoded strings:
+  `compiler_SAFETY_SETTINGS={"hate_speech": "none"}`. Non-string values (from `default=`
+  or `CONFIG_FILE`, below) pass through untouched.
+* **Bundle-level defaults only.** `from_env(prefix, default={...})` returns the default
+  dict verbatim when the prefix matches *nothing*, and ignores it entirely otherwise.
+  Configs are never merged across sources, so a provider swap can never produce a
+  half-ollama-half-bedrock hybrid.
+* **`{prefix}CONFIG_FILE` escape hatch.** Point it at a JSON file containing an object of
+  constructor parameters (plus `provider`); the file acts as the base config and
+  individual env vars under the same prefix override its keys. Useful for structured
+  parameters that are awkward as flat env vars.
+* **Construction is fail-fast by design.** Providers that health-check or build clients
+  in their constructors (Ollama, Bedrock) do so when `text()` / `image()` runs — i.e. at
+  service startup. If a dependency is allowed to come up later, that's what
+  `{prefix}SKIP_HEALTHCHECK=true` is for.
+
+### Discovery
+
+```py
+>>> trivialai.providers()       # zero-import: nothing heavy is loaded
+[{'provider': 'bedrock', 'class': 'Bedrock', 'capabilities': ['image', 'text']},
+ {'provider': 'ollama',  'class': 'Ollama',  'capabilities': ['text']}, ...]
+
+>>> for row in trivialai.env_schema("ollama", prefix="compiler_"):
+...     print(row["env_var"], "—", row["type"], "(required)" if row["required"] else "")
+compiler_PROVIDER — str (required)
+compiler_MODEL — str
+compiler_OLLAMA_SERVER — str
+compiler_SKIP_HEALTHCHECK — bool
+...
+```
+
+`env_schema` derives the listing live from the provider's constructor signature (and so
+imports that provider's module; its dependencies must be installed).
+
+### Extending the registry
+
+`trivialai.REGISTRY` is public, and out-of-tree adapters can add themselves — after which
+they work with `text` / `image` / `from_env` / `providers` and appear as lazy top-level
+class exports, with no other changes:
+
+```py
+trivialai.register("mything", "mypkg.mything", "MyThing", {"text"})
+m = trivialai.text({"provider": "mything", "model": "..."})
+```
+
+`register` validates the capability set; the module is not imported until first use, so
+laziness is preserved. (Direct `REGISTRY[name] = (module_path, cls_name, capabilities)`
+assignment also works. In-tree entries use module paths starting with `"."`, resolved
+against the package's runtime name; absolute paths are for out-of-tree adapters.)
 
 ---
 
@@ -485,6 +611,10 @@ and exposes **both** iterator interfaces.
 * **Mode-locked:** a given instance may be consumed *either* sync *or* async.
 * **Bridging:** async → sync driven by a background event loop thread; sync → async wraps `next()`.
 
+During development and testing, `trivialai.force` is exported at the top level for eagerly
+draining a stream into a list (`trivialai.force(m.stream_checked(...))`). It's a dev-time
+affordance — forcing in production code only degrades streaming for no real gain.
+
 ---
 
 ## Chaining streams with `then` / `map` / `mapcat` / `branch`
@@ -568,6 +698,20 @@ vec = embed("hello world")
 
 * **Dependencies:** `httpx` for HTTP providers; `boto3` for Bedrock; `google-genai` + optionally
   `google-auth` for Gemini. `StabDiff` uses only `httpx` — no extra install step needed.
+* **Lazy top-level exports:** `import trivialai` imports nothing heavy. Provider classes
+  (`trivialai.Bedrock`, ...) and helpers (`force`, `BiStream`, `LLMResult`, `Picture`, ...)
+  are resolved lazily on first attribute access (PEP 562), driven by `trivialai.REGISTRY`.
+  The classic `from trivialai.bedrock import Bedrock` form continues to work and remains
+  the way to avoid even the attribute-access cost.
+* **`trivialai.image` names the factory, not the submodule:** the top-level `image`
+  attribute is the config-driven factory function; the `trivialai.image` *submodule*
+  (`Picture`, `ImageMixin`) remains importable as `from trivialai.image import Picture`.
+  The one form to avoid is the alias import `import trivialai.image as x`, which resolves
+  through the package attribute and yields the factory.
+* **`ConfigError` is a startup signal:** everything raised by `text` / `image` /
+  `from_env` indicates a deployment-configuration problem. Provider constructor errors
+  (failed health checks, auth failures) propagate unchanged — config loading is
+  intentionally fail-fast so prerequisite services are known to be online at boot.
 * **Scratchpad:** Ollama surfaces `<think>` content via tag parsing; Gemini and DeepSeek
   (`deepseek-reasoner`) route native thought/reasoning tokens directly into `scratchpad`
   without any tag parsing; other providers emit `scratchpad=""` in deltas and `None` in

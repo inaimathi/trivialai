@@ -31,11 +31,11 @@ reachable through ``text``/``image``, ``providers()``, *and* as a lazy
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 from typing import Any
 
+from . import _factory as _factory_mod
 # Eager: light, factory-layer surface. _factory imports only stdlib.
 from ._factory import REGISTRY, ConfigError, env_schema, from_env  # noqa: F401
 from ._factory import image as _image_factory
@@ -87,12 +87,12 @@ sys.modules[__name__].__class__ = _TrivialaiModule
 # classes are NOT listed here — they are resolved by walking REGISTRY.
 
 _LAZY_EXTRAS = {
-    "BiStream": ("trivialai.bistream", "BiStream"),
-    "force": ("trivialai.bistream", "force"),
-    "LLMResult": ("trivialai.util", "LLMResult"),
-    "GenerationError": ("trivialai.util", "GenerationError"),
-    "TransformError": ("trivialai.util", "TransformError"),
-    "Picture": ("trivialai.image", "Picture"),
+    "BiStream": (".bistream", "BiStream"),
+    "force": (".bistream", "force"),
+    "LLMResult": (".util", "LLMResult"),
+    "GenerationError": (".util", "GenerationError"),
+    "TransformError": (".util", "TransformError"),
+    "Picture": (".image", "Picture"),
 }
 
 
@@ -110,7 +110,7 @@ def __getattr__(name: str) -> Any:
     if location is None:
         raise AttributeError(f"module 'trivialai' has no attribute {name!r}") from None
     module_path, attr = location
-    obj = getattr(importlib.import_module(module_path), attr)
+    obj = getattr(_factory_mod.resolve_module(module_path), attr)
     globals()[name] = obj  # cache so __getattr__ only fires once per name
     return obj
 

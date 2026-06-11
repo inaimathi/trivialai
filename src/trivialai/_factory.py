@@ -105,6 +105,7 @@ __all__ = [
     "ConfigError",
     "REGISTRY",
     "register",
+    "resolve_module",
     "from_env",
     "text",
     "image",
@@ -141,17 +142,35 @@ class ConfigError(Exception):
 # edit needed.  It is deliberately public: out-of-tree adapters can add
 # themselves (preferably via `register()`, which validates the entry) and
 # immediately work with `text` / `image` / `from_env` / `providers`.
+#
+# Module paths starting with "." are resolved relative to this package's
+# *runtime* name, so the registry works whether the package is imported as
+# `trivialai` (installed), `src.trivialai` (tests run from the repo root),
+# or anything else.  Absolute paths are for out-of-tree adapters.
+
+_PACKAGE = __package__ or "trivialai"
 
 REGISTRY: Dict[str, Tuple[str, str, frozenset]] = {
-    "ollama": ("trivialai.ollama", "Ollama", frozenset({"text"})),
-    "claude": ("trivialai.claude", "Claude", frozenset({"text"})),
-    "chatgpt": ("trivialai.chatgpt", "ChatGPT", frozenset({"text"})),
-    "openai": ("trivialai.chatgpt", "ChatGPT", frozenset({"text"})),  # alias
-    "deepseek": ("trivialai.deepseek", "DeepSeek", frozenset({"text"})),
-    "bedrock": ("trivialai.bedrock", "Bedrock", frozenset({"text", "image"})),
-    "gemini": ("trivialai.gemini", "Gemini", frozenset({"text", "image"})),
-    "stabdiff": ("trivialai.stabdiff", "StabDiff", frozenset({"image"})),
+    "ollama": (".ollama", "Ollama", frozenset({"text"})),
+    "claude": (".claude", "Claude", frozenset({"text"})),
+    "chatgpt": (".chatgpt", "ChatGPT", frozenset({"text"})),
+    "openai": (".chatgpt", "ChatGPT", frozenset({"text"})),  # alias
+    "deepseek": (".deepseek", "DeepSeek", frozenset({"text"})),
+    "bedrock": (".bedrock", "Bedrock", frozenset({"text", "image"})),
+    "gemini": (".gemini", "Gemini", frozenset({"text", "image"})),
+    "stabdiff": (".stabdiff", "StabDiff", frozenset({"image"})),
 }
+
+
+def resolve_module(module_path: str):
+    """
+    Import a registry module path: relative (".ollama") against this
+    package's runtime name, absolute ("mypkg.mything") as-is.
+    """
+    if module_path.startswith("."):
+        return importlib.import_module(module_path, package=_PACKAGE)
+    return importlib.import_module(module_path)
+
 
 _CAPABILITIES = frozenset({"text", "image"})
 
@@ -168,7 +187,9 @@ def register(
     Equivalent to a direct ``REGISTRY[name] = ...`` assignment, with
     validation.  The module is *not* imported here — laziness is preserved;
     a bad ``module_path`` / ``cls_name`` surfaces as a ``ConfigError`` on
-    first use, like any other provider.
+    first use, like any other provider.  Use an absolute ``module_path``
+    for out-of-tree adapters; paths starting with "." resolve relative to
+    this package.
 
         trivialai.register("mything", "mypkg.mything", "MyThing", {"text"})
         m = trivialai.text({"provider": "mything", ...})
@@ -424,7 +445,7 @@ def _signature_and_hints(cls: type) -> Tuple[inspect.Signature, Dict[str, Any]]:
 def _load_provider(provider: str) -> type:
     module_path, cls_name, _caps = REGISTRY[provider]
     try:
-        module = importlib.import_module(module_path)
+        module = resolve_module(module_path)
     except ImportError as e:
         hint = _OPTIONAL_DEPS.get(provider)
         extra = f" (try: pip install {hint})" if hint else ""
