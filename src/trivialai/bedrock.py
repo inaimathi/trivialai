@@ -380,65 +380,6 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         region = region or "us-east-1"
         geo_prefix = _region_to_geo_prefix(region)
 
-        if model_id is None:
-            # No model specified: use the default when the region supports
-            # cross-region inference profiles; otherwise stay in discovery-only
-            # mode (model_id=None) so the caller can inspect .inference_profile_ids()
-            # and construct a new instance with an explicit, valid model.
-            self._model_id: Optional[str] = (
-                f"{geo_prefix}.{_DEFAULT_TEXT_MODEL}"
-                if geo_prefix is not None
-                else None
-            )
-        else:
-            # Detect any existing geo-prefix on the supplied model ID.
-            existing_prefix = next(
-                (p.rstrip(".") for p in _GEO_PREFIXES if model_id.startswith(p)), None
-            )
-
-            if existing_prefix == "global":
-                # global. profiles are region-agnostic — they should be used
-                # *instead of* specifying a region, not alongside one.
-                if region_explicit:
-                    raise ValueError(
-                        f"model_id {model_id!r} is a global profile and cannot be "
-                        f"combined with an explicit region argument. "
-                        f"Either drop region= or use a regional profile ID "
-                        f"(e.g. 'us.anthropic.…') that matches your region."
-                    )
-                self._model_id = model_id
-
-            elif existing_prefix is not None:
-                # Regional prefix (us./eu./ap.) — must be consistent with region.
-                if geo_prefix is None:
-                    raise ValueError(
-                        f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
-                        f"but region {region!r} does not support cross-region "
-                        f"inference profiles (only us-*, eu-*, and ap-* do). "
-                        f"Use a global. profile or a bare foundation-model ID "
-                        f"available in that region."
-                    )
-                if existing_prefix != geo_prefix:
-                    raise ValueError(
-                        f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
-                        f"but region {region!r} expects {geo_prefix!r}. "
-                        f"Either change the region to match the prefix, supply a "
-                        f"bare model ID and let the prefix be added automatically, "
-                        f"or use a global. profile ID."
-                    )
-                self._model_id = model_id
-
-            else:
-                # No prefix on the supplied model ID — derive from region.
-                if geo_prefix is None:
-                    raise ValueError(
-                        f"Region {region!r} does not support cross-region inference "
-                        f"profiles (only us-*, eu-*, and ap-* regions do). "
-                        f"Cannot use model_id {model_id!r} here. "
-                        f"Construct Bedrock(region={region!r}) without a model_id to "
-                        f"run discovery, then pick a model available in that region."
-                    )
-                self._model_id = f"{geo_prefix}.{model_id}"
         self.image_model_id = image_model_id
         self.region = region
         self.max_tokens = max_tokens
@@ -450,6 +391,14 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         self.throttle_max_attempts = max(0, throttle_max_attempts)
         self.throttle_base_delay = max(0.0, throttle_base_delay)
         self.throttle_max_delay = max(self.throttle_base_delay, throttle_max_delay)
+
+        self._throttle_error_codes = (
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "TooManyRequests",
+            "RequestLimitExceeded",
+            "RateLimitExceeded",
+        )
 
         # ---- Build a shared boto3 session ----
         session_kwargs: Dict[str, Any] = {}
@@ -494,6 +443,15 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             self._runtime = session.client("bedrock-runtime", region_name=region)
             self._control = session.client("bedrock", region_name=region)
 
+        # Resolve the text model ID now that self._control exists, so we can
+        # consult the live inference-profile catalogue. Bare foundation-model
+        # IDs get a geo-prefix ONLY when a matching inference profile actually
+        # exists; profile-less on-demand models (zai.glm-5, many Qwen/MiniMax/
+        # DeepSeek/Gemma entries, etc.) are passed through verbatim.
+        self._model_id: Optional[str] = self._resolve_text_model_id(
+            model_id, region, region_explicit, geo_prefix
+        )
+
         # Precompute inference config for text requests.
         inference_config: Dict[str, Any] = {}
         if max_tokens is not None:
@@ -504,13 +462,78 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             inference_config["topP"] = top_p
         self._inference_config = inference_config or None
 
-        self._throttle_error_codes = (
-            "ThrottlingException",
-            "TooManyRequestsException",
-            "TooManyRequests",
-            "RequestLimitExceeded",
-            "RateLimitExceeded",
+    def _system_profile_ids(self) -> set:
+        """IDs of all system-defined inference profiles in this region."""
+        try:
+            resp = self._control.list_inference_profiles(typeEquals="SYSTEM_DEFINED")
+        except (BotoCoreError, ClientError) as e:
+            logger.warning(
+                "Could not list inference profiles while resolving model ID "
+                "(%s); will fall back to the bare foundation-model ID.",
+                e,
+            )
+            return set()
+        return {
+            p.get("inferenceProfileId", "")
+            for p in resp.get("inferenceProfileSummaries", [])
+        }
+
+    def _resolve_text_model_id(self, model_id, region, region_explicit, geo_prefix):
+        if model_id is None:
+            # Default model is profile-gated; prefix it when the region supports
+            # cross-region profiles, else stay in discovery-only mode.
+            return (
+                f"{geo_prefix}.{_DEFAULT_TEXT_MODEL}"
+                if geo_prefix is not None
+                else None
+            )
+
+        existing_prefix = next(
+            (p.rstrip(".") for p in _GEO_PREFIXES if model_id.startswith(p)), None
         )
+
+        if existing_prefix == "global":
+            if region_explicit:
+                raise ValueError(
+                    f"model_id {model_id!r} is a global profile and cannot be "
+                    f"combined with an explicit region argument. "
+                    f"Either drop region= or use a regional profile ID "
+                    f"(e.g. 'us.anthropic.…') that matches your region."
+                )
+            return model_id
+
+        if existing_prefix is not None:
+            # Regional prefix (us./eu./ap.) — must be consistent with region.
+            if geo_prefix is None:
+                raise ValueError(
+                    f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
+                    f"but region {region!r} does not support cross-region "
+                    f"inference profiles (only us-*, eu-*, and ap-* do). "
+                    f"Use a global. profile or a bare foundation-model ID "
+                    f"available in that region."
+                )
+            if existing_prefix != geo_prefix:
+                raise ValueError(
+                    f"model_id {model_id!r} has geo-prefix {existing_prefix!r} "
+                    f"but region {region!r} expects {geo_prefix!r}. "
+                    f"Either change the region to match the prefix, supply a "
+                    f"bare model ID and let the prefix be added automatically, "
+                    f"or use a global. profile ID."
+                )
+            return model_id
+
+        # No prefix on the supplied ID. Prefix it ONLY if a matching inference
+        # profile actually exists; otherwise the bare foundation-model ID is the
+        # correct (and only) identifier — this is the on-demand serverless case
+        # (zai.glm-5, many Qwen/MiniMax/DeepSeek/Gemma entries, etc.).
+        profile_ids = self._system_profile_ids()
+        if geo_prefix is not None:
+            regional = f"{geo_prefix}.{model_id}"
+            if regional in profile_ids:
+                return regional
+        if f"global.{model_id}" in profile_ids:
+            return f"global.{model_id}"
+        return model_id
 
     # ------------------------------------------------------------------
     # Throttle detection (shared by text + image paths)
@@ -903,14 +926,18 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             Foundation model summaries from ``ListFoundationModels``.
             **Note:** most newer Anthropic (and other) models cannot be invoked
             directly by their foundation-model ID — you must use an inference
-            profile ID instead.  See ``"inference_profiles"`` below.
+            profile ID instead.  Inspect each entry's ``inference_types`` to
+            tell which is which: ``["ON_DEMAND"]`` means the bare ``model_id``
+            is directly callable; ``["INFERENCE_PROFILE"]`` means you must use a
+            matching profile ID from ``"inference_profiles"``.  The constructor
+            applies exactly this distinction automatically.
 
         ``"inference_profiles"``
             System-defined cross-region inference profiles from
             ``ListInferenceProfiles``, filtered (when ``active_only=True``) to
             those backed exclusively by active foundation models.  These are the
-            IDs you should actually pass to the constructor (e.g.
-            ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``).
+            IDs you should pass to the constructor for profile-gated models
+            (e.g. ``"us.anthropic.claude-3-5-haiku-20241022-v1:0"``).
             Each entry has:
               ``profile_id``  – the ID to pass to the constructor
               ``name``        – human-readable profile name
@@ -919,13 +946,15 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
               ``type``        – ``"SYSTEM_DEFINED"`` | ``"APPLICATION"``
 
         Each foundation-model entry has:
-          ``model_id``   – the ID (may not be directly invocable; prefer inference profiles)
-          ``name``       – human-readable model name
-          ``provider``   – provider name (e.g. "Amazon", "Anthropic", ...)
-          ``input``      – list of input modalities  (e.g. ["TEXT", "IMAGE"])
-          ``output``     – list of output modalities (e.g. ["TEXT"])
-          ``streaming``  – bool, whether the model supports streaming
-          ``status``     – "ACTIVE" | "LEGACY" | "DEPRECATED"
+          ``model_id``         – the foundation-model ID
+          ``name``             – human-readable model name
+          ``provider``         – provider name (e.g. "Amazon", "Anthropic", ...)
+          ``input``            – list of input modalities  (e.g. ["TEXT", "IMAGE"])
+          ``output``           – list of output modalities (e.g. ["TEXT"])
+          ``streaming``        – bool, whether the model supports streaming
+          ``status``           – "ACTIVE" | "LEGACY" | "DEPRECATED"
+          ``inference_types``  – e.g. ["ON_DEMAND"] (bare ID callable directly)
+                                 or ["INFERENCE_PROFILE"] (needs a profile ID)
 
         Note: requires ``bedrock:ListFoundationModels`` and
         ``bedrock:ListInferenceProfiles`` IAM permissions.
@@ -939,7 +968,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             return (summary.get("modelLifecycle") or {}).get("status", "ACTIVE")
 
         def _summarise_foundation(
-            summaries: List[Dict[str, Any]]
+            summaries: List[Dict[str, Any]],
         ) -> List[Dict[str, Any]]:
             out = []
             for s in summaries:
@@ -955,6 +984,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
                         "output": s.get("outputModalities", []),
                         "streaming": s.get("responseStreamingSupported", False),
                         "status": status,
+                        "inference_types": s.get("inferenceTypesSupported", []),
                     }
                 )
             return out
