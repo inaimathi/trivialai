@@ -27,7 +27,7 @@ def _client_error(code: str, message: str = "simulated") -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": message}}, "operation")
 
 
-def _make_bedrock(**kwargs):
+def _make_bedrock(*, inference_profile_ids=(), **kwargs):
     """
     Construct a Bedrock instance with boto3.Session fully mocked.
 
@@ -38,6 +38,12 @@ def _make_bedrock(**kwargs):
     with patch("boto3.Session") as MockSession:
         mock_runtime = MagicMock(name="bedrock-runtime")
         mock_control = MagicMock(name="bedrock-control")
+        mock_control.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [
+                {"inferenceProfileId": profile_id}
+                for profile_id in inference_profile_ids
+            ]
+        }
         MockSession.return_value.client.side_effect = lambda svc, **kw: (
             mock_runtime if "runtime" in svc else mock_control
         )
@@ -121,22 +127,34 @@ class TestBedrockConstructor(unittest.TestCase):
         b, _, _ = _make_bedrock(region="ca-central-1")
         self.assertIsNone(b._model_id)
 
-    def test_bare_id_gets_prefix_from_region(self):
-        b, _, _ = _make_bedrock(model_id="anthropic.claude-3-5-sonnet-20241022-v2:0")
-        self.assertEqual(b._model_id, "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+    def test_bare_id_gets_prefix_when_matching_profile_exists(self):
+        model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        profile_id = f"us.{model_id}"
+
+        b, _, mock_control = _make_bedrock(
+            model_id=model_id,
+            inference_profile_ids=[profile_id],
+        )
+
+        self.assertEqual(b._model_id, profile_id)
+        mock_control.list_inference_profiles.assert_called_once_with(
+            typeEquals="SYSTEM_DEFINED"
+        )
 
     def test_correct_prefixed_id_is_unchanged(self):
         mid = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
         b, _, _ = _make_bedrock(model_id=mid, region="us-east-1")
         self.assertEqual(b._model_id, mid)
 
-    def test_explicit_id_unsupported_region_raises(self):
-        with self.assertRaises(ValueError) as ctx:
-            _make_bedrock(
-                model_id="anthropic.claude-3-5-haiku-20241022-v1:0",
-                region="ca-central-1",
-            )
-        self.assertIn("ca-central-1", str(ctx.exception))
+    def test_bare_id_unsupported_region_is_unchanged(self):
+        model_id = "example.on-demand-model-v1:0"
+
+        b, _, _ = _make_bedrock(
+            model_id=model_id,
+            region="ca-central-1",
+        )
+
+        self.assertEqual(b._model_id, model_id)
 
     def test_explicit_prefixed_id_unsupported_region_raises(self):
         # A regional prefix (us./eu./ap.) is rejected in unsupported regions.
