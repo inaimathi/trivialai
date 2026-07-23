@@ -9,14 +9,29 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
 
+import httpx
 from PIL import Image as PILImage
 
 from .bistream import BiStream
+
+DEFAULT_FETCH_TIMEOUT = 30.0
+MAX_FETCH_BYTES = 64 * 1024 * 1024
+
+_URL_SCHEMES = ("http://", "https://")
 
 
 # ---------------------------------------------------------------------------
 # Picture
 # ---------------------------------------------------------------------------
+def _looks_like_url(obj: Any) -> bool:
+    """
+    True for str URLs we know how to fetch. Deliberately a prefix test rather
+    than urlparse().scheme: on Windows, urlparse("C:/img.png").scheme == "c",
+    which would misroute local paths into the network path.
+    """
+    return isinstance(obj, str) and obj.lower().startswith(_URL_SCHEMES)
+
+
 def _looks_like_pil_image(obj: Any) -> bool:
     return isinstance(obj, PILImage.Image)
 
@@ -157,6 +172,8 @@ class Picture:
             return obj
         if isinstance(obj, (bytes, bytearray, memoryview)):
             return cls.from_bytes(bytes(obj))
+        if _looks_like_url(obj):
+            return cls.from_url(obj)
         if isinstance(obj, (str, os.PathLike)):
             with open(obj, "rb") as f:
                 return cls.from_bytes(f.read())
@@ -166,6 +183,63 @@ class Picture:
             obj.save(buf, format=fmt)
             return cls.from_bytes(buf.getvalue(), media_type=f"image/{fmt.lower()}")
         raise TypeError(f"Cannot create Picture from {type(obj).__name__!r}")
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        timeout: Optional[float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+        client: Optional[Any] = None,
+    ) -> "Picture":
+        """
+        Fetch an http(s) URL and wrap the response body.
+
+        Raises httpx.HTTPError on transport failures or non-2xx responses, and
+        ValueError if the response is implausibly large or not an image.
+        """
+        limit = MAX_FETCH_BYTES if max_bytes is None else max_bytes
+
+        def _get(c):
+            r = c.get(url, headers=headers, follow_redirects=True)
+            r.raise_for_status()
+            return r
+
+        if client is not None:
+            resp = _get(client)
+        else:
+            with httpx.Client(
+                timeout=DEFAULT_FETCH_TIMEOUT if timeout is None else timeout
+            ) as c:
+                resp = _get(c)
+
+        declared = (
+            (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
+        data = resp.content
+        if limit is not None and len(data) > limit:
+            raise ValueError(
+                f"Image at {url} is {len(data)} bytes, over the {limit} byte limit"
+            )
+
+        # Prefer sniffing the actual bytes -- servers mislabel images as
+        # application/octet-stream constantly. Fall back to the declared type
+        # for formats the sniffer does not know.
+        sniffed = _guess_media_type_from_bytes(data)
+        media_type = sniffed or (declared if declared.startswith("image/") else None)
+        if media_type is None:
+            raise ValueError(
+                f"Response from {url} does not look like an image "
+                f"(declared content-type: {declared or 'none'})"
+            )
+
+        return cls.from_bytes(
+            data,
+            media_type=media_type,
+            metadata={"source_url": url, "declared_media_type": declared or None},
+        )
 
     @classmethod
     def from_bytes(
