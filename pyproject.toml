@@ -1,6 +1,6 @@
 [project]
 name = "trivialai"
-version = "0.7.10"
+version = "0.7.11"
 authors = [
   { name="inaimathi", email="leo.zovic@gmail.com" },
 ]
