@@ -1,4 +1,3 @@
-# src/trivialai/vectorstore/base.py
 import hashlib
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -39,6 +38,31 @@ class Collection(ABC):
 
     @abstractmethod
     def insert(self, thing: Any, metadata: Optional[Metadata] = None) -> Vector:
+        pass
+
+    @abstractmethod
+    def insert_vector(
+        self,
+        thing: Any,
+        vector: Vector,
+        metadata: Optional[Metadata] = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def upsert(self, thing: Any, metadata: Optional[Metadata] = None) -> Vector:
+        """
+        Insert or replace a document using its normal document ID.
+
+        The default identity convention is content-addressed via
+        `doc_id(str(thing))`.
+
+        If a row with that ID already exists, its document, metadata, and
+        embedding are replaced by the supplied values.
+
+        Metadata replacement/merging policy is intentionally left to the
+        caller. This method stores exactly the metadata supplied.
+        """
         pass
 
     @abstractmethod

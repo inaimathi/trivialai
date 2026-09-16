@@ -63,13 +63,41 @@ class ChromaCollection(base.Collection):
     def insert(self, thing: Any, metadata: Optional[Metadata] = None) -> Vector:
         text = str(thing)
         vector = self.embedding(thing, metadata=metadata)
+
         self._collection.add(
             documents=[text],
-            metadatas=[metadata] if metadata is not None else None,
+            metadatas=[metadata] if metadata else None,
             ids=[self.doc_id(text)],
             embeddings=[vector],
         )
         return vector
+
+    def upsert(self, thing: Any, metadata: Optional[Metadata] = None) -> Vector:
+        text = str(thing)
+        vector = self.embedding(thing, metadata=metadata)
+
+        self._collection.upsert(
+            documents=[text],
+            metadatas=[metadata] if metadata else None,
+            ids=[self.doc_id(text)],
+            embeddings=[vector],
+        )
+        return vector
+
+    def insert_vector(
+        self,
+        thing: Any,
+        vector: Vector,
+        metadata: Optional[Metadata] = None,
+    ) -> None:
+        text = str(thing)
+
+        self._collection.add(
+            documents=[text],
+            metadatas=[metadata] if metadata else None,
+            ids=[self.doc_id(text)],
+            embeddings=[vector],
+        )
 
     def _result_from_query(
         self,
@@ -80,20 +108,17 @@ class ChromaCollection(base.Collection):
         *,
         index: int = 0,
     ) -> SearchResult:
-        """
-        Helper to build a SearchResult from query/get output.
-        Assumes `index` is valid.
-        """
         doc = docs[index]
         vec = vecs[index]
-        meta = metas[index]
+        meta = metas[index] or {}
         distance = dists[index] if dists else 0.0
+
         return {
             "value": doc,
             "vector": vec,
             "meta": meta,
             "distance": distance,
-            "id": self.doc_id(doc),  # derive from content
+            "id": self.doc_id(doc),
         }
 
     def lookup(
@@ -106,20 +131,29 @@ class ChromaCollection(base.Collection):
         if (id is None and vector is None) or (id is not None and vector is not None):
             raise ValueError("lookup() requires exactly one of 'id' or 'vector'")
 
-        # Lookup by explicit ID
         if id is not None:
             batch = self._collection.get(
                 ids=[id],
                 include=["documents", "embeddings", "metadatas"],
             )
+
             docs = batch.get("documents") or []
             if not docs:
                 raise KeyError(f"No document found with id {id!r}")
 
-            vecs = batch.get("embeddings") or [[]]
-            metas = batch.get("metadatas") or [{}]
-            # For get(ids=...), Chroma returns flat lists, so index 0 is our doc
-            return self._result_from_query(docs, vecs, metas, dists=[], index=0)
+            raw_vecs = batch.get("embeddings")
+            vecs = raw_vecs if raw_vecs is not None else [[]]
+
+            raw_metas = batch.get("metadatas")
+            metas = raw_metas if raw_metas is not None else [{}]
+
+            return self._result_from_query(
+                docs,
+                vecs,
+                metas,
+                dists=[],
+                index=0,
+            )
 
         # Lookup by nearest vector
         results = self._collection.query(
