@@ -1,4 +1,4 @@
-# base.py
+# src/trivialai/vectorstore/base.py
 import hashlib
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Iterable, List, Optional

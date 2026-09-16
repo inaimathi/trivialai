@@ -1,3 +1,4 @@
+# src/trivialai/embedding/bedrock.py
 from __future__ import annotations
 
 import json

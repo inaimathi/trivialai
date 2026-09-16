@@ -1,4 +1,4 @@
-# chromadb.py
+# src/trivialai/vectorstore/chromadb.py
 import json
 import os
 from typing import Any, Callable, Dict, List, Optional
