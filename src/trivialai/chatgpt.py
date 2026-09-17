@@ -74,14 +74,16 @@ class ChatGPT(LLMMixin, FilesystemMixin):
 
     def __init__(
         self,
-        model: Optional[str],
-        api_key: str,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
         anthropic_version: Optional[
             str
         ] = None,  # kept for signature compatibility; unused
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = 300.0,
     ):
+        if not api_key:
+            raise ValueError("api_key is required")
         self.max_tokens = max_tokens or 4096
         self.version = anthropic_version or "2023-06-01"
         self.api_key = api_key

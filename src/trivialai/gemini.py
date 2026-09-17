@@ -381,26 +381,40 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
         return [genai_types.Content(role="user", parts=user_parts)]
 
     def _make_text_config(
-        self, system: str, **overrides: Any
+        self,
+        system: str,
+        **overrides: Any,
     ) -> genai_types.GenerateContentConfig:
         """Build a GenerateContentConfig for a text request."""
-        kwargs: Dict[str, Any] = {}
+        kwargs: Dict[str, Any] = {
+            "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(
+                disable=True,
+            ),
+        }
+
         if system:
             kwargs["system_instruction"] = system
+
         if self._safety_settings:
             kwargs["safety_settings"] = self._safety_settings
+
         if self.max_output_tokens is not None:
             kwargs["max_output_tokens"] = self.max_output_tokens
 
-        # thinking_budget: per-call override > instance default > omit
-        budget = overrides.pop("thinking_budget", _UNSET)
+        budget = overrides.pop(
+            "thinking_budget",
+            _UNSET,
+        )
+
         resolved = budget if budget is not _UNSET else self.thinking_budget
+
         if resolved is not None:
             kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_budget=resolved
+                thinking_budget=resolved,
             )
 
         kwargs.update(overrides)
+
         return genai_types.GenerateContentConfig(**kwargs)
 
     def generate(
