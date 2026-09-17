@@ -186,6 +186,44 @@ class DeepSeek(LLMMixin, FilesystemMixin):
         return f"{self.base_url}{_MESSAGES_PATH}"
 
     # ------------------------------------------------------------------
+    # Model discovery
+    # ------------------------------------------------------------------
+
+    def models(self) -> list[dict]:
+        """Return the models currently available to this API key."""
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                res = client.get(
+                    f"{self.base_url}/models",
+                    headers=self._headers(),
+                )
+        except httpx.RequestError as exc:
+            raise ValueError(
+                f"Cannot query DeepSeek models at {self.base_url}: {exc}"
+            ) from exc
+
+        if res.status_code != 200:
+            raise ValueError(
+                "DeepSeek model discovery returned "
+                f"HTTP {res.status_code} from {self.base_url}/models"
+            )
+
+        try:
+            payload = res.json()
+        except ValueError as exc:
+            raise ValueError("DeepSeek model discovery returned invalid JSON") from exc
+
+        models = payload.get("data", [])
+        if not isinstance(models, list):
+            raise ValueError("DeepSeek model discovery returned an invalid model list")
+
+        return models
+
+    def model_names(self) -> list[str]:
+        """Convenience: return just the model IDs from :meth:`models`."""
+        return [model["id"] for model in self.models() if model.get("id")]
+
+    # ------------------------------------------------------------------
     # Synchronous generate (LLMMixin requirement)
     # ------------------------------------------------------------------
 
