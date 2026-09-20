@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .. import util
 from ..bistream import BiStream
 from ..llm import LLMMixin
-from . import prompting, toolkit
+from . import prompting, runtime, toolkit
 
 
 class Agent:
@@ -18,7 +18,7 @@ class Agent:
         llm: LLMMixin,
         *,
         system: str,
-        tools: Optional(List[Callable[..., Any]]) = None,
+        tools: Optional[List[Callable[..., Any]]] = None,
         name: Optional[str] = None,
         root: Optional[Union[str, Path]] = None,
     ):
@@ -27,7 +27,6 @@ class Agent:
         self.tools = toolkit.ToolKit(*([] if tools is None else tools))
 
         self.system = system
-
         root_path = Path(root or f"./agent-{self.name}").expanduser().resolve()
         self.root = root_path
         self.root.mkdir(parents=True, exist_ok=True)
@@ -62,6 +61,9 @@ class Agent:
     def call_tool(self, parsed):
         return self.tools.call_tool(parsed)
 
+    async def acall_tool(self, parsed):
+        return await self.tools.acall_tool(parsed)
+
     def stream(self, prompt, images: Optional[list] = None) -> BiStream[Dict[str, Any]]:
         return self.llm.stream(self.build_prompt(prompt), prompt, images=images).tap(
             self.log,
@@ -91,6 +93,34 @@ class Agent:
             prompt,
             images=images,
             retries=retries,
+        ).tap(
+            self.log,
+            ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",
+        )
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        max_steps: int = 16,
+        max_identical_tool_calls: Optional[int] = 3,
+        context_size: Optional[int] = None,
+        memory: Any = None,
+        context_summary: Optional[str] = None,
+        images: Optional[list] = None,
+    ) -> BiStream[Dict[str, Any]]:
+        return runtime.run_agent(
+            llm=self.llm,
+            base_system_prompt=self.system,
+            tools=self.tools,
+            task=prompt,
+            name=self.name,
+            max_steps=max_steps,
+            max_identical_tool_calls=max_identical_tool_calls,
+            context_size=context_size,
+            memory=memory,
+            context_summary=context_summary,
+            images=images,
         ).tap(
             self.log,
             ignore=lambda ev: isinstance(ev, dict) and ev.get("type") == "delta",

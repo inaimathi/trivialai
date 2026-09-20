@@ -9,6 +9,7 @@ from typing import (Any, Callable, Dict, Literal, Optional, Tuple, Union,
                     get_args, get_origin)
 
 from .. import util
+from ..bistream import BiStream
 from ..util import TransformError
 
 
@@ -251,25 +252,33 @@ class ToolKit:
         return tool_call
 
     def call_tool(self, tool_call: Dict[str, Any]) -> Any:
-        """
-        Validate and then execute the tool call.
-
-        - Runs check_tool() (may raise TransformError).
-        - Calls the underlying function with **args.
-        - Returns whatever the tool returns.
-        """
         checked = self.check_tool(tool_call)
         tool_name = checked["tool"]
         args = checked.get("args", {})
-
         fn = self._tools[tool_name]
-
-        # If you want async support, you can detect coroutine functions here
-        # and run them with your _run_coro_sync helper.
         try:
-            return fn(**args)
+            result = fn(**args)
+            if inspect.isawaitable(result):
+
+                async def one_result():
+                    yield await result
+
+                return list(BiStream(one_result()))[0]
+            return result
         except TypeError as e:
-            # In case Python's own call-time checking finds something we missed
+            raise util.TransformError("tool-call-failed") from e
+
+    async def acall_tool(self, tool_call: Dict[str, Any]) -> Any:
+        checked = self.check_tool(tool_call)
+        tool_name = checked["tool"]
+        args = checked.get("args", {})
+        fn = self._tools[tool_name]
+        try:
+            result = fn(**args)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except TypeError as e:
             raise util.TransformError("tool-call-failed") from e
 
     # ---------- Internal: best-effort type compatibility ----------

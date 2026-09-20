@@ -1,3 +1,4 @@
+import json
 import textwrap
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -313,3 +314,137 @@ def _combine_sections_with_limit(
     if len(text) > limit:
         return text[:limit]
     return text
+
+
+########## Agent-Related Infra
+
+
+def _agent_protocol_section() -> str:
+    return textwrap.dedent(
+        """
+        ## Agent protocol
+
+        You are executing inside an automated tool loop. Every completed model turn MUST be
+        exactly one JSON object and nothing else.
+
+        To call a tool:
+        {"type":"tool-call","tool":"tool_name","args":{"arg":"value"}}
+
+        To finish the task:
+        {"type":"final","content":"Here is the final answer."}
+
+        Do not emit prose outside one of those JSON objects. Do not use an unstructured
+        response as the final answer. Tool results from earlier steps appear in the execution
+        history below; use them when deciding the next step.
+        """
+    ).strip()
+
+
+def _build_agent_history_pair(call: Dict[str, Any], result: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            json.dumps(call, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            json.dumps(
+                result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        ]
+    )
+
+
+def _build_agent_history_section(
+    history: Sequence[Tuple[Dict[str, Any], Dict[str, Any]]],
+) -> str:
+    if not history:
+        return ""
+    pairs = [_build_agent_history_pair(call, result) for call, result in history]
+    return "## Execution history\n\n" + "\n\n".join(pairs)
+
+
+def _join_agent_sections(
+    base_section: str,
+    protocol_section: str,
+    tools_section: str,
+    summary_section: str,
+    memory_section: str,
+    history: Sequence[Tuple[Dict[str, Any], Dict[str, Any]]],
+    context_size: Optional[int],
+) -> str:
+    if context_size is not None and context_size < 0:
+        raise ValueError("context_size must be non-negative or None")
+
+    old_history = list(history[:-1])
+    latest_history = list(history[-1:])
+    current_memory = memory_section
+    current_summary = summary_section
+
+    def render() -> str:
+        history_section = _build_agent_history_section(old_history + latest_history)
+        sections = [
+            base_section,
+            protocol_section,
+            tools_section,
+            current_summary,
+            current_memory,
+            history_section,
+        ]
+        return "\n\n".join(section for section in sections if section).strip()
+
+    combined = render()
+    if context_size is None:
+        return combined
+
+    # Trimming priority is deliberate: retrieval memory first, then complete old
+    # call/result pairs, then the optional context summary. Base instructions,
+    # protocol, tool definitions and the most recent call/result pair are never
+    # dropped. If those mandatory sections alone exceed the caller's limit, the
+    # prompt is allowed to exceed it rather than corrupting the protocol.
+    if len(combined) > context_size and current_memory:
+        current_memory = ""
+        combined = render()
+
+    while len(combined) > context_size and old_history:
+        old_history.pop(0)
+        combined = render()
+
+    if len(combined) > context_size and current_summary:
+        current_summary = ""
+        combined = render()
+
+    return combined
+
+
+def build_agent_prompt(
+    base_system_prompt: str,
+    user_prompt: str,
+    tools: ToolKit,
+    *,
+    history: Optional[Sequence[Tuple[Dict[str, Any], Dict[str, Any]]]] = None,
+    context_size: Optional[int] = None,
+    memory: Any = None,
+    context_summary: Optional[str] = None,
+) -> str:
+    """Build the system prompt for one step of Agent.run().
+
+    Unlike build_prompt(), this has no small default character cap. The original
+    user task is supplied separately as the model's user prompt on every step;
+    user_prompt is accepted here so retrieval memory can still query against it.
+    """
+    base_section = _build_base_section(base_system_prompt)
+    protocol_section = _agent_protocol_section()
+    tools_section = tools.to_tool_prompt()
+    tools_section = tools_section.replace(
+        "If you do not need to call a tool, respond normally instead of emitting a "
+        "tool-call JSON object.",
+        "",
+    ).strip()
+    summary_section = _build_summary_section(context_summary)
+    memory_section = _build_memory_section(memory, user_prompt)
+    return _join_agent_sections(
+        base_section,
+        protocol_section,
+        tools_section,
+        summary_section,
+        memory_section,
+        list(history or []),
+        context_size,
+    )
