@@ -8,9 +8,10 @@ from src.trivialai.agent.core import Agent
 from src.trivialai.agent.prompting import build_agent_prompt
 from src.trivialai.agent.toolkit import ToolKit
 from src.trivialai.bistream import BiStream
+from src.trivialai.llm import LLMMixin
 
 
-class FakeLLM:
+class FakeLLM(LLMMixin):
     def __init__(self, decisions):
         self.decisions = list(decisions)
         self.system_prompts = []
@@ -60,7 +61,6 @@ class AgentRuntimeTests(unittest.TestCase):
             ]
         )
         events = list(self.make_agent(llm, search).run("Investigate it."))
-
         self.assertEqual(events[-1], {"type": "final", "content": "done", "steps": 2})
         result = next(ev for ev in events if ev["type"] == "tool-result")
         self.assertTrue(result["ok"])
@@ -272,6 +272,40 @@ class AgentRuntimeTests(unittest.TestCase):
         failed = [e for e in events if e["type"] == "tool-result" and not e["ok"]]
         self.assertEqual(len(failed), 1)
 
+    def test_invalid_decision_is_retried_without_consuming_agent_step(self):
+        seen = []
+
+        def echo(value: int):
+            seen.append(value)
+            return value
+
+        llm = FakeLLM(
+            [
+                "I should call the tool now.",
+                {"type": "tool-call", "tool": "echo", "args": {"value": 7}},
+                {"type": "final", "content": "done"},
+            ]
+        )
+
+        events = list(
+            self.make_agent(llm, echo).run(
+                "Use echo.",
+                decision_retries=3,
+            )
+        )
+
+        self.assertEqual(seen, [7])
+        self.assertEqual(events[-1], {"type": "final", "content": "done", "steps": 2})
+
+        failures = [
+            event for event in events
+            if event.get("type") == "model-attempt-failed"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["step"], 0)
+        self.assertEqual(failures[0]["attempt"], 1)
+        self.assertEqual(len(llm.system_prompts), 3)
+
     def test_prompt_trimming_keeps_tools_and_latest_complete_pair(self):
         def search(query: str):
             """Search the test corpus."""
@@ -318,7 +352,6 @@ class AgentRuntimeTests(unittest.TestCase):
             context_size=1,
             context_summary="SUMMARY_SENTINEL",
         )
-
         self.assertIn("SYSTEM_SENTINEL", prompt)
         self.assertIn("search", prompt)
         self.assertIn("LATEST_CALL", prompt)

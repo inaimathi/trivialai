@@ -1,3 +1,4 @@
+# src/trivialai/agent/prompting.py
 import json
 import textwrap
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -325,17 +326,26 @@ def _agent_protocol_section() -> str:
         ## Agent protocol
 
         You are executing inside an automated tool loop. Every completed model turn MUST be
-        exactly one JSON object and nothing else.
+        exactly one JSON object and nothing else. Do not wrap the object in Markdown fences
+        and do not emit commentary before or after it.
 
-        To call a tool:
+        To call exactly one tool:
         {"type":"tool-call","tool":"tool_name","args":{"arg":"value"}}
+
+        Only `type`, `tool`, and `args` are model-controlled for a tool call.
+        Runtime fields such as `tool_call_id`, `step`, and `attempt` are assigned
+        automatically; do not copy them from execution history.
 
         To finish the task:
         {"type":"final","content":"Here is the final answer."}
 
-        Do not emit prose outside one of those JSON objects. Do not use an unstructured
-        response as the final answer. Tool results from earlier steps appear in the execution
-        history below; use them when deciding the next step.
+        Use only tool names and argument shapes listed below. A tool call is an action request,
+        not a description of an action. If a tool result reports an error, use that result to
+        correct or change the next action; do not repeat an identical failed call unless the
+        result indicates that retrying unchanged may succeed.
+
+        Do not use an unstructured response as the final answer. Tool results from earlier
+        steps appear in the execution history below; use them when deciding the next step.
         """
     ).strip()
 

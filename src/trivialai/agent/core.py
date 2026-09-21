@@ -1,4 +1,4 @@
-# src/trivialai/agent.py
+# src/trivialai/agent/core.py
 from __future__ import annotations
 
 import json
@@ -103,6 +103,7 @@ class Agent:
         prompt: str,
         *,
         max_steps: int = 16,
+        decision_retries: int = 3,
         max_identical_tool_calls: Optional[int] = 3,
         context_size: Optional[int] = None,
         memory: Any = None,
@@ -116,6 +117,7 @@ class Agent:
             task=prompt,
             name=self.name,
             max_steps=max_steps,
+            decision_retries=decision_retries,
             max_identical_tool_calls=max_identical_tool_calls,
             context_size=context_size,
             memory=memory,
