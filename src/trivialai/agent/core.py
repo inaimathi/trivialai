@@ -21,10 +21,12 @@ class Agent:
         tools: Optional[List[Callable[..., Any]]] = None,
         name: Optional[str] = None,
         root: Optional[Union[str, Path]] = None,
+        final_check: Optional[Callable[[str, Any], Any]] = None,
     ):
         self.llm = llm
         self.name = name or "agent-task"
         self.tools = toolkit.ToolKit(*([] if tools is None else tools))
+        self.final_check = final_check
 
         self.system = system
         root_path = Path(root or f"./agent-{self.name}").expanduser().resolve()
@@ -119,6 +121,7 @@ class Agent:
             max_steps=max_steps,
             decision_retries=decision_retries,
             max_identical_tool_calls=max_identical_tool_calls,
+            final_check=self.final_check,
             context_size=context_size,
             memory=memory,
             context_summary=context_summary,

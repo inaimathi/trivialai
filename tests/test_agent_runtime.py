@@ -1,3 +1,4 @@
+# tests/test_agent_runtime.py
 import asyncio
 import json
 import tempfile
@@ -298,8 +299,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(events[-1], {"type": "final", "content": "done", "steps": 2})
 
         failures = [
-            event for event in events
-            if event.get("type") == "model-attempt-failed"
+            event for event in events if event.get("type") == "model-attempt-failed"
         ]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["step"], 0)

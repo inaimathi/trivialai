@@ -1,39 +1,129 @@
-# toolkit.py
+# src/trivialai/agent/toolkit.py
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import threading
 from collections.abc import Mapping as ABCMapping
 from collections.abc import Sequence as ABCSequence
 from typing import (Any, Callable, Dict, Literal, Optional, Tuple, Union,
                     get_args, get_origin)
 
 from .. import util
-from ..bistream import BiStream
 from ..util import TransformError
+
+
+class ToolCallError(TransformError):
+    """
+    Structured tool-call validation error.
+
+    `message` intentionally remains the historical short error code so callers
+    that catch TransformError and inspect `.message` remain compatible.
+    `public_dict()` carries the actionable model-facing diagnostics.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        detail: Optional[str] = None,
+        tool: Optional[str] = None,
+        expected: Optional[list[str]] = None,
+        received: Optional[list[str]] = None,
+        missing: Optional[list[str]] = None,
+        unexpected: Optional[list[str]] = None,
+        argument: Optional[str] = None,
+        expected_type: Optional[str] = None,
+        received_type: Optional[str] = None,
+        available_tools: Optional[list[str]] = None,
+        raw: Any = None,
+    ) -> None:
+        super().__init__(code, raw=raw)
+        self.code = code
+        self.detail = detail or code
+        self.tool = tool
+        self.expected = expected
+        self.received = received
+        self.missing = missing
+        self.unexpected = unexpected
+        self.argument = argument
+        self.expected_type = expected_type
+        self.received_type = received_type
+        self.available_tools = available_tools
+
+    def public_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "type": "tool-error",
+            "code": self.code,
+            "message": self.detail,
+        }
+        for key in (
+            "tool",
+            "expected",
+            "received",
+            "missing",
+            "unexpected",
+            "argument",
+            "expected_type",
+            "received_type",
+            "available_tools",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+
+def _run_awaitable_sync(awaitable):
+    """
+    Resolve an awaitable for the synchronous `call_tool` API.
+
+    If no event loop is running in this thread, use asyncio.run directly.
+    If a loop is already running, drive the awaitable in a helper thread so
+    sync callers still get a normal return value without trying to nest loops.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_await_value(awaitable))
+
+    result = []
+    error = []
+
+    def runner():
+        try:
+            result.append(asyncio.run(_await_value(awaitable)))
+        except BaseException as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if error:
+        raise error[0]
+    return result[0]
+
+
+async def _await_value(awaitable):
+    return await awaitable
 
 
 class ToolKit:
     """
     Small wrapper around a set of callables that:
-
     - describes them to an LLM (to_tool_prompt)
-    - describes the JSON shape of a tool call (to_prompt_type)
+    - describes the JSON shape of a tool call (to_tool_shape)
     - validates tool calls (check_tool)
-    - executes tool calls (call_tool)
+    - executes sync or async tools (call_tool / acall_tool)
     """
 
-    TOOL_CALL_TYPE = "tool-call"  # must match what you tell the model to emit
+    TOOL_CALL_TYPE = "tool-call"
 
     def __init__(self, *tools: Callable[..., Any]) -> None:
-        """
-        Initialize with a list of tool functions, e.g.:
-
-            tk = ToolKit(util.slurp, util.spit, util.tree, os.listdir)
-        """
         self._tools: Dict[str, Callable[..., Any]] = {}
         self._tool_summaries: Dict[str, Dict[str, Any]] = {}
-
         for fn in tools:
             name = getattr(fn, "__name__", None)
             if not name:
@@ -44,32 +134,25 @@ class ToolKit:
             self._tool_summaries[name] = to_summary(fn)
 
     def __bool__(self) -> bool:
-        """
-        Truthy if this toolkit has any tools, falsy if it is empty.
-        """
         return bool(self._tools)
 
     def __len__(self) -> int:
         return len(self._tools)
 
+    def has_tool(self, name: Any) -> bool:
+        """Return whether `name` identifies a registered model-facing tool."""
+        return isinstance(name, str) and name in self._tools
+
+    def tool_names(self) -> list[str]:
+        """Return registered tool names in deterministic order."""
+        return sorted(self._tools)
+
     # ---------- Public API ----------
+
     def add_tool(self, fn: Callable[..., Any], *, name: Optional[str] = None) -> None:
-        """
-        Register a new tool function after initialization.
-
-        - If `name` is provided, use that as the tool name.
-        - Otherwise, use `fn.__name__`.
-
-        Raises:
-            ValueError if:
-              * the function has no usable name AND no explicit `name` is given
-              * a tool with the same name already exists
-        """
         tool_name = name or getattr(fn, "__name__", None)
         if not tool_name:
-            # This is the "anonymous function with no explicit name" case
             raise ValueError(f"Tool {fn!r} has no __name__ and no explicit name")
-
         if tool_name in self._tools:
             raise ValueError(f"Duplicate tool name: {tool_name!r}")
 
@@ -77,34 +160,18 @@ class ToolKit:
         self._tool_summaries[tool_name] = to_summary(fn, name=tool_name)
 
     def ensure_tool(
-        self, fn: Callable[..., Any], *, name: Optional[str] = None
+        self,
+        fn: Callable[..., Any],
+        *,
+        name: Optional[str] = None,
     ) -> None:
-        """
-        Upsert a tool function.
-
-        - If a tool with this name already exists, overwrite it.
-        - If not, add it.
-
-        Name resolution is the same as in `add_tool`:
-        - If `name` is provided, use it.
-        - Otherwise, use `fn.__name__`.
-
-        Raises:
-            ValueError if the function has no usable name and no explicit `name`.
-        """
         tool_name = name or getattr(fn, "__name__", None)
         if not tool_name:
             raise ValueError(f"Tool {fn!r} has no __name__ and no explicit name")
-
         self._tools[tool_name] = fn
         self._tool_summaries[tool_name] = to_summary(fn, name=tool_name)
 
     def remove_tool(self, name: str) -> None:
-        """
-        Unregister an existing tool by name.
-
-        Raises KeyError if the tool is not present.
-        """
         try:
             del self._tools[name]
             del self._tool_summaries[name]
@@ -112,16 +179,11 @@ class ToolKit:
             raise KeyError(f"No such tool: {name!r}") from None
 
     def to_summary(self) -> Dict[str, Any]:
-        """
-        Return a machine-usable summary of tools:
-
-            {"tools": [ {name, description, args, ...}, ... ]}
-        """
         return {
             "tools": [self._tool_summaries[name] for name in sorted(self._tools.keys())]
         }
 
-    def to_tool_shape(self) -> Dict:
+    def to_tool_shape(self) -> Dict[str, Any]:
         tool_names = ", ".join(sorted(self._tools.keys()))
         return {
             "type": self.TOOL_CALL_TYPE,
@@ -130,48 +192,42 @@ class ToolKit:
         }
 
     def to_tool_prompt(self) -> str:
-        """
-        Return a complete text block you can stitch into a system prompt,
-        using compact Python-ish signatures like:
-
-            spit(file_path: str, content: str, mode: Optional[str] = None) -> None
-        """
         if len(self._tools) == 0:
             return ""
+
         summary = self.to_summary()
-        shape = self.to_tool_shape()
-        shape_json = json.dumps(shape, indent=2)
+        shape_json = json.dumps(self.to_tool_shape(), indent=2)
 
-        lines: list[str] = []
+        lines: list[str] = [
+            "You have access to the following tools.",
+            "",
+            (
+                "When you want to call a tool, respond with a single JSON object "
+                "of the following form, and NOTHING else:"
+            ),
+            "",
+            shape_json,
+            "",
+            "Available tools:",
+            "",
+        ]
 
-        lines.append("You have access to the following tools.")
-        lines.append("")
-        lines.append(
-            "When you want to call a tool, respond with a single JSON object "
-            "of the following form, and NOTHING else:"
-        )
-        lines.append("")
-        lines.append(shape_json)
-        lines.append("")
-        lines.append("Available tools:")
-        lines.append("")
-
-        for t in summary["tools"]:
-            sig = t.get("signature")
+        for row in summary["tools"]:
+            sig = row.get("signature")
             if not sig:
-                # Fallback if something omitted it
-                fn = self._tools[t["name"]]
-                sig = _format_signature(fn)
+                sig = _format_signature(self._tools[row["name"]])
 
-            desc = (t.get("description") or "").strip()
-
+            desc = (row.get("description") or "").strip()
             lines.append(sig)
             if desc:
-                # single-line, indented description
-                first_line = desc.splitlines()[0]
-                lines.append(f"  {first_line}")
+                lines.append(f"  {desc.splitlines()[0]}")
             lines.append("")
 
+        lines.append(
+            "Use the signature exactly. Required arguments must be present, and "
+            "do not invent argument names that are not shown."
+        )
+        lines.append("")
         lines.append(
             "If you do not need to call a tool, respond normally instead of "
             "emitting a tool-call JSON object."
@@ -181,130 +237,216 @@ class ToolKit:
 
     # ---------- Validation + execution ----------
 
+    def _argument_shape(self, fn: Callable[..., Any]) -> Dict[str, Any]:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        accepted = [
+            name
+            for name, param in params.items()
+            if param.kind
+            in (
+                param.POSITIONAL_OR_KEYWORD,
+                param.KEYWORD_ONLY,
+            )
+        ]
+        required = [
+            name
+            for name, param in params.items()
+            if param.kind
+            in (
+                param.POSITIONAL_OR_KEYWORD,
+                param.KEYWORD_ONLY,
+            )
+            and param.default is inspect._empty
+        ]
+        return {
+            "signature": sig,
+            "params": params,
+            "accepted": accepted,
+            "required": required,
+            "has_varkw": any(
+                param.kind == param.VAR_KEYWORD for param in params.values()
+            ),
+        }
+
     def check_tool(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Validate a tool-call dict:
+        Validate a textual tool call.
 
-        - structure matches the envelope from to_prompt_type()
-        - tool exists
-        - args is a dict
-        - no unexpected args (unless tool has **kwargs)
-        - all required args are present
-        - best-effort type checks against annotations
-
-        On failure: raise util.TransformError
-        On success: return the (possibly normalized) tool_call dict.
+        Validation remains strict, but failures are now structured and
+        actionable: missing/unexpected argument names, expected arguments and
+        received arguments are all exposed through ToolCallError.public_dict().
         """
         if not isinstance(tool_call, dict):
-            raise util.TransformError("invalid-object-structure")
+            raise ToolCallError(
+                "invalid-object-structure",
+                detail="Tool call must be a JSON object.",
+                received_type=type(tool_call).__name__,
+                raw=tool_call,
+            )
 
         if tool_call.get("type") != self.TOOL_CALL_TYPE:
-            raise util.TransformError("invalid-tool-call-type")
+            raise ToolCallError(
+                "invalid-tool-call-type",
+                detail=f"Tool call type must be {self.TOOL_CALL_TYPE!r}.",
+                raw=tool_call,
+            )
 
         tool_name = tool_call.get("tool")
-        if not isinstance(tool_name, str):
-            raise util.TransformError("invalid-tool-name")
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ToolCallError(
+                "invalid-tool-name",
+                detail="Tool call must include a non-empty string `tool` name.",
+                available_tools=sorted(self._tools),
+                raw=tool_call,
+            )
 
         fn = self._tools.get(tool_name)
         if fn is None:
-            raise util.TransformError("no-such-tool")
+            raise ToolCallError(
+                "no-such-tool",
+                detail=f"Unknown tool {tool_name!r}.",
+                tool=tool_name,
+                available_tools=sorted(self._tools),
+                raw=tool_call,
+            )
 
         args = tool_call.get("args", {})
         if not isinstance(args, dict):
-            raise util.TransformError("invalid-tool-args")
+            raise ToolCallError(
+                "invalid-tool-args",
+                detail=f"Arguments for {tool_name} must be a JSON object.",
+                tool=tool_name,
+                expected=sorted(self._argument_shape(fn)["accepted"]),
+                received_type=type(args).__name__,
+                raw=tool_call,
+            )
 
-        sig = inspect.signature(fn)
-        params = sig.parameters
-        has_varkw = any(p.kind == p.VAR_KEYWORD for p in params.values())
+        shape = self._argument_shape(fn)
+        expected = sorted(shape["accepted"])
+        received = sorted(args)
 
-        # 1) Unexpected args (unless function accepts **kwargs)
-        allowed_kw = {
-            name
-            for name, p in params.items()
-            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-        }
-        unexpected = set(args) - allowed_kw
-        if unexpected and not has_varkw:
-            raise util.TransformError("unexpected-tool-arg")
+        unexpected = sorted(set(args) - set(shape["accepted"]))
+        if unexpected and not shape["has_varkw"]:
+            names = ", ".join(repr(name) for name in unexpected)
+            raise ToolCallError(
+                "unexpected-tool-arg",
+                detail=(
+                    f"Unexpected argument"
+                    f"{'s' if len(unexpected) != 1 else ''} for {tool_name}: "
+                    f"{names}. Expected arguments: {', '.join(expected) or '(none)'}."
+                ),
+                tool=tool_name,
+                expected=expected,
+                received=received,
+                unexpected=unexpected,
+                raw=tool_call,
+            )
 
-        # 2) Missing required args
-        missing = [
-            name
-            for name, p in params.items()
-            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-            and p.default is inspect._empty
-            and name not in args
-        ]
+        missing = sorted(name for name in shape["required"] if name not in args)
         if missing:
-            raise util.TransformError("missing-tool-arg")
+            names = ", ".join(repr(name) for name in missing)
+            raise ToolCallError(
+                "missing-tool-arg",
+                detail=(
+                    f"Missing required argument"
+                    f"{'s' if len(missing) != 1 else ''} for {tool_name}: "
+                    f"{names}. Expected arguments: {', '.join(expected) or '(none)'}."
+                ),
+                tool=tool_name,
+                expected=expected,
+                received=received,
+                missing=missing,
+                raw=tool_call,
+            )
 
-        # 3) Best-effort type checks based on annotations
-        ann = getattr(fn, "__annotations__", {}) or {}
-        for name, expected in ann.items():
-            if name == "return":
-                continue
-            if name not in args:
+        annotations = getattr(fn, "__annotations__", {}) or {}
+        for name, expected_type in annotations.items():
+            if name == "return" or name not in args:
                 continue
             value = args[name]
-            if not self._type_ok(value, expected):
-                raise util.TransformError("invalid-tool-arg-type")
+            if not self._type_ok(value, expected_type):
+                formatted = _format_type(expected_type)
+                raise ToolCallError(
+                    "invalid-tool-arg-type",
+                    detail=(
+                        f"Argument {name!r} for {tool_name} must be {formatted}; "
+                        f"received {type(value).__name__}."
+                    ),
+                    tool=tool_name,
+                    expected=expected,
+                    received=received,
+                    argument=name,
+                    expected_type=formatted,
+                    received_type=type(value).__name__,
+                    raw=tool_call,
+                )
 
         return tool_call
 
     def call_tool(self, tool_call: Dict[str, Any]) -> Any:
+        """
+        Validate and execute a tool from synchronous code.
+
+        Async tools are bridged to a result transparently.
+        """
         checked = self.check_tool(tool_call)
         tool_name = checked["tool"]
         args = checked.get("args", {})
         fn = self._tools[tool_name]
+
         try:
             result = fn(**args)
-            if inspect.isawaitable(result):
+        except TypeError as exc:
+            raise ToolCallError(
+                "tool-call-failed",
+                detail=f"Tool {tool_name} rejected the supplied arguments: {exc}",
+                tool=tool_name,
+                expected=sorted(self._argument_shape(fn)["accepted"]),
+                received=sorted(args),
+                raw=tool_call,
+            ) from exc
 
-                async def one_result():
-                    yield await result
-
-                return list(BiStream(one_result()))[0]
-            return result
-        except TypeError as e:
-            raise util.TransformError("tool-call-failed") from e
+        if inspect.isawaitable(result):
+            return _run_awaitable_sync(result)
+        return result
 
     async def acall_tool(self, tool_call: Dict[str, Any]) -> Any:
+        """
+        Validate and execute a tool from asynchronous code.
+
+        Sync tools return normally; awaitable results are awaited.
+        """
         checked = self.check_tool(tool_call)
         tool_name = checked["tool"]
         args = checked.get("args", {})
         fn = self._tools[tool_name]
+
         try:
             result = fn(**args)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        except TypeError as e:
-            raise util.TransformError("tool-call-failed") from e
+        except TypeError as exc:
+            raise ToolCallError(
+                "tool-call-failed",
+                detail=f"Tool {tool_name} rejected the supplied arguments: {exc}",
+                tool=tool_name,
+                expected=sorted(self._argument_shape(fn)["accepted"]),
+                received=sorted(args),
+                raw=tool_call,
+            ) from exc
+
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     # ---------- Internal: best-effort type compatibility ----------
 
     @staticmethod
     def _type_ok(value: Any, annotation: Any) -> bool:
-        """
-        Best-effort runtime compatibility check:
-
-        - Any / empty -> always OK
-        - Union[...] / Optional[...] -> any branch OK
-        - Literal[...] -> value must be one of the literals
-        - Sequence / list[...] -> value must be a list
-        - Mapping / dict[...] -> value must be a dict
-        - Plain class -> isinstance(value, annotation)
-        - Simple string annotations like "int", "str", "Optional[str]" handled specially
-        - Everything else -> permissive True (don't over-reject)
-        """
         if annotation is Any or annotation is inspect._empty:
             return True
 
-        # Handle string annotations (from `from __future__ import annotations`)
         if isinstance(annotation, str):
             ann_str = annotation.strip()
-
-            # Simple builtin type names
             builtin_map = {
                 "int": int,
                 "str": str,
@@ -318,21 +460,21 @@ class ToolKit:
             if ann_str in builtin_map:
                 return isinstance(value, builtin_map[ann_str])
 
-            # Optional[T] in string form
             if ann_str.startswith("Optional[") and ann_str.endswith("]"):
-                inner_str = ann_str[len("Optional[") : -1].strip()
+                inner = ann_str[len("Optional[") : -1].strip()
                 if value is None:
                     return True
-                return ToolKit._type_ok(value, inner_str)
+                return ToolKit._type_ok(value, inner)
 
-            # If it's some complex string we don't recognize, be permissive
+            # `from __future__ import annotations` can leave richer types as
+            # strings. Stay permissive rather than rejecting valid calls.
             return True
 
         origin = get_origin(annotation)
         args = get_args(annotation)
 
         if origin is Union:
-            return any(ToolKit._type_ok(value, a) for a in args)
+            return any(ToolKit._type_ok(value, branch) for branch in args)
 
         if origin is Literal:
             return value in args
@@ -346,7 +488,6 @@ class ToolKit:
         if isinstance(annotation, type):
             return isinstance(value, annotation)
 
-        # Fallback – be permissive
         return True
 
 
@@ -358,40 +499,29 @@ def to_summary(
     description: Optional[str] = None,
     is_async: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """
-    Build the LLM-facing tool descriptor for a function.
-
-    - name: override tool name (defaults to fn.__name__)
-    - types: override parameter annotations dict (defaults to fn.__annotations__ without 'return')
-    - description: override description (defaults to fn.__doc__ or "")
-    - is_async: override async flag (defaults to inspect.iscoroutinefunction(fn))
-    """
     try:
         sig = inspect.signature(fn)
     except (ValueError, TypeError):
         sig = None
 
-    ann = getattr(fn, "__annotations__", {}) or {}
-
+    annotations = getattr(fn, "__annotations__", {}) or {}
     if types is not None:
         raw_schema: Dict[str, Any] = types
     else:
         raw_schema = {}
-
         if sig is not None:
-            # Use the signature for parameter *names*,
-            # but annotations (if present) for types.
             for pname, param in sig.parameters.items():
                 if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
                     continue
-                raw_schema[pname] = ann.get(pname, Any)
+                raw_schema[pname] = annotations.get(pname, Any)
         else:
-            # Fallback: just use annotations (may miss some params).
-            raw_schema = {k: v for k, v in ann.items() if k != "return"}
+            raw_schema = {
+                key: value for key, value in annotations.items() if key != "return"
+            }
 
-    norm_schema: Dict[str, Any] = {arg: _to_schema(t) for arg, t in raw_schema.items()}
-
-    signature_str = _format_signature(fn, sig=sig, annotations=ann)
+    norm_schema = {
+        argument: _to_schema(annotation) for argument, annotation in raw_schema.items()
+    }
 
     return {
         "name": name or fn.__name__,
@@ -401,48 +531,39 @@ def to_summary(
         "async": bool(
             is_async if is_async is not None else inspect.iscoroutinefunction(fn)
         ),
-        "signature": signature_str,
+        "signature": _format_signature(
+            fn,
+            sig=sig,
+            annotations=annotations,
+        ),
     }
 
 
-def _format_type(ann: Any) -> str:
-    """
-    Best-effort pretty-printer for type annotations.
-
-    - Optional[str] instead of Union[str, NoneType]
-    - Strip leading 'typing.'
-    - Builtins by bare name
-    - Fallback to str(...)
-    """
-    if ann is inspect._empty:
+def _format_type(annotation: Any) -> str:
+    if annotation is inspect._empty:
         return "Any"
 
-    # Forward-ref / string annotation
-    if isinstance(ann, str):
-        return ann
+    if isinstance(annotation, str):
+        return annotation
 
-    origin = get_origin(ann)
-    args = get_args(ann)
+    origin = get_origin(annotation)
+    args = get_args(annotation)
 
-    # Optional[T]
     if origin is Union and args:
-        non_none = [a for a in args if a is not type(None)]  # noqa: E721
-        if len(non_none) == 1 and len(args) == 2 and type(None) in args:  # noqa: E721
+        non_none = [branch for branch in args if branch is not type(None)]
+        if len(non_none) == 1 and len(args) == 2 and type(None) in args:
             return f"Optional[{_format_type(non_none[0])}]"
-        # General Union
-        return " | ".join(_format_type(a) for a in args)
+        return " | ".join(_format_type(branch) for branch in args)
 
-    # Normal classes
-    if isinstance(ann, type):
-        if ann.__module__ == "builtins":
-            return ann.__name__
-        return f"{ann.__module__}.{ann.__qualname__}"
+    if isinstance(annotation, type):
+        if annotation.__module__ == "builtins":
+            return annotation.__name__
+        return f"{annotation.__module__}.{annotation.__qualname__}"
 
-    # Fallback
-    s = str(ann)
-    if s.startswith("typing."):
-        s = s[len("typing.") :]
-    return s
+    text = str(annotation)
+    if text.startswith("typing."):
+        text = text[len("typing.") :]
+    return text
 
 
 def _format_signature(
@@ -451,11 +572,6 @@ def _format_signature(
     sig: inspect.Signature | None = None,
     annotations: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Produce a compact Python-ish signature string:
-
-        spit(file_path: str, content: str, mode: Optional[str] = None) -> None
-    """
     if sig is None:
         try:
             sig = inspect.signature(fn)
@@ -466,98 +582,71 @@ def _format_signature(
         annotations = getattr(fn, "__annotations__", {}) or {}
 
     parts: list[str] = []
-
     for param in sig.parameters.values():
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
-            # for LLM tools, *args/**kwargs are almost never useful
             continue
 
-        name = param.name
-        ann = annotations.get(name, inspect._empty)
-        type_str = _format_type(ann)
-
+        type_str = _format_type(annotations.get(param.name, inspect._empty))
         if param.default is inspect._empty:
-            parts.append(f"{name}: {type_str}")
+            parts.append(f"{param.name}: {type_str}")
         else:
-            default_repr = repr(param.default)
-            parts.append(f"{name}: {type_str} = {default_repr}")
+            parts.append(f"{param.name}: {type_str} = {param.default!r}")
 
-    ret_ann = annotations.get("return", inspect._empty)
-    ret_str = _format_type(ret_ann) if ret_ann is not inspect._empty else "Any"
-
-    fn_name = getattr(fn, "__name__", "<fn>")
-    return f"{fn_name}({', '.join(parts)}) -> {ret_str}"
+    ret = annotations.get("return", inspect._empty)
+    ret_str = _format_type(ret) if ret is not inspect._empty else "Any"
+    return f"{getattr(fn, '__name__', '<fn>')}" f"({', '.join(parts)}) -> {ret_str}"
 
 
-def _to_schema(ann: Any) -> Dict[str, Any]:
-    """
-    Convert a Python type annotation into a lightweight, JSON-serializable
-    schema dict.
-
-    This is intentionally minimal and geared toward documentation / prompts:
-    - Always includes a human-readable "type" string (via _format_type).
-    - Adds a bit of structure for common containers and Literal.
-    """
-    # No annotation / fully dynamic
-    if ann is inspect._empty or ann is Any:
+def _to_schema(annotation: Any) -> Dict[str, Any]:
+    if annotation is inspect._empty or annotation is Any:
         return {"type": "Any"}
 
-    # Forward-ref / string annotation
-    if isinstance(ann, str):
-        return {"type": ann}
+    if isinstance(annotation, str):
+        return {"type": annotation}
 
-    origin = get_origin(ann)
-    args = get_args(ann)
+    origin = get_origin(annotation)
+    args = get_args(annotation)
 
-    # Optional / Union[...] (we just pretty-print it)
     if origin is Union and args:
-        return {"type": _format_type(ann)}
+        return {"type": _format_type(annotation)}
 
-    # Literal[...] -> record enum values
     if origin is Literal:
         return {
             "type": "Literal",
             "enum": list(args),
         }
 
-    # List[T] / Sequence[T]
     if origin in (list, ABCSequence):
-        item_ann = args[0] if args else Any
+        item = args[0] if args else Any
         return {
-            "type": f"List[{_format_type(item_ann)}]",
-            "items": _to_schema(item_ann),
+            "type": f"List[{_format_type(item)}]",
+            "items": _to_schema(item),
         }
 
-    # Dict[K, V] / Mapping[K, V]
     if origin in (dict, ABCMapping):
-        key_ann = args[0] if len(args) > 0 else Any
-        val_ann = args[1] if len(args) > 1 else Any
+        key = args[0] if len(args) > 0 else Any
+        value = args[1] if len(args) > 1 else Any
         return {
-            "type": f"Dict[{_format_type(key_ann)}, {_format_type(val_ann)}]",
-            "keys": _to_schema(key_ann),
-            "values": _to_schema(val_ann),
+            "type": f"Dict[{_format_type(key)}, {_format_type(value)}]",
+            "keys": _to_schema(key),
+            "values": _to_schema(value),
         }
 
-    # Tuple[...] (fixed-length or variadic)
     if origin is tuple or origin is Tuple:
         if not args:
             return {"type": "Tuple[Any, ...]"}
         if len(args) == 2 and args[1] is Ellipsis:
-            # Tuple[T, ...]
-            item_ann = args[0]
+            item = args[0]
             return {
-                "type": f"Tuple[{_format_type(item_ann)}, ...]",
-                "items": _to_schema(item_ann),
+                "type": f"Tuple[{_format_type(item)}, ...]",
+                "items": _to_schema(item),
             }
-        # Tuple[T1, T2, ...]
         return {
-            "type": f"Tuple[{', '.join(_format_type(a) for a in args)}]",
-            "items": [_to_schema(a) for a in args],
+            "type": ("Tuple[" + ", ".join(_format_type(item) for item in args) + "]"),
+            "items": [_to_schema(item) for item in args],
         }
 
-    # Plain class / builtin / custom type
-    if isinstance(ann, type):
-        return {"type": _format_type(ann)}
+    if isinstance(annotation, type):
+        return {"type": _format_type(annotation)}
 
-    # Fallback: just stringify via _format_type
-    return {"type": _format_type(ann)}
+    return {"type": _format_type(annotation)}
