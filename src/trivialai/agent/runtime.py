@@ -8,6 +8,7 @@ import enum
 import inspect
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -49,7 +50,9 @@ def json_safe(value: Any, _seen: Optional[set[int]] = None) -> Any:
 
     if _seen is None:
         _seen = set()
-    track = isinstance(value, (Mapping, Sequence, set, frozenset)) or dataclasses.is_dataclass(value)
+    track = isinstance(
+        value, (Mapping, Sequence, set, frozenset)
+    ) or dataclasses.is_dataclass(value)
     value_id = id(value)
     if track:
         if value_id in _seen:
@@ -95,7 +98,13 @@ def _json_key(value: Any) -> str:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _error_message(exc: BaseException) -> str:
@@ -180,6 +189,24 @@ def _protocol_error(
     return event
 
 
+def _looks_like_protocol_attempt(content: str) -> bool:
+    """Return whether malformed text appears to be an Agent protocol envelope.
+
+    Ordinary prose and arbitrary non-protocol output are valid terminal
+    responses. This deliberately recognizes only the conventional leading
+    ``type``/``tool`` keys so malformed attempts to speak the reserved
+    protocol can still benefit from ``stream_checked`` repair retries without
+    classifying JSON-looking user-facing content broadly as protocol.
+    """
+    text = str(content or "").lstrip()
+    return bool(
+        re.match(
+            r"^\{\s*[\"'](?:type|tool)[\"']\s*:",
+            text,
+        )
+    )
+
+
 def _parse_decision(
     content: Any,
     *,
@@ -187,72 +214,172 @@ def _parse_decision(
 ) -> Dict[str, Any]:
     """Parse and normalize one agent-loop decision.
 
-    Canonical decisions remain ``tool-call`` and ``final``. For registered
-    tools only, tolerate the two common collapsed envelopes produced by small
-    models::
+    Tool calls use a reserved JSON protocol. Final responses may either use the
+    explicit ``{"type":"final","content":"..."}`` envelope or be ordinary
+    unstructured model output.
+
+    For registered tools only, tolerate the two common collapsed envelopes
+    produced by small models::
 
         {"type":"repo_edit","path":"x","old":"a","new":"b"}
         {"tool":"repo_edit","args":{"path":"x","old":"a","new":"b"}}
 
-    Unknown type values remain protocol errors.
+    A JSON object containing an explicit but unknown ``type`` is treated as a
+    malformed protocol decision rather than as a final response.
     """
     if not isinstance(content, str):
-        raise TransformError("agent-decision-not-text", raw=content)
+        raise TransformError(
+            "agent-decision-not-text",
+            raw=content,
+        )
+
     try:
         parsed = util.loadch(content)
     except TransformError:
-        raise
+        # Ordinary prose is a valid terminal response, but malformed text that
+        # clearly begins as an Agent protocol envelope should remain invalid so
+        # stream_checked() can repair/retry it.
+        if _looks_like_protocol_attempt(content):
+            raise
+        return {
+            "type": "final",
+            "content": content,
+        }
     except Exception as exc:
-        raise TransformError("invalid-agent-decision-json", raw=content) from exc
+        if _looks_like_protocol_attempt(content):
+            raise TransformError(
+                "invalid-agent-decision-json",
+                raw=content,
+            ) from exc
+        return {
+            "type": "final",
+            "content": content,
+        }
+
     if not isinstance(parsed, dict):
-        raise TransformError("invalid-agent-decision", raw=content)
+        # Valid non-object JSON is still ordinary model output rather than an
+        # agent protocol decision.
+        return {
+            "type": "final",
+            "content": content,
+        }
 
     decision_type = parsed.get("type")
+
     if decision_type == "tool-call":
         if (
             not isinstance(parsed.get("tool"), str)
             or not parsed.get("tool")
             or not isinstance(parsed.get("args"), dict)
         ):
-            raise TransformError("invalid-tool-call-decision", raw=content)
-        return {"type":"tool-call", "tool":parsed["tool"], "args":parsed["args"]}
+            raise TransformError(
+                "invalid-tool-call-decision",
+                raw=content,
+            )
+
+        return {
+            "type": "tool-call",
+            "tool": parsed["tool"],
+            "args": parsed["args"],
+        }
 
     if decision_type == "final":
         if not isinstance(parsed.get("content"), str):
-            raise TransformError("invalid-final-decision", raw=content)
-        return {"type":"final", "content":parsed["content"]}
+            raise TransformError(
+                "invalid-final-decision",
+                raw=content,
+            )
 
+        return {
+            "type": "final",
+            "content": parsed["content"],
+        }
+
+    # Small-model compatibility:
+    #
+    #     {"type":"repo_edit","path":"x","old":"a","new":"b"}
+    #
+    # or:
+    #
+    #     {"type":"repo_edit","args":{"path":"x", ...}}
+    #
+    # A registered tool name is the only non-canonical value allowed in the
+    # reserved `type` field.
     if tools is not None and tools.has_tool(decision_type):
         nested_args = parsed.get("args")
+
         if isinstance(nested_args, dict) and set(parsed).issubset(
-            {"type", "args", "tool_call_id", "step", "attempt"}
+            {
+                "type",
+                "args",
+                "tool_call_id",
+                "step",
+                "attempt",
+            }
         ):
             args = nested_args
         else:
             args = {
-                key: value for key, value in parsed.items()
-                if key not in {"type", "tool_call_id", "step", "attempt"}
+                key: value
+                for key, value in parsed.items()
+                if key
+                not in {
+                    "type",
+                    "tool_call_id",
+                    "step",
+                    "attempt",
+                }
             }
-        return {"type":"tool-call", "tool":decision_type, "args":args}
 
+        return {
+            "type": "tool-call",
+            "tool": decision_type,
+            "args": args,
+        }
+
+    # Once a model explicitly emits `type`, it has entered the reserved agent
+    # protocol namespace. Unknown values should therefore be repaired/retried,
+    # not silently surfaced to the user as a final response.
+    if "type" in parsed:
+        raise TransformError(
+            "invalid-agent-decision-type",
+            raw=content,
+        )
+
+    # Also tolerate:
+    #
+    #     {"tool":"repo_edit","args":{...}}
+    #
+    # when the named tool is actually registered.
     if (
-        decision_type is None
-        and tools is not None
+        tools is not None
         and tools.has_tool(parsed.get("tool"))
         and isinstance(parsed.get("args"), dict)
     ):
-        return {"type":"tool-call", "tool":parsed["tool"], "args":parsed["args"]}
+        return {
+            "type": "tool-call",
+            "tool": parsed["tool"],
+            "args": parsed["args"],
+        }
 
-    raise TransformError("invalid-agent-decision-type", raw=content)
+    # Arbitrary JSON that does not enter the reserved protocol namespace is a
+    # legitimate user-facing response, just like ordinary prose.
+    return {
+        "type": "final",
+        "content": content,
+    }
 
 
 def _final_check_error_payload(value: Any) -> Optional[Dict[str, Any]]:
     if value is None or value is True:
         return None
     if value is False:
-        return {"type":"final-check-error", "message":"The final decision is not yet allowed."}
+        return {
+            "type": "final-check-error",
+            "message": "The final decision is not yet allowed.",
+        }
     if isinstance(value, str):
-        return {"type":"final-check-error", "message":value}
+        return {"type": "final-check-error", "message": value}
     if isinstance(value, Mapping):
         payload = dict(json_safe(value))
         if payload.get("ok") is True:
@@ -261,7 +388,7 @@ def _final_check_error_payload(value: Any) -> Optional[Dict[str, Any]]:
         payload.setdefault("type", "final-check-error")
         payload.setdefault("message", "The final decision is not yet allowed.")
         return payload
-    return {"type":"final-check-error", "message":str(value)}
+    return {"type": "final-check-error", "message": str(value)}
 
 
 async def _check_final_decision(
@@ -453,9 +580,7 @@ def run_agent(
                     code="agent-protocol-error",
                     attempts=checked_final.get("attempts", decision_retries),
                     raw=_clip_raw(
-                        last_failed_raw
-                        if last_failed_raw is not None
-                        else completed
+                        last_failed_raw if last_failed_raw is not None else completed
                     ),
                 )
                 return
@@ -509,8 +634,8 @@ def run_agent(
                     }
                     history.append(
                         (
-                            {"type":"final", "content":decision["content"]},
-                            {"type":"final-check", "ok":False, "error":rejection},
+                            {"type": "final", "content": decision["content"]},
+                            {"type": "final-check", "ok": False, "error": rejection},
                         )
                     )
                     continue

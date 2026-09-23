@@ -325,18 +325,24 @@ def _agent_protocol_section() -> str:
         """
         ## Agent protocol
 
-        You are executing inside an automated tool loop. Every completed model turn MUST be
-        exactly one JSON object and nothing else. Do not wrap the object in Markdown fences
-        and do not emit commentary before or after it.
+        You are executing inside an automated tool loop. Tool calls use a strict
+        machine-readable protocol; ordinary user-facing responses do not.
 
-        To call exactly one tool:
+        To call exactly one tool, your entire completed turn MUST be exactly one
+        JSON object and nothing else. Do not wrap the object in Markdown fences
+        and do not emit commentary before or after it:
         {"type":"tool-call","tool":"tool_name","args":{"arg":"value"}}
 
         Only `type`, `tool`, and `args` are model-controlled for a tool call.
         Runtime fields such as `tool_call_id`, `step`, and `attempt` are assigned
         automatically; do not copy them from execution history.
 
-        To finish the task:
+        When you are ready to stop using tools, respond normally to the user. A
+        normal response ends the tool loop. This includes a completed answer, a
+        report that some requested work could not be completed, or a request for
+        clarification.
+
+        For backwards compatibility, you may alternatively finish with:
         {"type":"final","content":"Here is the final answer."}
 
         Use only tool names and argument shapes listed below. A tool call is an action request,
@@ -344,8 +350,8 @@ def _agent_protocol_section() -> str:
         correct or change the next action; do not repeat an identical failed call unless the
         result indicates that retrying unchanged may succeed.
 
-        Do not use an unstructured response as the final answer. Tool results from earlier
-        steps appear in the execution history below; use them when deciding the next step.
+        Tool results from earlier steps appear in the execution history below; use them when
+        deciding the next step.
         """
     ).strip()
 
@@ -442,11 +448,6 @@ def build_agent_prompt(
     base_section = _build_base_section(base_system_prompt)
     protocol_section = _agent_protocol_section()
     tools_section = tools.to_tool_prompt()
-    tools_section = tools_section.replace(
-        "If you do not need to call a tool, respond normally instead of emitting a "
-        "tool-call JSON object.",
-        "",
-    ).strip()
     summary_section = _build_summary_section(context_summary)
     memory_section = _build_memory_section(memory, user_prompt)
     return _join_agent_sections(

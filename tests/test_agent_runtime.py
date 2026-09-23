@@ -40,7 +40,7 @@ class FakeLLM(LLMMixin):
 
 
 class AgentRuntimeTests(unittest.TestCase):
-    def make_agent(self, llm, *tools):
+    def make_agent(self, llm, *tools, final_check=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return Agent(
@@ -49,6 +49,7 @@ class AgentRuntimeTests(unittest.TestCase):
             tools=list(tools),
             name="runtime-test",
             root=Path(tmp.name),
+            final_check=final_check,
         )
 
     def test_textual_tool_call_result_then_final(self):
@@ -273,7 +274,28 @@ class AgentRuntimeTests(unittest.TestCase):
         failed = [e for e in events if e["type"] == "tool-result" and not e["ok"]]
         self.assertEqual(len(failed), 1)
 
-    def test_invalid_decision_is_retried_without_consuming_agent_step(self):
+    def test_plain_prose_is_terminal(self):
+        for content in (
+            "I completed the requested work.",
+            "I could not complete one part of the request.",
+            "What do you mean by the final requirement?",
+        ):
+            with self.subTest(content=content):
+                llm = FakeLLM([content])
+                events = list(self.make_agent(llm).run("Handle it."))
+                self.assertEqual(
+                    events[-1],
+                    {"type": "final", "content": content, "steps": 1},
+                )
+                self.assertFalse(
+                    any(
+                        event.get("type") == "model-attempt-failed"
+                        for event in events
+                    )
+                )
+                self.assertEqual(len(llm.system_prompts), 1)
+
+    def test_plain_prose_after_tool_call_is_terminal(self):
         seen = []
 
         def echo(value: int):
@@ -282,9 +304,42 @@ class AgentRuntimeTests(unittest.TestCase):
 
         llm = FakeLLM(
             [
-                "I should call the tool now.",
                 {"type": "tool-call", "tool": "echo", "args": {"value": 7}},
-                {"type": "final", "content": "done"},
+                "The tool returned 7, so the task is complete.",
+            ]
+        )
+        events = list(self.make_agent(llm, echo).run("Use echo."))
+        self.assertEqual(seen, [7])
+        self.assertEqual(
+            events[-1],
+            {
+                "type": "final",
+                "content": "The tool returned 7, so the task is complete.",
+                "steps": 2,
+            },
+        )
+
+    def test_arbitrary_json_is_terminal_without_reserialization(self):
+        content = '{"answer": 42, "details": [1, 2, 3]}'
+        llm = FakeLLM([content])
+        events = list(self.make_agent(llm).run("Answer."))
+        self.assertEqual(
+            events[-1],
+            {"type": "final", "content": content, "steps": 1},
+        )
+
+    def test_malformed_reserved_protocol_is_retried_without_consuming_step(self):
+        seen = []
+
+        def echo(value: int):
+            seen.append(value)
+            return value
+
+        llm = FakeLLM(
+            [
+                '{"type":"tool-call","tool":"echo","args":',
+                {"type": "tool-call", "tool": "echo", "args": {"value": 7}},
+                "done",
             ]
         )
 
@@ -297,14 +352,79 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(seen, [7])
         self.assertEqual(events[-1], {"type": "final", "content": "done", "steps": 2})
-
         failures = [
-            event for event in events if event.get("type") == "model-attempt-failed"
+            event
+            for event in events
+            if event.get("type") == "model-attempt-failed"
         ]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["step"], 0)
         self.assertEqual(failures[0]["attempt"], 1)
         self.assertEqual(len(llm.system_prompts), 3)
+
+    def test_malformed_explicit_final_is_retried(self):
+        llm = FakeLLM(
+            [
+                {"type": "final", "content": 123},
+                {"type": "final", "content": "fixed"},
+            ]
+        )
+        events = list(
+            self.make_agent(llm).run(
+                "Finish.",
+                decision_retries=2,
+            )
+        )
+        self.assertEqual(
+            events[-1],
+            {"type": "final", "content": "fixed", "steps": 1},
+        )
+        failures = [
+            event
+            for event in events
+            if event.get("type") == "model-attempt-failed"
+        ]
+        self.assertEqual(len(failures), 1)
+
+    def test_final_check_applies_to_plain_prose(self):
+        checks = []
+
+        def final_check(content, history):
+            checks.append((content, history))
+            if content == "not yet":
+                return "Keep working."
+            return True
+
+        llm = FakeLLM(["not yet", "okay now"])
+        events = list(
+            self.make_agent(llm, final_check=final_check).run("Finish correctly.")
+        )
+
+        rejected = next(event for event in events if event["type"] == "final-rejected")
+        self.assertEqual(rejected["content"], "not yet")
+        self.assertEqual(rejected["error"]["message"], "Keep working.")
+        self.assertEqual(
+            events[-1],
+            {"type": "final", "content": "okay now", "steps": 2},
+        )
+        self.assertEqual(checks[0], ("not yet", []))
+        self.assertEqual(checks[1][0], "okay now")
+        self.assertEqual(checks[1][1][0][0]["type"], "final")
+        self.assertEqual(checks[1][1][0][1]["type"], "final-check")
+
+    def test_agent_prompt_allows_normal_terminal_responses(self):
+        def search(query: str):
+            return query
+
+        prompt = build_agent_prompt(
+            "SYSTEM",
+            "task",
+            ToolKit(search),
+        )
+        self.assertIn("When you are ready to stop using tools, respond normally", prompt)
+        self.assertIn("If you do not need to call a tool, respond normally", prompt)
+        self.assertNotIn("Every completed model turn MUST be", prompt)
+        self.assertNotIn("Do not use an unstructured response as the final answer", prompt)
 
     def test_prompt_trimming_keeps_tools_and_latest_complete_pair(self):
         def search(query: str):
