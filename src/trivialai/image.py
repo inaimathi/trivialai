@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import tempfile
 from asyncio import to_thread
 from io import BytesIO
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Collection, Dict, List, Optional, Tuple
 
 import httpx
-from PIL import Image as PILImage
 
 from .bistream import BiStream
 
@@ -32,8 +32,31 @@ def _looks_like_url(obj: Any) -> bool:
     return isinstance(obj, str) and obj.lower().startswith(_URL_SCHEMES)
 
 
+def _pil():
+    """
+    Import Pillow on first use.
+
+    Pillow is only needed to decode or re-encode pixels (``pil_image()``,
+    PIL-backed Pictures).  Bytes- and file-backed Pictures — which is all
+    the HTTP adapters need — work without it, so the import is deferred
+    until something actually asks for pixels.
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError as e:  # pragma: no cover - depends on environment
+        raise ImportError(
+            "This operation needs Pillow, which is not installed. "
+            "Install it with: pip install 'trivialai[image]'"
+        ) from e
+    return PILImage
+
+
 def _looks_like_pil_image(obj: Any) -> bool:
-    return isinstance(obj, PILImage.Image)
+    # A PIL image cannot exist unless PIL.Image has been imported, so
+    # consulting sys.modules gives the exact isinstance answer without
+    # importing Pillow ourselves.
+    mod = sys.modules.get("PIL.Image")
+    return mod is not None and isinstance(obj, mod.Image)
 
 
 def _mime_to_ext(mime: Optional[str]) -> Optional[str]:
@@ -48,6 +71,7 @@ def _mime_to_ext(mime: Optional[str]) -> Optional[str]:
         "image/gif": ".gif",
         "image/bmp": ".bmp",
         "image/tiff": ".tiff",
+        "image/svg+xml": ".svg",
     }.get(m)
 
 
@@ -353,6 +377,11 @@ class Picture:
     def b64(self) -> str:
         return base64.b64encode(self.bytes()).decode("ascii")
 
+    def data_url(self) -> str:
+        """The image as a ``data:<media type>;base64,...`` URL."""
+        media_type, data = encode_image_input(self)
+        return f"data:{media_type};base64,{data}"
+
     def bytes(self) -> bytes:
         if self._bytes is not None:
             return self._bytes
@@ -376,7 +405,7 @@ class Picture:
 
         if self._bytes is not None:
             with BytesIO(self._bytes) as bio:
-                img = PILImage.open(bio)
+                img = _pil().open(bio)
                 img.load()
                 self._pil = img.copy()
             if not self.format:
@@ -386,7 +415,7 @@ class Picture:
             return self._pil
 
         if self._file_path is not None:
-            with PILImage.open(self._file_path) as img:
+            with _pil().open(self._file_path) as img:
                 img.load()
                 self._pil = img.copy()
                 if not self.format:
@@ -474,9 +503,38 @@ class Picture:
         return f"Picture({', '.join(parts)})"
 
 
+def encode_image_input(
+    obj: Any, *, allowed: Optional[Collection[str]] = None
+) -> Tuple[str, str]:
+    """
+    Prepare an image-like object for sending to a model API.
+
+    Returns ``(media_type, base64_data)``.  The media type is taken from
+    the bytes themselves where possible.  If it cannot be determined, or
+    `allowed` is given and does not include it (BMP for an API that takes
+    only PNG/JPEG/GIF/WebP, say), the image is re-encoded as PNG — the one
+    step here that needs Pillow.
+    """
+    pic = Picture.of(obj)
+    data = pic.bytes()
+    media_type = _guess_media_type_from_bytes(data) or pic.media_type
+
+    if media_type is None or (allowed is not None and media_type not in allowed):
+        buf = BytesIO()
+        pic.pil_image().save(buf, format="PNG")
+        data = buf.getvalue()
+        media_type = "image/png"
+
+    return media_type, base64.b64encode(data).decode("ascii")
+
+
 # ---------------------------------------------------------------------------
 # ImageMixin
 # ---------------------------------------------------------------------------
+
+
+# Sentinel: "use the class's MAX_REFERENCE_IMAGES" (None already means no cap).
+_CLASS_LIMIT: Any = object()
 
 
 class ImageMixin:
@@ -488,12 +546,80 @@ class ImageMixin:
       - aimagen(prompt, image=None, model=None, **kwargs) -> Picture
       - imagestream(prompt, image=None, model=None, **kwargs) -> BiStream[dict]
 
-    Providers may interpret `image` as:
+    `image` is either one image-like object or an ordered list/tuple of
+    them (reference images).  An image-like object is a Picture, raw bytes,
+    a file path, an http(s) URL, or a PIL image.
+
+    Providers may interpret the image(s) as:
       - img2img init image
       - edit/inpaint source image
-      - conditioning image
-      - ignored (for text-only image models)
+      - conditioning / reference images, in the order given (prompts can
+        refer to them as "image 1", "image 2", ...)
+
+    A provider that cannot take as many references as it was given raises
+    ValueError instead of silently dropping some; see MAX_REFERENCE_IMAGES.
     """
+
+    # Largest number of input images one request may carry.  None means no
+    # limit is enforced here and the provider's API decides.
+    MAX_REFERENCE_IMAGES: Optional[int] = None
+
+    @staticmethod
+    def _has_image_input(image: Any) -> bool:
+        """True if `image` names at least one input image (without loading it)."""
+        if image is None:
+            return False
+        if isinstance(image, (list, tuple)):
+            return any(item is not None for item in image)
+        return True
+
+    def _coerce_image_inputs(
+        self,
+        image: Any,
+        *,
+        limit: Any = _CLASS_LIMIT,
+        what: Optional[str] = None,
+    ) -> List[Picture]:
+        """
+        Normalize the `image` argument of generate_image into an ordered
+        list of Pictures (empty for txt2img).
+
+        Accepts one image-like object or a list/tuple of them; ``None``
+        entries are skipped so callers can build lists conditionally.
+        Anything else raises TypeError: a reference that cannot be read
+        must not silently turn an edit into a plain text-to-image call.
+
+        `limit` caps the number of images (default: MAX_REFERENCE_IMAGES;
+        pass None for no cap).  `what` names the model in the error.
+        """
+        if image is None:
+            return []
+
+        items = list(image) if isinstance(image, (list, tuple)) else [image]
+
+        out: List[Picture] = []
+        for item in items:
+            if item is None:
+                continue
+            if _looks_like_url(item):
+                pic: Optional[Picture] = Picture.from_url(item)
+            else:
+                pic = self._coerce_image_result(item)
+            if pic is None:
+                raise TypeError(
+                    "Expected an image-like input (Picture/bytes/file path/"
+                    f"URL/PIL image), got {type(item).__name__}: {item!r}"
+                )
+            out.append(pic)
+
+        if limit is _CLASS_LIMIT:
+            limit = self.MAX_REFERENCE_IMAGES
+        if limit is not None and len(out) > limit:
+            raise ValueError(
+                f"{what or type(self).__name__} accepts at most {limit} "
+                f"input image(s) per request; got {len(out)}."
+            )
+        return out
 
     def _coerce_image_result(self, obj: Any) -> Optional[Picture]:
         if obj is None:
@@ -567,19 +693,51 @@ class ImageMixin:
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> AsyncIterator[Dict[str, Any]]:
-        actual_model = model or getattr(self, "model", None)
+        """
+        Default stream for single-shot providers (no server-side progress):
+
+          {"type": "start",    "provider": ..., "model": ..., "mode": ...}
+          {"type": "progress", "progress": 0.0, "state": "generating", ...}
+          {"type": "end",      "image": Picture, "model": ..., "mode": ...}
+
+        or, on failure, ``{"type": "error", "message": "..."}``.
+
+        The provider name is the class's PROVIDER attribute if it has one,
+        else its lowercased class name; the model is `image_model` where a
+        client keeps separate text and image models.
+        """
+        actual_model = (
+            model or getattr(self, "image_model", None) or getattr(self, "model", None)
+        )
+        provider = getattr(self, "PROVIDER", None) or self.__class__.__name__.lower()
+        mode = "img2img" if self._has_image_input(image) else "txt2img"
 
         yield {
             "type": "start",
-            "provider": self.__class__.__name__.lower(),
+            "provider": provider,
             "model": actual_model,
+            "mode": mode,
+        }
+        yield {
+            "type": "progress",
+            "progress": 0.0,
+            "eta_relative": None,
+            "state": "generating",
+            "textinfo": f"Waiting for {provider} image API…",
         }
 
-        img = await self.agenerate_image(prompt, image=image, model=model, **kwargs)
+        try:
+            img = await self.agenerate_image(prompt, image=image, model=model, **kwargs)
+        except Exception as exc:
+            yield {"type": "error", "message": str(exc)}
+            return
 
         yield {
             "type": "end",
             "image": img,
+            "content": img,
+            "model": actual_model,
+            "mode": mode,
         }
 
     def imagen(

@@ -24,7 +24,7 @@ pip install trivialai
 ## Quick start
 
 ```py
->>> from trivialai import claude, gemini, ollama, chatgpt, bedrock
+>>> from trivialai import claude, gemini, ollama, chatgpt, openrouter, bedrock
 >>> from trivialai.stabdiff import StabDiff
 ```
 
@@ -71,6 +71,19 @@ Use an [OpenAI Platform](https://platform.openai.com) API key:
 
 ```py
 chatgpt.ChatGPT("gpt-4o-mini", os.environ["OPENAI_API_KEY"])
+```
+
+The same key covers image generation; see
+[ChatGPT (OpenAI API) — text + image](#chatgpt-openai-api--text--image). To use an
+OpenAI-compatible server instead, pass `base_url="http://host:port/v1"`.
+
+### OpenRouter
+
+Use an [OpenRouter](https://openrouter.ai/settings/keys) API key. One key reaches text,
+vision and image models from many providers:
+
+```py
+openrouter.OpenRouter("anthropic/claude-sonnet-4.5", os.environ["OPENROUTER_API_KEY"])
 ```
 
 ### Google Gemini
@@ -165,7 +178,8 @@ config edit — no code changes.
 For a role prefix like `compiler_`, the variables are:
 
 * `{prefix}PROVIDER` — one of the registered provider names
-  (`ollama`, `claude`, `chatgpt` / `openai`, `deepseek`, `bedrock`, `gemini`, `stabdiff`),
+  (`ollama`, `claude`, `chatgpt` / `openai`, `openrouter`, `deepseek`, `bedrock`, `gemini`,
+  `stabdiff`),
   case-insensitive.
 * `{prefix}{CAPITALIZED_CONSTRUCTOR_ARG}` — every other variable is the **literal
   constructor parameter name** of that provider class, capitalized. There is no mapping
@@ -282,13 +296,114 @@ performed:
 >>> result.scratchpad  # chain-of-thought
 ```
 
-### ChatGPT (OpenAI API)
+### ChatGPT (OpenAI API) — text + image
+
+`ChatGPT` is a unified client like `Gemini` and `Bedrock`: `model` targets text
+(Chat Completions) and `image_model` targets image generation (Images API). Either can
+be left unset on a client that only does the other.
 
 ```py
 >>> client = chatgpt.ChatGPT("gpt-4o-mini", os.environ["OPENAI_API_KEY"])
 >>> client.generate("sys msg", "Say hi with 'platypus'.").content
 "Hello, platypus!"
 ```
+
+```py
+>>> painter = chatgpt.ChatGPT(
+...     api_key=os.environ["OPENAI_API_KEY"],
+...     image_model="gpt-image-2.6-flare",
+... )
+
+# Text to image. Extra keywords are sent as fields of the Images API request.
+>>> knight = painter.generate_image(
+...     "Full body game sprite of a knight in silver armor, front view",
+...     background="transparent",
+...     size="1024x1024",
+... )
+>>> knight.file()
+'/tmp/trivialai-img-9d2k1xqa.png'
+
+# Edit one image
+>>> blue = painter.generate_image("Recolor the cape royal blue", image=knight)
+
+# Up to 16 ordered reference images
+>>> walk = painter.generate_image(
+...     "A 3x2 walk-cycle sheet of the character in image 1, poses as in image 2.",
+...     image=[knight, "pose-guide.png"],
+... )
+
+# Masked edit: only the mask's fully transparent pixels may change
+>>> painter.generate_image("A red plume", image=knight, mask="plume-mask.png")
+```
+
+The returned `Picture` records what produced it in `.metadata` (`provider`, `model`,
+`mode`, `prompt`, `references`, and `usage` when the API reports it). `n=` asks for
+several images; `image_index=` picks which one is returned.
+
+`client.models()` returns `{"text": [...], "image": [...]}`.
+
+### OpenRouter — text + image
+
+`OpenRouter` is `ChatGPT` pointed at OpenRouter: text and vision calls are the same, and
+model names are OpenRouter IDs.
+
+```py
+>>> from trivialai import openrouter
+>>> judge = openrouter.OpenRouter(
+...     "anthropic/claude-sonnet-4.5", os.environ["OPENROUTER_API_KEY"]
+... )
+>>> judge.generate("sys msg", "Is this sprite readable at 1x?", images=["knight.png"]).content
+"Yes. The silhouette is clear and the sword does not merge with the cape."
+```
+
+Image generation uses OpenRouter's Image API, so any image model it routes to works
+through the same call. Extra keywords are sent as request fields (`aspect_ratio`,
+`resolution`, `quality`, `background`, `output_format`, `seed`, ...); which ones a model
+honours, and how many reference images it takes, depends on the model.
+
+```py
+>>> painter = openrouter.OpenRouter(
+...     api_key=os.environ["OPENROUTER_API_KEY"],
+...     image_model="google/gemini-3.1-flash-image",
+... )
+>>> potion = painter.generate_image("A red potion icon", aspect_ratio="1:1")
+>>> mana = painter.generate_image(
+...     "A blue mana potion in the style of image 1", image=[potion]
+... )
+>>> mana.metadata["cost_usd"]       # the charge OpenRouter reported for this call
+0.0746
+```
+
+`painter.models()` returns `{"text": [...], "image": [...]}`. There is no `mask=`
+here: OpenRouter's Image API has no mask parameter.
+
+### Vision input (images in text prompts)
+
+`generate`, `stream`, `generate_json` and the other text calls take `images=[...]` on
+Claude, ChatGPT, OpenRouter, Gemini and Ollama. The model sees the images, in order, ahead of the
+prompt. Each entry can be a `Picture`, raw bytes, a file path, an http(s) URL, or a
+PIL image.
+
+```py
+>>> client = claude.Claude("claude-sonnet-4-5", os.environ["ANTHROPIC_API_KEY"])
+>>> client.generate(
+...     "You review game sprites.",
+...     "Image 1 is the reference character. Does image 2 show the same character?",
+...     images=["knight.png", "knight-walk-frame-3.png"],
+... ).content
+"Yes: same armour, cape and sword; the plume is a slightly darker red."
+
+>>> client.generate_json(
+...     "Reply with JSON only.",
+...     'Score this sprite as {"readable": 0-10, "problems": [...]}.',
+...     images=[sprite_bytes],
+... ).content
+{'readable': 8, 'problems': ['left boot merges with the outline']}
+```
+
+Claude and ChatGPT accept PNG, JPEG, GIF and WebP; any other format is converted to
+PNG first, which needs Pillow (`pip install "trivialai[image]"`). Bedrock and DeepSeek
+text calls ignore `images`.
 
 ### Gemini (Google) — text + image
 
@@ -314,7 +429,34 @@ Both default to sensible values, so you can use either or both.
 >>> edited = gem.generate_image("Make it sunset colours", image=img)
 >>> edited.file()
 '/tmp/trivialai-img-x7q2kl1m.png'
+
+# Several reference images, in order
+>>> posed = gem.generate_image(
+...     "Draw the character from image 1 in the pose shown by image 2.",
+...     image=[img, "pose-guide.png"],
+... )
 ```
+
+#### Reference images
+
+Every image provider takes `image=` as either one image or an ordered list of them.
+Each entry can be a `Picture`, raw bytes, a file path, an http(s) URL, or a PIL image;
+`None` entries are skipped. The images are sent in the order given, so a prompt can
+refer to them as "image 1", "image 2", and so on.
+
+How many a request can carry depends on the provider, and asking for more raises
+`ValueError` rather than dropping some:
+
+| Provider | Input images per request |
+|---|---|
+| Gemini | as many as the chosen image model accepts |
+| ChatGPT (OpenAI Images) | up to 16 |
+| OpenRouter | up to 16, fewer on some models |
+| Bedrock: Nova Canvas, Titan | up to 5 |
+| Bedrock: Stability | 1 |
+| Stable Diffusion (A1111) | 1 |
+
+An input that cannot be read raises `TypeError`.
 
 Image and text models are independent — you can override either per-call or at construction:
 
@@ -543,6 +685,21 @@ for ev in gem.imagestream("A rainy Tokyo street at night, neon reflections"):
         ev["image"].file("tokyo.png")
 ```
 
+### Example: streaming image (OpenAI)
+
+The Images API call is also single-shot, so the stream has the same shape as Gemini's
+and Bedrock's: `start`, one synthetic `progress`, then `end` (or `error`).
+
+```py
+painter = chatgpt.ChatGPT(api_key=os.environ["OPENAI_API_KEY"], image_model="gpt-image-2.6-flare")
+
+for ev in painter.imagestream("A potion icon", image=["style-reference.png"]):
+    if ev["type"] == "end":
+        ev["image"].file("potion.png")
+    elif ev["type"] == "error":
+        print("Error:", ev["message"])
+```
+
 ### Example: streaming image (Bedrock)
 
 ```py
@@ -697,7 +854,11 @@ vec = embed("hello world")
 ## Notes & compatibility
 
 * **Dependencies:** `httpx` for HTTP providers; `boto3` for Bedrock; `google-genai` + optionally
-  `google-auth` for Gemini. `StabDiff` uses only `httpx` — no extra install step needed.
+  `google-auth` for Gemini. `StabDiff` and `ChatGPT` (text and images) use only `httpx` — no
+  extra install step needed.
+* **Pillow is optional:** it is imported only when pixels have to be decoded or re-encoded
+  (`Picture.pil_image()`, PIL images as input, converting a BMP/TIFF input to PNG). Passing
+  bytes, file paths or URLs around does not need it.
 * **Lazy top-level exports:** `import trivialai` imports nothing heavy. Provider classes
   (`trivialai.Bedrock`, ...) and helpers (`force`, `BiStream`, `LLMResult`, `Picture`, ...)
   are resolved lazily on first attribute access (PEP 562), driven by `trivialai.REGISTRY`.

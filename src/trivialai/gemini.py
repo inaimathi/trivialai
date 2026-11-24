@@ -520,17 +520,23 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
     def _build_image_contents(
         self,
         prompt: str,
-        src_img: Optional[Picture],
+        src_imgs: Any = None,
     ) -> List[Any]:
         """
         Assemble contents for an image generation request.
 
-        For img2img the source image precedes the text so the model interprets
-        the prompt as an editing instruction applied to the supplied image.
+        `src_imgs` is a list of Pictures (a single Picture or None is also
+        accepted).  Input images precede the text, in the order given, so
+        the model reads the prompt as an instruction about them and the
+        prompt can refer to "image 1", "image 2", ...
         """
-        if src_img is None:
+        if src_imgs is None:
+            src_imgs = []
+        elif not isinstance(src_imgs, (list, tuple)):
+            src_imgs = [src_imgs]
+        if not src_imgs:
             return [prompt]
-        return [_to_part(src_img), prompt]
+        return [*(_to_part(img) for img in src_imgs), prompt]
 
     def generate_image(
         self,
@@ -547,7 +553,9 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
         prompt:
             Text description or editing instruction.
         image:
-            Source image for img2img editing.  ``None`` = txt2img.
+            Source image for img2img editing, or an ordered list of
+            reference images (identity, style, pose guide, ...).
+            ``None`` = txt2img.
         model:
             Override ``self.image_model`` for this call.
         image_index:
@@ -564,9 +572,9 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
             )
 
         image_index = int(kwargs.pop("image_index", 0))
-        src_img = self._coerce_image_result(image)
-        mode = "img2img" if src_img is not None else "txt2img"
-        contents = self._build_image_contents(prompt, src_img)
+        src_imgs = self._coerce_image_inputs(image, what=effective_model)
+        mode = "img2img" if src_imgs else "txt2img"
+        contents = self._build_image_contents(prompt, src_imgs)
 
         # Only pass through known GenerateContentConfig keys; drop the rest.
         _config_keys = {
@@ -639,7 +647,7 @@ class Gemini(LLMMixin, ImageMixin, FilesystemMixin):
           {"type": "error", "message": "..."}
         """
         effective_model = model or self.image_model
-        mode = "img2img" if image is not None else "txt2img"
+        mode = "img2img" if self._has_image_input(image) else "txt2img"
 
         yield {
             "type": "start",

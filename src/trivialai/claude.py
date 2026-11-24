@@ -1,13 +1,43 @@
 # src/trivialai/claude.py
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
 from .filesystem import FilesystemMixin
+from .image import encode_image_input
 from .llm import LLMMixin, LLMResult
+
+# Image formats the Messages API accepts; anything else is sent as PNG.
+_IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+
+def _user_content(prompt: str, images: Optional[list] = None) -> Any:
+    """
+    The user turn's content: the bare prompt, or — when images are given —
+    one image block per image, in order, followed by the prompt.
+    """
+    if not images:
+        return prompt
+
+    blocks: list[Dict[str, Any]] = []
+    for img in images:
+        media_type, data = encode_image_input(img, allowed=_IMAGE_MEDIA_TYPES)
+        blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            }
+        )
+    blocks.append({"type": "text", "text": prompt})
+    return blocks
 
 
 class Claude(LLMMixin, FilesystemMixin):
@@ -23,6 +53,10 @@ class Claude(LLMMixin, FilesystemMixin):
     `model=None` is supported for discovery-only instances. Call `models()`
     to list models visible to the supplied Anthropic API key, then construct
     a generation instance with the selected model.
+
+    Vision: `generate` / `stream` (and the JSON / checked variants) take
+    `images=[...]`, a list of Pictures, bytes, file paths, URLs or PIL
+    images.  They are sent ahead of the prompt, in order.
     """
 
     def __init__(
@@ -125,11 +159,35 @@ class Claude(LLMMixin, FilesystemMixin):
             "text": models,
         }
 
+    def _build_body(
+        self,
+        system: str,
+        prompt: str,
+        images: Optional[list] = None,
+        *,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "system": system,
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": _user_content(prompt, images),
+                }
+            ],
+        }
+        if stream:
+            body["stream"] = True
+        return body
+
     # ---- Sync full-generate (compat) ----
     def generate(
         self,
         system: str,
         prompt: str,
+        images: Optional[list] = None,
     ) -> LLMResult:
         if not self.model:
             raise ValueError("model is not set; " "select a model before generation")
@@ -140,17 +198,7 @@ class Claude(LLMMixin, FilesystemMixin):
             "anthropic-version": self.version,
         }
 
-        body: Dict[str, Any] = {
-            "system": system,
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        }
+        body = self._build_body(system, prompt, images)
 
         with httpx.Client(timeout=self.timeout) as client:
             res = client.post(
@@ -242,20 +290,18 @@ class Claude(LLMMixin, FilesystemMixin):
             "anthropic-version": self.version,
         }
 
-        # NOTE: We accept `images` to match the LLMMixin signature.
-        # The application currently exposes text modality only.
-        body: Dict[str, Any] = {
-            "system": system,
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            "stream": True,
-        }
+        try:
+            # Off the event loop: preparing images can read files or URLs.
+            body = await asyncio.to_thread(
+                self._build_body, system, prompt, images, stream=True
+            )
+        except Exception as e:
+            # An unreadable image is reported the way other failures are.
+            yield {
+                "type": "error",
+                "message": f"could not prepare images: {e}",
+            }
+            return
 
         content_buf: list[str] = []
 

@@ -14,7 +14,8 @@ Supported image model families and their invoke_model payload shapes
 --------------------------------------------------------------------
 Nova Canvas  (amazon.nova-canvas-*)
   txt2img: taskType TEXT_IMAGE       → textToImageParams.text
-  img2img: taskType IMAGE_VARIATION  → imageVariationParams.images[0]
+  img2img: taskType IMAGE_VARIATION  → imageVariationParams.images[0..4]
+           (one to five reference images conditioning a single output)
   response: {"images": ["<base64>", ...]}
 
 Titan Image  (amazon.titan-image-*)
@@ -173,9 +174,16 @@ def _build_nova_titan_txt2img(
     }
 
 
+def _as_bytes_list(src: Any) -> List[bytes]:
+    """One image's bytes, or a list of them, as a list."""
+    if isinstance(src, (bytes, bytearray, memoryview)):
+        return [bytes(src)]
+    return [bytes(b) for b in src]
+
+
 def _build_nova_titan_img2img(
     prompt: str,
-    src_bytes: bytes,
+    src_bytes: Any,
     *,
     negative_prompt: str = "",
     similarity_strength: float = 0.7,
@@ -186,7 +194,8 @@ def _build_nova_titan_img2img(
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "text": prompt,
-        "images": [_b64(src_bytes)],
+        # IMAGE_VARIATION conditions one output on all of these (1 to 5).
+        "images": [_b64(b) for b in _as_bytes_list(src_bytes)],
         "similarityStrength": similarity_strength,
     }
     if negative_prompt:
@@ -278,22 +287,54 @@ def _is_stability(model_id: str) -> bool:
     return model_id.startswith("stability.")
 
 
+# Input-image limits per model family (see the payload shapes at the top of
+# this module): Nova Canvas / Titan IMAGE_VARIATION take 1 to 5 images;
+# Stability takes a single init_image.
+_NOVA_TITAN_MAX_REFERENCES = 5
+_STABILITY_MAX_REFERENCES = 1
+
+
+def _max_reference_images(model_id: str) -> int:
+    if _is_stability(model_id):
+        return _STABILITY_MAX_REFERENCES
+    return _NOVA_TITAN_MAX_REFERENCES
+
+
 def _build_image_payload(
     model_id: str,
     prompt: str,
-    src_img: Optional[Picture],
+    src_imgs: Any = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Dispatch to the right payload builder based on model family."""
+    """
+    Dispatch to the right payload builder based on model family.
+
+    `src_imgs` is a list of Pictures (a single Picture or None is also
+    accepted); empty means txt2img.
+    """
+    if src_imgs is None:
+        src_imgs = []
+    elif not isinstance(src_imgs, (list, tuple)):
+        src_imgs = [src_imgs]
+
+    limit = _max_reference_images(model_id)
+    if len(src_imgs) > limit:
+        raise ValueError(
+            f"Bedrock image model '{model_id}' accepts at most {limit} "
+            f"input image(s) per request; got {len(src_imgs)}."
+        )
+
     if _is_stability(model_id):
-        if src_img is not None:
-            return _build_stability_img2img(prompt, src_img.bytes(), **kwargs)
+        if src_imgs:
+            return _build_stability_img2img(prompt, src_imgs[0].bytes(), **kwargs)
         return _build_stability_txt2img(prompt, **kwargs)
     else:
         # Nova Canvas, Titan, and unknown Amazon-family models all share
         # the taskType / imageGenerationConfig schema.
-        if src_img is not None:
-            return _build_nova_titan_img2img(prompt, src_img.bytes(), **kwargs)
+        if src_imgs:
+            return _build_nova_titan_img2img(
+                prompt, [img.bytes() for img in src_imgs], **kwargs
+            )
         return _build_nova_titan_txt2img(prompt, **kwargs)
 
 
@@ -767,8 +808,9 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         prompt:
             Text description of the desired image (or edit instruction).
         image:
-            Optional source image for img2img.  Accepts anything
-            ``ImageMixin._coerce_image_result`` understands.
+            Optional source image for img2img, or an ordered list of
+            reference images (Nova Canvas / Titan: up to 5; Stability: 1).
+            Each may be a Picture, bytes, file path, URL or PIL image.
         model:
             Override ``self.image_model_id`` for this call.
         image_index:
@@ -786,8 +828,12 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
             )
 
         image_index = int(kwargs.pop("image_index", 0))
-        src_img = self._coerce_image_result(image)
-        mode = "img2img" if src_img is not None else "txt2img"
+        src_imgs = self._coerce_image_inputs(
+            image,
+            limit=_max_reference_images(effective_model),
+            what=f"Bedrock image model '{effective_model}'",
+        )
+        mode = "img2img" if src_imgs else "txt2img"
 
         # Separate known image-gen kwargs from any stray extras.
         _img_kwarg_keys = {
@@ -805,7 +851,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
         }
         img_kwargs = {k: v for k, v in kwargs.items() if k in _img_kwarg_keys}
 
-        payload = _build_image_payload(effective_model, prompt, src_img, **img_kwargs)
+        payload = _build_image_payload(effective_model, prompt, src_imgs, **img_kwargs)
 
         def _invoke() -> Any:
             return self._runtime.invoke_model(
@@ -868,7 +914,7 @@ class Bedrock(LLMMixin, ImageMixin, FilesystemMixin):
           ``{"type": "error",    "message": "..."}``
         """
         effective_model = model or self.image_model_id
-        mode = "img2img" if image is not None else "txt2img"
+        mode = "img2img" if self._has_image_input(image) else "txt2img"
 
         yield {
             "type": "start",

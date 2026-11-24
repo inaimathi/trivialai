@@ -72,6 +72,8 @@ class StabDiff(ImageMixin, FilesystemMixin):
       `/sdapi/v1/options`.
     """
 
+    MAX_REFERENCE_IMAGES = 1
+
     def __init__(
         self,
         webui_server: str = "http://127.0.0.1:7860",
@@ -295,11 +297,16 @@ class StabDiff(ImageMixin, FilesystemMixin):
             payload["override_settings"] = override
             payload.setdefault("override_settings_restore_afterwards", True)
 
-        src_img = self._coerce_image_result(image)
-        if src_img is None:
+        # A1111's img2img treats `init_images` as a batch (one output per
+        # init image), not as several references for one output, so more
+        # than one input image is an error rather than a silent batch.
+        src_imgs = self._coerce_image_inputs(
+            image, what="StabDiff (A1111 img2img takes a single init image)"
+        )
+        if not src_imgs:
             return "/sdapi/v1/txt2img", payload
 
-        payload["init_images"] = [_encode_b64_image_bytes(src_img.bytes())]
+        payload["init_images"] = [_encode_b64_image_bytes(src_imgs[0].bytes())]
         payload.setdefault("denoising_strength", 0.75)
         payload.setdefault("include_init_images", False)
 
@@ -465,7 +472,7 @@ class StabDiff(ImageMixin, FilesystemMixin):
         interrupt_on_cancel = _coerce_bool(kwargs.pop("interrupt_on_cancel", True))
 
         actual_model = model or self.model
-        mode = "img2img" if image is not None else "txt2img"
+        mode = "img2img" if self._has_image_input(image) else "txt2img"
 
         yield {
             "type": "start",

@@ -153,8 +153,9 @@ _PACKAGE = __package__ or "trivialai"
 REGISTRY: Dict[str, Tuple[str, str, frozenset]] = {
     "ollama": (".ollama", "Ollama", frozenset({"text"})),
     "claude": (".claude", "Claude", frozenset({"text"})),
-    "chatgpt": (".chatgpt", "ChatGPT", frozenset({"text"})),
-    "openai": (".chatgpt", "ChatGPT", frozenset({"text"})),  # alias
+    "chatgpt": (".chatgpt", "ChatGPT", frozenset({"text", "image"})),
+    "openai": (".chatgpt", "ChatGPT", frozenset({"text", "image"})),  # alias
+    "openrouter": (".openrouter", "OpenRouter", frozenset({"text", "image"})),
     "deepseek": (".deepseek", "DeepSeek", frozenset({"text"})),
     "bedrock": (".bedrock", "Bedrock", frozenset({"text", "image"})),
     "gemini": (".gemini", "Gemini", frozenset({"text", "image"})),
